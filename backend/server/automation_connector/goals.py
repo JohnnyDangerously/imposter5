@@ -1,0 +1,176 @@
+"""Goal specifications for automation connector runs.
+
+The goal layer describes intent and acceptable partial completion. Browser
+runners and interaction primitives consume this shape, but the goal itself is
+provider-neutral.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+from typing import Any
+
+
+DEFAULT_GOAL_NAME = "observe_visible_page_state"
+DEFAULT_OUTCOME = "visible_state_recorded"
+
+
+@dataclass(frozen=True)
+class GoalStep:
+    name: str
+    action: str
+    required: bool = True
+    # For action steps from prompts: e.g. selector, text, value, etc.
+    params: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class GoalSpec:
+    name: str
+    start_url: str
+    desired_outcome: str
+    steps: tuple[GoalStep, ...]
+    prompt: str = ""  # original user/agent natural language intent (for context + interp)
+
+
+DEFAULT_STEPS: tuple[GoalStep, ...] = (
+    GoalStep("visit_start_url", "visit"),
+    GoalStep("settle_page", "wait"),
+    GoalStep("inspect_visible_state", "read"),
+    GoalStep("scroll_page", "scroll", required=False),
+    GoalStep("record_visible_state", "record"),
+)
+
+
+def _safe_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _step_from_raw(raw: Any) -> GoalStep | None:
+    if isinstance(raw, str):
+        name = _safe_text(raw)
+        return GoalStep(name=name, action=name) if name else None
+    if not isinstance(raw, dict):
+        return None
+    name = _safe_text(raw.get("name") or raw.get("step") or raw.get("action"))
+    if not name:
+        return None
+    action = _safe_text(raw.get("action")) or name
+    params = raw.get("params") if isinstance(raw.get("params"), dict) else None
+    return GoalStep(name=name, action=action, required=bool(raw.get("required", True)), params=params)
+
+
+def goal_spec_to_payload(goal: GoalSpec) -> dict[str, Any]:
+    """Serialize a goal spec into a JSON-safe payload."""
+    return {
+        "name": goal.name,
+        "start_url": goal.start_url,
+        "desired_outcome": goal.desired_outcome,
+        "prompt": goal.prompt,
+        "steps": [
+            {
+                "name": step.name,
+                "action": step.action,
+                "required": step.required,
+                **({"params": step.params} if step.params else {}),
+            }
+            for step in goal.steps
+        ],
+    }
+
+
+def goal_spec_from_payload(raw_goal: Any, *, fallback_start_url: str = "") -> GoalSpec:
+    """Build a goal spec from a JSON-safe goal payload."""
+    if isinstance(raw_goal, str):
+        try:
+            raw_goal = json.loads(raw_goal)
+        except json.JSONDecodeError:
+            raw_goal = {"name": raw_goal}
+    raw_goal = raw_goal if isinstance(raw_goal, dict) else {}
+    raw_steps = raw_goal.get("steps") if isinstance(raw_goal.get("steps"), list) else []
+    steps = tuple(step for step in (_step_from_raw(item) for item in raw_steps) if step)
+    return GoalSpec(
+        name=_safe_text(raw_goal.get("name") or raw_goal.get("goal") or DEFAULT_GOAL_NAME),
+        start_url=_safe_text(raw_goal.get("start_url") or fallback_start_url),
+        desired_outcome=_safe_text(raw_goal.get("desired_outcome") or DEFAULT_OUTCOME),
+        steps=steps or DEFAULT_STEPS,
+        prompt=_safe_text(raw_goal.get("prompt")),
+    )
+
+
+def goal_spec_from_target(target: dict[str, Any]) -> GoalSpec:
+    """Build a goal spec from target configuration with safe defaults."""
+    raw_goal = target.get("goal_spec") or target.get("automation_goal")
+    if isinstance(raw_goal, str):
+        try:
+            raw_goal = json.loads(raw_goal)
+        except json.JSONDecodeError:
+            raw_goal = {"name": raw_goal}
+    raw_goal = raw_goal if isinstance(raw_goal, dict) else {}
+
+    payload = {**raw_goal, "prompt": raw_goal.get("prompt") or target.get("payload_prompt")}
+    return goal_spec_from_payload(payload, fallback_start_url=_safe_text(target.get("entity_id")))
+
+
+# --- Prompt interpretation pass (for agent control plane / user-declared prompts) ---
+
+def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_hint: str | None = None) -> GoalSpec:
+    """
+    Basic pass to turn a natural-language user/agent prompt into a GoalSpec with discrete steps.
+
+    This is the "interpret declared prompts about what they want into actions on the site" entry point.
+    Full rich semantic interpretation (LLM/David/planner producing detailed steps + selectors from prompt + live page context)
+    can be plugged in upstream and fed here (or directly construct GoalSpec).
+
+    For now: simple keyword/rule-based + fallback to observation-with-prompt. Supports common action verbs so agents can
+    drive real work (browse sheet, search, click results, type, etc.) through the humanized mechanics + variance.
+
+    The resulting GoalSpec is then fed to build_behavior_plan (for all the persona/completion/outer variance, human twin)
+    and the runner (which uses the redteam-improved primitives for execution).
+
+    Static high-volume (LinkedIn etc.) bypass full interp for cost and use specialized paths, but can still attach the prompt
+    for context and use behavior variance.
+    """
+    p = _safe_text(prompt).lower()
+    name = _safe_text(prompt)[:80] or "user_prompted_task"
+    url = _safe_text(start_url)
+
+    steps: list[GoalStep] = [GoalStep("visit_start_url", "visit")]
+
+    # Very basic action interp for common cases (pass 1; expand with LLM later)
+    if any(k in p for k in ("search", "find", "look for", "query", "google")):
+        # Assume a search flow; selectors are illustrative / will be made robust in runner or by caller providing params
+        steps.append(GoalStep("focus_search", "click", params={"selector": "input[type=search], input[name=q], textarea[title*='Search']"}))
+        # Extract query heuristically
+        q = prompt
+        for prefix in ("search for ", "look for ", "find ", "query "):
+            if prefix in prompt.lower():
+                q = prompt.split(prefix, 1)[1].strip().split()[0:8]  # rough
+                q = " ".join(q) if isinstance(q, list) else q
+                break
+        steps.append(GoalStep("type_query", "type", params={"selector": "input[type=search], input[name=q], textarea[title*='Search']", "text": q}))
+        steps.append(GoalStep("submit_search", "click", params={"selector": "button[type=submit], input[type=submit], form button"}))
+        steps.append(GoalStep("settle_results", "wait"))
+        steps.append(GoalStep("inspect_results", "read", required=False))
+        steps.append(GoalStep("scroll_results", "scroll", required=False))
+    elif any(k in p for k in ("browse", "open", "sheet", "list", "get all", "extract", "people who", "begin with")):
+        steps.append(GoalStep("settle_page", "wait"))
+        steps.append(GoalStep("scroll_to_see", "scroll", required=False))
+        steps.append(GoalStep("inspect_content", "read"))
+        steps.append(GoalStep("record_extracted", "record"))
+    else:
+        # Generic observation-with-intent (current default behavior, now explicitly carrying the prompt for agent context)
+        steps.extend([
+            GoalStep("settle_page", "wait"),
+            GoalStep("inspect_visible_state", "read"),
+            GoalStep("scroll_page", "scroll", required=False),
+            GoalStep("record_visible_state", "record"),
+        ])
+
+    return GoalSpec(
+        name=name,
+        start_url=url,
+        desired_outcome="prompt_executed" if any(k in p for k in ("search", "click", "type", "browse", "extract")) else DEFAULT_OUTCOME,
+        steps=tuple(steps),
+        prompt=prompt,
+    )
