@@ -60,7 +60,7 @@ From the `backend` directory (with virtual environment active):
 ```bash
 python app.py
 ```
-The backend will start on `http://127.0.0.1:5180`.
+The backend will start on `http://127.0.0.1:5185`.
 
 ### 2. Start the Frontend Dev Server
 From the `frontend` directory:
@@ -75,7 +75,7 @@ To build the frontend and serve it directly from the FastAPI backend:
 cd frontend
 npm run build
 ```
-Then start the backend with `python app.py` and navigate to `http://127.0.0.1:5180`.
+Then start the backend with `python app.py` and navigate to `http://127.0.0.1:5185`.
 
 ---
 

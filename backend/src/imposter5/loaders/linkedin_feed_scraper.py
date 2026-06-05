@@ -794,13 +794,12 @@ def _visit_notifications_variation(
 ) -> bool:
     """Click notifications nav (mouse positioned), do a little scroll/reading there, return to feed."""
     try:
+        from imposter5.automation_connector.interaction_primitives import click_element, update_status_ticker
         icon = page.locator(_RULES.nav_notifications_selector).first
         if not icon:
             return False
-        b = icon.bounding_box()
-        if b:
-            move_pointer(page, b["x"] + b["width"] * 0.5, b["y"] + b["height"] * 0.5, plan, recorder=recorder)
-        icon.click()
+        update_status_ticker(page, "🔔 NOTIFICATIONS CHECK", "Navigating to Notifications tab...")
+        click_element(page, icon, plan, recorder=recorder)
         wait_human(page, plan, 0, 600, recorder=recorder)
         # Small varied scroll + mouse in the notifs area.
         for i in range(2):
@@ -812,8 +811,8 @@ def _visit_notifications_variation(
         try:
             feed = page.locator(_RULES.feed_nav_selector).first
             if feed:
-                move_pointer(page, 120, 80, plan, recorder=recorder)  # rough nav area
-                feed.click()
+                update_status_ticker(page, "🧭 NAVIGATING", "Returning to Feed...")
+                click_element(page, feed, plan, recorder=recorder)
             else:
                 page.goto(_FEED_URL, wait_until="domcontentloaded")
         except Exception:
@@ -833,6 +832,7 @@ def _peek_random_profile_variation(
     then back. Bounded and rare so the main feed extraction goal is preserved.
     """
     try:
+        from imposter5.automation_connector.interaction_primitives import click_element, update_status_ticker
         containers = page.query_selector_all(_RULES.post_container_selectors[0]) or []
         if not containers:
             return False
@@ -840,14 +840,9 @@ def _peek_random_profile_variation(
         link = c.query_selector(_RULES.actor_link_selector)
         if not link:
             return False
-        b = link.bounding_box()
-        if b:
-            cx = b["x"] + b["width"] * random.uniform(0.35, 0.65)
-            cy = b["y"] + b["height"] * random.uniform(0.3, 0.7)
-            move_pointer(page, cx, cy, plan, recorder=recorder)
-        # Use direct click after the move_pointer (which already did any arc/two_step/overshoot from plan);
-        # this keeps the human trajectory without needing a stable page-level selector for nth.
-        link.click()
+        
+        update_status_ticker(page, "👤 PROFILE PEEK", "Peeking actor profile...")
+        click_element(page, link, plan, recorder=recorder)
         wait_human(page, plan, 0, 700, recorder=recorder)
 
         # "scroll down to their work history" + reading moves (like a person would).
@@ -864,6 +859,7 @@ def _peek_random_profile_variation(
 
         actions_log.append("profile_peek")
         # Back to feed (human backtrack).
+        update_status_ticker(page, "🧭 BACKTRACKING", "Returning to Feed...")
         page.go_back(wait_until="domcontentloaded")
         wait_human(page, plan, 0, 550, recorder=recorder)
         return True
@@ -912,6 +908,10 @@ def scrape_feed(
         ) as page:
             if visible:
                 try:
+                    # Enable console logging for debugging
+                    page.on("console", lambda msg: print(f"[BROWSER CONSOLE] {msg.text}", flush=True))
+                    page.on("pageerror", lambda exc: print(f"[BROWSER EXCEPTION] {exc}", flush=True))
+
                     from imposter5.automation_connector.interaction_primitives import enable_visible_mouse_tracking
                     enable_visible_mouse_tracking(page)
                     try:
@@ -920,29 +920,37 @@ def scrape_feed(
                         pass
                 except Exception:
                     pass  # synthetic cursor is only for human visual judgment; never break the run
-                # Early calibration for the movie / live view: drive obvious mouse moves immediately
-                # so the red HUMAN MOUSE is visible in the recording from the first frame.
-                print("[linkedin_feed_scraper] >>> SYNTHETIC CURSOR ENABLED + calibration path for visible run — watch for the bright red HUMAN MOUSE moving on screen now (or in the recorded movie).")
-                for cx, cy in [(160, 140), (380, 170), (240, 290), (490, 210), (290, 260), (430, 280)]:
-                    try:
-                        page.mouse.move(cx, cy)
-                        page.wait_for_timeout(110)
-                    except Exception:
-                        pass
-                print("[linkedin_feed_scraper] >>> calibration mouse path complete — red cursor should be clearly visible in live window or in the saved movie. Proceeding with feed navigation + human variations (cursor will continue tracking).")
             logger.info("[linkedin_feed_scraper] navigating to feed for user_hash %s", user_hash)
+            
+            from imposter5.automation_connector.interaction_primitives import update_status_ticker
+            update_status_ticker(page, "🧭 NAVIGATING", "Opening LinkedIn Feed...")
             page.goto(_FEED_URL, wait_until="domcontentloaded")
 
             if not is_logged_in(page):
                 logger.warning(
-                    "[linkedin_feed_scraper] user_hash %s is not authenticated — skipping",
+                    "[linkedin_feed_scraper] user_hash %s is not authenticated — pausing for manual login",
                     user_hash,
                 )
-                if raise_on_error:
-                    raise RuntimeError(
-                        "LinkedIn browser session is not authenticated; saved cookies are missing or expired."
-                    )
-                return []
+                print("[linkedin_feed_scraper] >>> NOT LOGGED IN. Pausing automation to allow manual login.")
+                print("[linkedin_feed_scraper] >>> Please log in to LinkedIn in the browser window now.")
+                
+                # Wait up to 90 seconds for manual login
+                logged_in = False
+                for i in range(90):
+                    page.wait_for_timeout(1000)
+                    if is_logged_in(page):
+                        logged_in = True
+                        print("[linkedin_feed_scraper] >>> Manual login detected! Proceeding with simulation...")
+                        break
+                    if i % 10 == 0:
+                        print(f"[linkedin_feed_scraper] >>> Still waiting for manual login... ({90 - i} seconds remaining)")
+                
+                if not logged_in:
+                    if raise_on_error:
+                        raise RuntimeError(
+                            "LinkedIn browser session is not authenticated; manual login timed out (90 seconds)."
+                        )
+                    return []
 
             # Recorder + plan-driven variations (mouse-positioned scrolls, reading hovers, comment expands,
             # occasional profile peeks to work history, notifications checks, bidirectional/eye-like scrolls).

@@ -69,6 +69,7 @@ def wait_human(
 ) -> int:
     """Wait for a planned bounded interval and return the actual wait."""
     wait_ms = planned_wait_ms(plan, pass_index, fallback_ms)
+    update_status_ticker(page, "⏳ WAITING / READING", f"Pause: {wait_ms}ms (pass {pass_index})")
     page.wait_for_timeout(wait_ms)
     if recorder is not None:
         recorder.record("wait", metadata={"pass_index": pass_index, "wait_ms": wait_ms})
@@ -84,8 +85,15 @@ def scroll_page(
     recorder: SessionRecorder | None = None,
 ) -> int:
     """Scroll using a planned bounded delta, with mouse positioning over content first so the wheel is accompanied by realistic mouse events (for detectors and human twin traces). Returns the actual delta used."""
+    if plan and plan.get("persona", {}).get("name") == "naive_bot":
+        page.mouse.wheel(0, delta_y)
+        if recorder is not None:
+            recorder.record("scroll", metadata={"pass_index": pass_index, "delta_y": delta_y})
+        return delta_y
+
     delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
     rng = _seeded_rng(plan, f"scroll:{pass_index}")
+    update_status_ticker(page, "📜 SCROLLING", f"Delta: {delta_y}px (pass {pass_index})")
     # Position the mouse over a content area before the wheel so the scroll "event" has an associated cursor position (mouse scroll realism, not just raw wheel from nowhere).
     _position_mouse_over_content(page, plan, rng, recorder)
     page.mouse.wheel(0, delta_y)
@@ -148,6 +156,14 @@ def type_text(
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Type text into a selector with bounded delays and occasional corrections."""
+    if plan and plan.get("persona", {}).get("name") == "naive_bot":
+        locator.fill(text)
+        result = {"typed_chars": len(text), "typos": 0, "corrections": 0}
+        if recorder is not None:
+            recorder.record("type_text", metadata={"selector": selector, **result})
+        return result
+
+    update_status_ticker(page, "⌨️ TYPING", f"Input: {selector} - '{text[:20]}...'")
     typing_plan = plan.get("typing") if isinstance(plan, dict) else {}
     typing_plan = typing_plan if isinstance(typing_plan, dict) else {}
     min_delay = int(typing_plan.get("min_delay_ms", 55))
@@ -181,15 +197,168 @@ def type_text(
 
 def click_element(
     page: Any,
-    selector: str,
+    selector: Any,
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Click an element with optional pre-click hover."""
+    if plan and plan.get("persona", {}).get("name") == "naive_bot":
+        try:
+            if isinstance(selector, str):
+                page.locator(selector).click()
+            else:
+                selector.click()
+        except Exception:
+            pass
+        result = {
+            "hovered": False,
+            "move_style": "direct",
+        }
+        if recorder is not None:
+            recorder.record("click", metadata={"selector": str(selector), **result})
+        return result
+
     pointer = _pointer_plan(plan)
     rng = _seeded_rng(plan, f"click:{selector}")
-    locator = page.locator(selector)
+    
+    # Handle random link selection for red-team multi-page browsing simulations
+    if selector == "random_link":
+        update_status_ticker(page, "🖱️ CLICKING", "Choosing random link...")
+        try:
+            links = page.locator("a[href]").all()
+            valid_links = []
+            for link in links:
+                try:
+                    if link.is_visible():
+                        box = link.bounding_box()
+                        if box and box["width"] > 10 and box["height"] > 10:
+                            href = str(link.get_attribute("href") or "").lower()
+                            text = str(link.inner_text() or "").lower()
+                            # Filter out utility/external/auth links to stay on target site
+                            if not any(k in href or k in text for k in ("logout", "signout", "share", "facebook", "twitter", "linkedin", "privacy", "terms", "cookie", "login", "register")):
+                                valid_links.append((link, box))
+                except Exception:
+                    pass
+            
+            # Relax filters if no links matched
+            if not valid_links:
+                for link in links:
+                    try:
+                        if link.is_visible():
+                            box = link.bounding_box()
+                            if box and box["width"] > 5 and box["height"] > 5:
+                                valid_links.append((link, box))
+                    except Exception:
+                        pass
+
+            # If still empty, scroll down a bit and try to find links again
+            if not valid_links:
+                page.evaluate("window.scrollBy(0, 400)")
+                page.wait_for_timeout(500)
+                links = page.locator("a[href]").all()
+                for link in links:
+                    try:
+                        if link.is_visible():
+                            box = link.bounding_box()
+                            if box and box["width"] > 5 and box["height"] > 5:
+                                valid_links.append((link, box))
+                    except Exception:
+                        pass
+
+            if valid_links:
+                locator, box = rng.choice(valid_links)
+                cx = box["x"] + box["width"] * rng.uniform(0.28, 0.72)
+                cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
+                update_status_ticker(page, "🖱️ CLICKING", f"Clicking: random link at ({round(cx)}, {round(cy)})")
+                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder)
+                locator.click()
+                result = {
+                    "hovered": False,
+                    "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
+                    "clicked_random_link": True,
+                }
+                if move_meta:
+                    result["move"] = move_meta
+                if recorder is not None:
+                    recorder.record("click", metadata={"selector": "random_link", **result})
+                return result
+            else:
+                # Fallback: Click a safe spot on the page instead of crashing
+                cx = rng.uniform(300, 600)
+                cy = rng.uniform(200, 500)
+                update_status_ticker(page, "🖱️ CLICKING", f"Clicking fallback spot ({round(cx)}, {round(cy)})")
+                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder)
+                page.mouse.click(cx, cy)
+                result = {
+                    "hovered": False,
+                    "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
+                    "clicked_fallback_spot": True,
+                }
+                if move_meta:
+                    result["move"] = move_meta
+                if recorder is not None:
+                    recorder.record("click", metadata={"selector": "fallback_spot", **result})
+                return result
+        except Exception:
+            # Fallback to safe spot if anything fails
+            cx = rng.uniform(300, 600)
+            cy = rng.uniform(200, 500)
+            move_pointer(page, cx, cy, plan, recorder=recorder)
+            page.mouse.click(cx, cy)
+            return {"clicked_fallback_spot": True}
+
+    if isinstance(selector, str):
+        # --- Stateful Honeypot Evasion (Layer 4 Defense) ---
+        # Before clicking, check if the selector points to a hidden / honeypot element.
+        # Honeypots are styled to be invisible to humans but are visible in the DOM.
+        try:
+            loc = page.locator(selector)
+            is_honeypot = page.evaluate("""
+                (sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    
+                    // 1. Standard hidden styles
+                    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
+                        return true;
+                    }
+                    
+                    // 2. Off-screen positioning (common honeypot technique)
+                    const rect = el.getBoundingClientRect();
+                    if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) {
+                        return true;
+                    }
+                    
+                    // 3. Zero dimensions
+                    if (rect.width === 0 || rect.height === 0) {
+                        return true;
+                    }
+                    
+                    // 4. Hidden by absolute positioning/z-index or tiny font size
+                    if (parseFloat(style.fontSize) === 0 || parseInt(style.zIndex) < -1000) {
+                        return true;
+                    }
+                    
+                    return false;
+                }
+            """, selector)
+            
+            if is_honeypot:
+                update_status_ticker(page, "⚠️ EVADING HONEYPOT", f"Detected hidden honeypot: {selector}. Bypassing click.")
+                if recorder is not None:
+                    recorder.record("honeypot_evaded", metadata={"selector": selector})
+                return {"hovered": False, "honeypot_evaded": True}
+        except Exception as e:
+            pass
+
+        locator = page.locator(selector)
+        update_status_ticker(page, "🖱️ CLICKING", f"Clicking: {selector}")
+    else:
+        locator = selector
+        update_status_ticker(page, "🖱️ CLICKING", "Clicking element handle")
+
     hovered = False
     move_meta: dict[str, Any] | None = None
     if rng.random() < float(pointer.get("hover_before_click_chance", 0.0)):
@@ -212,22 +381,44 @@ def click_element(
     if move_meta:
         result["move"] = move_meta
     if recorder is not None:
-        recorder.record("click", metadata={"selector": selector, **result})
+        recorder.record("click", metadata={"selector": str(selector), **result})
     return result
 
 
 def hover_element(
     page: Any,
-    selector: str,
+    selector: Any,
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Hover an element and dwell for a bounded interval."""
+    if plan and plan.get("persona", {}).get("name") == "naive_bot":
+        try:
+            if isinstance(selector, str):
+                page.locator(selector).hover()
+            else:
+                selector.hover()
+        except Exception:
+            pass
+        result = {
+            "hovered": True,
+        }
+        if recorder is not None:
+            recorder.record("hover", metadata={"selector": str(selector), **result})
+        return result
+
     hover = plan.get("hover") if isinstance(plan, dict) else {}
     hover = hover if isinstance(hover, dict) else {}
     dwell_ms = _bounded_int(hover.get("hover_dwell_ms"), lower=150, upper=1_500, default=450)
-    locator = page.locator(selector)
+    
+    if isinstance(selector, str):
+        locator = page.locator(selector)
+        update_status_ticker(page, "👁️ HOVERING", f"Hovering: {selector} (dwell {dwell_ms}ms)")
+    else:
+        locator = selector
+        update_status_ticker(page, "👁️ HOVERING", f"Hovering element handle (dwell {dwell_ms}ms)")
+
     try:
         box = locator.bounding_box()
         if box:
@@ -238,7 +429,7 @@ def hover_element(
         pass
     locator.hover()
     page.wait_for_timeout(dwell_ms)
-    result = {"selector": selector, "hover_dwell_ms": dwell_ms}
+    result = {"selector": str(selector), "hover_dwell_ms": dwell_ms}
     if recorder is not None:
         recorder.record("hover", metadata=result)
     return result
@@ -336,6 +527,19 @@ def move_pointer(
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Move cursor to coordinates honoring the plan's pointer.move_style, imprecision, and overshoot."""
+    if plan and plan.get("persona", {}).get("name") == "naive_bot":
+        page.mouse.move(x, y)
+        res = {
+            "x": round(x),
+            "y": round(y),
+            "style": "direct",
+            "imprecision_px": 0,
+            "overshot": False,
+        }
+        if recorder is not None:
+            recorder.record("mouse_move", metadata=res)
+        return res
+
     pointer = _pointer_plan(plan)
     style = str(pointer.get("move_style") or "direct")
     imprec = _bounded_int(pointer.get("imprecision_px"), lower=0, upper=20, default=3)
@@ -408,75 +612,436 @@ def inject_synthetic_cursor(page: Any) -> None:
     """Create (idempotent) the large bright red QA cursor overlay in the page.
 
     Uses createElement (robust to CSP/navigations) + add_init_script for future
-    pages + direct evaluate for the current document. Parks at (220,220) so it
-    is immediately obvious even before the first real move.
+    pages + direct evaluate for the current document. Features high-precision 
+    canvas drawing for color-coded velocity/acceleration trails and real-time
+    telemetry overlay.
     """
     js = """
     (function(){
-        if (document.getElementById('__human_cursor__')) return;
-        const style = document.createElement('style');
-        style.id = '__human_cursor_style__';
-        style.textContent = `
-            #__human_cursor__ {
-                position: fixed !important;
-                left: 0; top: 0;
-                width: 56px; height: 56px;
-                pointer-events: none !important;
-                z-index: 2147483647 !important;
-                transform: translate(-50%, -50%);
-                filter: drop-shadow(0 2px 4px rgba(0,0,0,0.6));
+        // Store state persistently on window so it survives re-injection
+        if (!window.__human_cursor_state) {
+            window.__human_cursor_state = {
+                points: [],
+                lastX: 220,
+                lastY: 220,
+                lastTime: performance.now(),
+                lastVel: 0,
+                stepCount: 0,
+                currentAction: 'INITIALIZING...',
+                currentDetails: 'Waiting for simulation start...',
+                timelineEvents: []
+            };
+        }
+        
+        const state = window.__human_cursor_state;
+        
+        function injectElements() {
+            if (!document.documentElement) {
+                setTimeout(injectElements, 50);
+                return;
             }
-            #__human_cursor__ .arrow {
-                position: absolute;
-                left: 8px; top: 8px;
-                width: 0; height: 0;
-                border-left: 18px solid transparent;
-                border-right: 18px solid transparent;
-                border-bottom: 28px solid #ff1a1a;
+            
+            let style = document.getElementById('__human_cursor_style__');
+            if (!style) {
+                style = document.createElement('style');
+                style.id = '__human_cursor_style__';
+                style.textContent = `
+                    #__human_cursor__ {
+                        position: fixed !important;
+                        left: 0; top: 0;
+                        width: 56px; height: 56px;
+                        pointer-events: none !important;
+                        z-index: 2147483647 !important;
+                        transform: translate(-50%, -50%);
+                        filter: drop-shadow(0 2px 4px rgba(0,0,0,0.6));
+                    }
+                    #__human_cursor__ .arrow {
+                        position: absolute;
+                        left: 8px; top: 8px;
+                        width: 0; height: 0;
+                        border-left: 18px solid transparent;
+                        border-right: 18px solid transparent;
+                        border-bottom: 28px solid #ff1a1a;
+                    }
+                    #__human_cursor__ .dot {
+                        position: absolute;
+                        left: 22px; top: 22px;
+                        width: 12px; height: 12px;
+                        background: #fff;
+                        border: 3px solid #ff1a1a;
+                        border-radius: 999px;
+                    }
+                    #__human_cursor__ .label {
+                        position: absolute;
+                        left: 52px; top: 4px;
+                        background: #ff1a1a;
+                        color: #fff;
+                        font: 700 11px/1 system-ui, sans-serif;
+                        padding: 2px 6px;
+                        border-radius: 3px;
+                        white-space: nowrap;
+                        box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+                    }
+                    /* Speedometer/Telemetry overlay */
+                    #__human_cursor_telemetry__ {
+                        position: fixed !important;
+                        bottom: 20px;
+                        right: 20px;
+                        background: rgba(15, 23, 42, 0.85) !important;
+                        border: 1px solid rgba(244, 63, 94, 0.4) !important;
+                        border-radius: 8px !important;
+                        padding: 10px 14px !important;
+                        color: #38bdf8 !important;
+                        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+                        font-size: 11px !important;
+                        line-height: 1.4 !important;
+                        z-index: 2147483640 !important;
+                        pointer-events: none !important;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.5) !important;
+                        backdrop-filter: blur(4px) !important;
+                        width: 220px !important;
+                    }
+                    #__human_cursor_telemetry__ .title {
+                        color: #f43f5e !important;
+                        font-weight: bold !important;
+                        text-transform: uppercase !important;
+                        letter-spacing: 0.05em !important;
+                        border-bottom: 1px solid rgba(244, 63, 94, 0.2) !important;
+                        padding-bottom: 4px !important;
+                        margin-bottom: 6px !important;
+                    }
+                    #__human_cursor_telemetry__ .row {
+                        display: flex !important;
+                        justify-content: space-between !important;
+                        margin-bottom: 2px !important;
+                    }
+                    #__human_cursor_telemetry__ .val {
+                        color: #10b981 !important;
+                        font-weight: bold !important;
+                    }
+                    
+                    /* Futuristic status ticker / timeline */
+                    #__imposter5_ticker__ {
+                        position: fixed !important;
+                        bottom: 20px !important;
+                        left: 20px !important;
+                        width: calc(100vw - 280px) !important;
+                        background: rgba(15, 23, 42, 0.9) !important;
+                        border: 1px solid rgba(244, 63, 94, 0.4) !important;
+                        border-radius: 8px !important;
+                        padding: 12px 16px !important;
+                        color: #f1f5f9 !important;
+                        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+                        font-size: 12px !important;
+                        z-index: 2147483641 !important;
+                        pointer-events: none !important;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.5) !important;
+                        backdrop-filter: blur(6px) !important;
+                        display: flex !important;
+                        flex-direction: column !important;
+                        gap: 8px !important;
+                    }
+                    #__imposter5_ticker__ .header {
+                        display: flex !important;
+                        align-items: center !important;
+                        justify-content: space-between !important;
+                        border-bottom: 1px solid rgba(244, 63, 94, 0.2) !important;
+                        padding-bottom: 6px !important;
+                    }
+                    #__imposter5_ticker__ .title-container {
+                        display: flex !important;
+                        align-items: center !important;
+                        gap: 8px !important;
+                    }
+                    #__imposter5_ticker__ .pulse {
+                        width: 8px; height: 8px;
+                        background: #f43f5e;
+                        border-radius: 50%;
+                        box-shadow: 0 0 8px #f43f5e;
+                        animation: __pulse__ 1.5s infinite;
+                    }
+                    #__imposter5_ticker__ .brand {
+                        color: #f43f5e !important;
+                        font-weight: bold !important;
+                        text-transform: uppercase !important;
+                        letter-spacing: 0.05em !important;
+                    }
+                    #__imposter5_ticker__ .action {
+                        color: #38bdf8 !important;
+                        font-weight: bold !important;
+                        text-transform: uppercase !important;
+                    }
+                    #__imposter5_ticker__ .details {
+                        color: #94a3b8 !important;
+                        font-size: 11px !important;
+                    }
+                    #__imposter5_ticker__ .timeline-title {
+                        color: #64748b !important;
+                        font-size: 10px !important;
+                        text-transform: uppercase !important;
+                        font-weight: bold !important;
+                        margin-top: 4px !important;
+                        margin-bottom: 2px !important;
+                    }
+                    #__imposter5_ticker__ .timeline {
+                        display: flex !important;
+                        flex-direction: column !important;
+                        gap: 2px !important;
+                        max-height: 80px !important;
+                        overflow: hidden !important;
+                    }
+                    
+                    @keyframes __pulse__ {
+                        0% { opacity: 0.4; box-shadow: 0 0 2px #f43f5e; }
+                        50% { opacity: 1; box-shadow: 0 0 10px #f43f5e; }
+                        100% { opacity: 0.4; box-shadow: 0 0 2px #f43f5e; }
+                    }
+                `;
+                document.documentElement.appendChild(style);
             }
-            #__human_cursor__ .dot {
-                position: absolute;
-                left: 22px; top: 22px;
-                width: 12px; height: 12px;
-                background: #fff;
-                border: 3px solid #ff1a1a;
-                border-radius: 999px;
+            
+            let canvas = document.getElementById('__human_cursor_canvas__');
+            if (!canvas) {
+                canvas = document.createElement('canvas');
+                canvas.id = '__human_cursor_canvas__';
+                canvas.style.cssText = `
+                    position: fixed !important;
+                    left: 0; top: 0;
+                    width: 100vw; height: 100vh;
+                    pointer-events: none !important;
+                    z-index: 2147483645 !important;
+                `;
+                document.documentElement.appendChild(canvas);
+                
+                const ctx = canvas.getContext('2d');
+                function resizeCanvas() {
+                    canvas.width = window.innerWidth * window.devicePixelRatio;
+                    canvas.height = window.innerHeight * window.devicePixelRatio;
+                    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+                }
+                window.addEventListener('resize', resizeCanvas);
+                resizeCanvas();
+                
+                function drawTrail() {
+                    if (!document.getElementById('__human_cursor_canvas__')) return;
+                    const now = performance.now();
+                    
+                    // Periodically ensure canvas size is non-zero and matches window size
+                    const expectedW = window.innerWidth * window.devicePixelRatio;
+                    const expectedH = window.innerHeight * window.devicePixelRatio;
+                    if (canvas.width !== expectedW || canvas.height !== expectedH) {
+                        resizeCanvas();
+                    }
+                    
+                    while (state.points.length > 0 && now - state.points[0].timestamp > 3000) {
+                        state.points.shift();
+                    }
+                    
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    
+                    if (state.points.length < 2) {
+                        requestAnimationFrame(drawTrail);
+                        return;
+                    }
+                    
+                    for (let i = 1; i < state.points.length; i++) {
+                        const p1 = state.points[i - 1];
+                        const p2 = state.points[i];
+                        
+                        const age = now - p2.timestamp;
+                        const alpha = Math.max(0, 1 - age / 3000);
+                        
+                        let color = 'rgba(6, 182, 212, ' + alpha + ')';
+                        if (p2.vel > 1.5) {
+                            color = 'rgba(244, 63, 94, ' + alpha + ')';
+                        } else if (p2.vel > 0.5) {
+                            color = 'rgba(139, 92, 246, ' + alpha + ')';
+                        } else if (p2.vel > 0.1) {
+                            color = 'rgba(16, 185, 129, ' + alpha + ')';
+                        }
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = Math.max(1, 4 * alpha);
+                        ctx.lineCap = 'round';
+                        ctx.stroke();
+                        
+                        if (i % 2 === 0) {
+                            ctx.beginPath();
+                            ctx.arc(p2.x, p2.y, Math.max(1.5, 3.5 * alpha), 0, Math.PI * 2);
+                            ctx.fillStyle = color;
+                            ctx.fill();
+                        }
+                    }
+                    requestAnimationFrame(drawTrail);
+                }
+                requestAnimationFrame(drawTrail);
             }
-            #__human_cursor__ .label {
-                position: absolute;
-                left: 52px; top: 4px;
-                background: #ff1a1a;
-                color: #fff;
-                font: 700 11px/1 system-ui, sans-serif;
-                padding: 2px 6px;
-                border-radius: 3px;
-                white-space: nowrap;
-                box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+            
+            let cursor = document.getElementById('__human_cursor__');
+            if (!cursor) {
+                cursor = document.createElement('div');
+                cursor.id = '__human_cursor__';
+                cursor.setAttribute('aria-hidden', 'true');
+                cursor.innerHTML = '<div class="arrow"></div><div class="dot"></div><div class="label">HUMAN MOUSE</div>';
+                document.documentElement.appendChild(cursor);
+                cursor.style.left = (state.lastX | 0) + 'px';
+                cursor.style.top = (state.lastY | 0) + 'px';
             }
-        `;
-        document.documentElement.appendChild(style);
-        const c = document.createElement('div');
-        c.id = '__human_cursor__';
-        c.setAttribute('aria-hidden', 'true');
-        c.innerHTML = '<div class="arrow"></div><div class="dot"></div><div class="label">HUMAN MOUSE</div>';
-        document.documentElement.appendChild(c);
+            
+            let tel = document.getElementById('__human_cursor_telemetry__');
+            if (!tel) {
+                tel = document.createElement('div');
+                tel.id = '__human_cursor_telemetry__';
+                tel.setAttribute('aria-hidden', 'true');
+                tel.innerHTML = `
+                    <div class="title">Telemetry Monitor</div>
+                    <div class="row"><span>Position:</span><span id="__tel_pos__" class="val">${Math.round(state.lastX)}, ${Math.round(state.lastY)}</span></div>
+                    <div class="row"><span>Velocity:</span><span id="__tel_vel__" class="val">${state.lastVel.toFixed(3)} px/ms</span></div>
+                    <div class="row"><span>Acceleration:</span><span id="__tel_acc__" class="val">0 px/ms²</span></div>
+                    <div class="row"><span>Micro-steps:</span><span id="__tel_steps__" class="val">${state.stepCount}</span></div>
+                `;
+                document.documentElement.appendChild(tel);
+            }
+            
+            let ticker = document.getElementById('__imposter5_ticker__');
+            if (!ticker) {
+                ticker = document.createElement('div');
+                ticker.id = '__imposter5_ticker__';
+                ticker.setAttribute('aria-hidden', 'true');
+                ticker.innerHTML = `
+                    <div class="header">
+                        <div class="title-container">
+                            <div class="pulse"></div>
+                            <span class="brand">IMPOSTER5 ACTIVE PROTOCOL</span>
+                        </div>
+                        <div id="__ticker_current_action__" class="action">${state.currentAction}</div>
+                    </div>
+                    <div id="__ticker_details__" class="details">${state.currentDetails}</div>
+                    <div>
+                        <div class="timeline-title">Event Timeline</div>
+                        <div id="__ticker_timeline__" class="timeline"></div>
+                    </div>
+                `;
+                document.documentElement.appendChild(ticker);
+                
+                const tlEl = document.getElementById('__ticker_timeline__');
+                if (tlEl) {
+                    state.timelineEvents.forEach(ev => {
+                        const item = document.createElement('div');
+                        item.style.cssText = 'color: #cbd5e1 !important; font-size: 10px !important; display: flex !important; gap: 6px !important;';
+                        item.innerHTML = `<span style="color: #64748b !important;">[${ev.time}]</span> <span style="color: #f43f5e !important; font-weight: bold !important;">${ev.action}</span> <span>${ev.details}</span>`;
+                        tlEl.appendChild(item);
+                    });
+                }
+            }
+        }
+        
         window.__human_cursor_move = function(x, y) {
             const el = document.getElementById('__human_cursor__');
             if (el) {
                 el.style.left = (x | 0) + 'px';
                 el.style.top = (y | 0) + 'px';
             }
+            
+            const now = performance.now();
+            const dx = x - state.lastX;
+            const dy = y - state.lastY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const dt = now - state.lastTime;
+            
+            let vel = 0;
+            let acc = 0;
+            if (dt > 0) {
+                vel = dist / dt;
+                acc = (vel - state.lastVel) / dt;
+            }
+            
+            state.stepCount++;
+            
+            state.points.push({
+                x: x,
+                y: y,
+                timestamp: now,
+                vel: vel,
+                acc: acc
+            });
+            
+            const tPos = document.getElementById('__tel_pos__');
+            const tVel = document.getElementById('__tel_vel__');
+            const tAcc = document.getElementById('__tel_acc__');
+            const tSteps = document.getElementById('__tel_steps__');
+            if (tPos) tPos.textContent = `${Math.round(x)}, ${Math.round(y)}`;
+            if (tVel) tVel.textContent = `${vel.toFixed(3)} px/ms`;
+            if (tAcc) tAcc.textContent = `${acc.toFixed(4)} px/ms²`;
+            if (tSteps) tSteps.textContent = `${state.stepCount}`;
+            
+            state.lastX = x;
+            state.lastY = y;
+            state.lastTime = now;
+            state.lastVel = vel;
         };
-        // Park visibly so even with no moves yet the overlay is obvious on screen.
-        if (window.__human_cursor_move) {
-            window.__human_cursor_move(220, 220);
-        }
-        try { console.log('[human-cursor] large bright overlay active for visual QA only'); } catch(e){}
+        
+        injectElements();
+        document.addEventListener('DOMContentLoaded', injectElements);
+        setInterval(injectElements, 200);
     })();
     """
     try:
         page.add_init_script(js)
         page.evaluate(js)  # immediate for current document
+    except Exception as e:
+        logger.exception("[interaction_primitives] failed to inject synthetic cursor: %s", e)
+
+
+def _safe_evaluate(page: Any, expression: str, *args: Any) -> Any:
+    """Safely evaluate JS on the page with a very low timeout to prevent blocking during navigations."""
+    orig_timeout = page._impl.default_timeout if hasattr(page, "_impl") else 25_000
+    try:
+        page.set_default_timeout(150)  # 150ms max wait for overlay updates
+        return page.evaluate(expression, *args)
+    except Exception:
+        pass
+    finally:
+        try:
+            page.set_default_timeout(orig_timeout)
+        except Exception:
+            pass
+
+
+def update_status_ticker(page: Any, action: str, details: str) -> None:
+    """Update the futuristic bottom status ticker with the current active behavior."""
+    try:
+        _safe_evaluate(
+            page,
+            "([action, details]) => { "
+            "  if (window.__human_cursor_state) { "
+            "    window.__human_cursor_state.currentAction = action; "
+            "    window.__human_cursor_state.currentDetails = details; "
+            "    const timeStr = new Date().toTimeString().split(' ')[0]; "
+            "    window.__human_cursor_state.timelineEvents.push({ time: timeStr, action: action, details: details }); "
+            "    while (window.__human_cursor_state.timelineEvents.length > 5) { "
+            "      window.__human_cursor_state.timelineEvents.shift(); "
+            "    } "
+            "  } "
+            "  const actEl = document.getElementById('__ticker_current_action__'); "
+            "  const detEl = document.getElementById('__ticker_details__'); "
+            "  const tlEl = document.getElementById('__ticker_timeline__'); "
+            "  if (actEl) actEl.textContent = action; "
+            "  if (detEl) detEl.textContent = details; "
+            "  if (tlEl) { "
+            "    const timeStr = new Date().toTimeString().split(' ')[0]; "
+            "    const item = document.createElement('div'); "
+            "    item.style.cssText = 'color: #cbd5e1 !important; font-size: 10px !important; display: flex !important; gap: 6px !important;'; "
+            "    item.innerHTML = `<span style=\"color: #64748b !important;\">[${timeStr}]</span> <span style=\"color: #f43f5e !important; font-weight: bold !important;\">${action}</span> <span>${details}</span>`; "
+            "    tlEl.appendChild(item); "
+            "    while (tlEl.children.length > 5) { tlEl.removeChild(tlEl.firstChild); } "
+            "  } "
+            "}",
+            [action, details]
+        )
     except Exception:
         pass
 
@@ -491,6 +1056,31 @@ def enable_visible_mouse_tracking(page: Any) -> None:
     """
     try:
         inject_synthetic_cursor(page)
+    except Exception as e:
+        logger.exception("[interaction_primitives] enable_visible_mouse_tracking failed: %s", e)
+
+    try:
+        # Patch the raw mouse move so that every single micro-step of the Bezier curve updates the overlay!
+        if hasattr(page, "_human_raw_mouse"):
+            raw_mouse = page._human_raw_mouse
+            orig_raw_move = getattr(raw_mouse, "move", None)
+            if orig_raw_move and not getattr(raw_mouse, "_tokyo_raw_cursor_patched", False):
+                def _wrapped_raw_move(x: float, y: float, **kw: Any):
+                    res = orig_raw_move(x, y, **kw)
+                    try:
+                        _safe_evaluate(
+                            page,
+                            "([x,y]) => { const m = window.__human_cursor_move; if (m) m(x,y); }",
+                            [int(x), int(y)],
+                        )
+                    except Exception:
+                        pass
+                    return res
+                raw_mouse.move = _wrapped_raw_move
+                try:
+                    setattr(raw_mouse, "_tokyo_raw_cursor_patched", True)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -502,7 +1092,8 @@ def enable_visible_mouse_tracking(page: Any) -> None:
             def _wrapped_move(x: float, y: float, **kw: Any):
                 res = orig_move(x, y, **kw)
                 try:
-                    page.evaluate(
+                    _safe_evaluate(
+                        page,
                         "([x,y]) => { const m = window.__human_cursor_move; if (m) m(x,y); }",
                         [int(x), int(y)],
                     )
@@ -538,7 +1129,8 @@ def move_pointer(
     try:
         tx = res.get("x", x)
         ty = res.get("y", y)
-        page.evaluate(
+        _safe_evaluate(
+            page,
             "([x,y]) => { const m = window.__human_cursor_move; if (m) m(x,y); }",
             [int(tx), int(ty)],
         )

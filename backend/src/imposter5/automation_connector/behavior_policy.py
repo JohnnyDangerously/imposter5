@@ -35,15 +35,74 @@ class CompletionLevel:
     collect_visible_state: bool = True
 
 
-PERSONAS = (
-    Persona("focused_power_user", "medium", "direct_scan", 0.82, 1.10, "low_touch"),
-    Persona("curious_reader", "high", "pause_and_read", 1.25, 0.82, "inspect_then_move"),
-    Persona("impatient_scanner", "low", "long_skim", 0.68, 1.25, "minimal"),
-    Persona("slow_reader", "high", "short_partial_scrolls", 1.55, 0.72, "inspect_then_move"),
-    Persona("methodical_operator", "medium", "section_scan", 1.05, 0.95, "confirm_before_click"),
-    Persona("mobile_checker", "medium", "short_swipes", 1.15, 0.70, "touch_first"),
-    Persona("late_day_review", "high", "pause_and_read", 1.35, 0.78, "low_touch"),
-)
+PERSONAS_FILE_PATH = os.path.join(os.path.dirname(__file__), "personas.json")
+
+DEFAULT_PERSONAS = [
+    {"name": "focused_power_user", "patience": "medium", "scroll_style": "direct_scan", "dwell_multiplier": 0.82, "scroll_multiplier": 1.10, "interaction_style": "low_touch"},
+    {"name": "curious_reader", "patience": "high", "scroll_style": "pause_and_read", "dwell_multiplier": 1.25, "scroll_multiplier": 0.82, "interaction_style": "inspect_then_move"},
+    {"name": "impatient_scanner", "patience": "low", "scroll_style": "long_skim", "dwell_multiplier": 0.68, "scroll_multiplier": 1.25, "interaction_style": "minimal"},
+    {"name": "slow_reader", "patience": "high", "scroll_style": "short_partial_scrolls", "dwell_multiplier": 1.55, "scroll_multiplier": 0.72, "interaction_style": "inspect_then_move"},
+    {"name": "methodical_operator", "patience": "medium", "scroll_style": "section_scan", "dwell_multiplier": 1.05, "scroll_multiplier": 0.95, "interaction_style": "confirm_before_click"},
+    {"name": "mobile_checker", "patience": "medium", "scroll_style": "short_swipes", "dwell_multiplier": 1.15, "scroll_multiplier": 0.70, "interaction_style": "touch_first"},
+    {"name": "late_day_review", "patience": "high", "scroll_style": "pause_and_read", "dwell_multiplier": 1.35, "scroll_multiplier": 0.78, "interaction_style": "low_touch"},
+    {"name": "naive_bot", "patience": "low", "scroll_style": "instantaneous", "dwell_multiplier": 0.01, "scroll_multiplier": 2.0, "interaction_style": "robotic"}
+]
+
+
+def load_personas() -> list[Persona]:
+    try:
+        if os.path.exists(PERSONAS_FILE_PATH):
+            with open(PERSONAS_FILE_PATH, "r") as f:
+                data = json.load(f)
+                return [
+                    Persona(
+                        name=p["name"],
+                        patience=p["patience"],
+                        scroll_style=p["scroll_style"],
+                        dwell_multiplier=float(p["dwell_multiplier"]),
+                        scroll_multiplier=float(p["scroll_multiplier"]),
+                        interaction_style=p.get("interaction_style", "low_touch")
+                    )
+                    for p in data
+                ]
+    except Exception:
+        pass
+
+    try:
+        with open(PERSONAS_FILE_PATH, "w") as f:
+            json.dump(DEFAULT_PERSONAS, f, indent=2)
+    except Exception:
+        pass
+
+    return [
+        Persona(
+            name=p["name"],
+            patience=p["patience"],
+            scroll_style=p["scroll_style"],
+            dwell_multiplier=p["dwell_multiplier"],
+            scroll_multiplier=p["scroll_multiplier"],
+            interaction_style=p["interaction_style"]
+        )
+        for p in DEFAULT_PERSONAS
+    ]
+
+
+def save_personas(personas_list: list[dict[str, Any]]) -> None:
+    global PERSONAS
+    try:
+        with open(PERSONAS_FILE_PATH, "w") as f:
+            json.dump(personas_list, f, indent=2)
+    except Exception:
+        pass
+    try:
+        loaded = load_personas()
+        PERSONAS.clear()
+        PERSONAS.extend(loaded)
+    except Exception:
+        pass
+
+
+PERSONAS = load_personas()
 
 COMPLETION_LADDER = (
     CompletionLevel("glance_only", 15, 1),

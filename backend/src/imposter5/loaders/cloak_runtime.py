@@ -408,24 +408,39 @@ def apply_anti_fingerprint_init_script(context: Any) -> None:
     js = """
     (function(){
         try {
-            // Classic: make navigator.webdriver report false (or absent)
-            if ('webdriver' in navigator) {
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => false,
-                    configurable: true
-                });
-            }
             // Remove some common automation / driver artifacts if the wrapper left any
             try { delete window['cdc_']; } catch(e){}
             try { delete window['cdc_adoQpoasnfa76pfcZLmcfl']; } catch(e){}
-            // Light toString guard so patched natives don't scream "this was redefined by automation"
+
+            // Define custom webdriver getter on Navigator.prototype to prevent prototype leaks
+            const customWebdriverGetter = function get webdriver() {
+                return false;
+            };
+            if ('webdriver' in navigator) {
+                Object.defineProperty(Navigator.prototype, 'webdriver', {
+                    get: customWebdriverGetter,
+                    configurable: true
+                });
+            }
+
+            // Bulletproof toString override that handles custom toString and webdriver getter perfectly
             const origToString = Function.prototype.toString;
-            Function.prototype.toString = function toString() {
-                if (this === navigator.webdriver) {
-                    return 'function webdriver() { [native code] }';
+            const customToString = function toString() {
+                if (this === customToString) {
+                    return 'function toString() { [native code] }';
+                }
+                if (this === customWebdriverGetter) {
+                    return 'function get webdriver() { [native code] }';
                 }
                 return origToString.call(this);
             };
+
+            Object.defineProperty(Function.prototype, 'toString', {
+                value: customToString,
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
         } catch (e) {
             // never break the page
         }

@@ -63,26 +63,57 @@ def _cookie_key(user_id: str) -> str:
 
 
 def load_cookies(user_id: str) -> list[dict]:
-    """Load LinkedIn cookies for *user_id* from S3. Returns [] if not found."""
-    key = _cookie_key(user_id)
+    """Load LinkedIn cookies for *user_id* from local storage or S3. Returns [] if not found."""
     user_hash = _log_user_id(user_id)
+    
+    # Try local first
+    local_path = Path(__file__).parent.parent / "cookies" / f"{user_id}.json"
+    if local_path.is_file():
+        try:
+            with open(local_path, "r") as f:
+                data = json.load(f)
+                logger.info("[linkedin_browser] loaded %d cookies from local file for user_hash %s", len(data), user_hash)
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning("[linkedin_browser] failed to read local cookies: %s", e)
+
+    # Try S3 if local not found or fails
+    key = _cookie_key(user_id)
     try:
         resp = _s3().get_object(Bucket=_COOKIE_BUCKET, Key=key)
         data = json.loads(resp["Body"].read())
-        logger.info("[linkedin_browser] loaded %d cookies for user_hash %s", len(data), user_hash)
+        logger.info("[linkedin_browser] loaded %d cookies from S3 for user_hash %s", len(data), user_hash)
+        
+        # Cache locally
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(local_path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+            
         return data if isinstance(data, list) else []
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            logger.info("[linkedin_browser] no saved cookies for user_hash %s", user_hash)
-            return []
-        logger.warning("[linkedin_browser] S3 load error for user_hash %s: %s", user_hash, exc)
+    except Exception as exc:
+        logger.info("[linkedin_browser] no S3 cookies or S3 not configured for user_hash %s: %s", user_hash, exc)
         return []
 
 
 def save_cookies(user_id: str, cookies: list[dict]) -> None:
-    """Persist *cookies* list to S3 for *user_id*."""
-    key = _cookie_key(user_id)
+    """Persist *cookies* list to local storage and S3 for *user_id*."""
     user_hash = _log_user_id(user_id)
+    
+    # Save locally
+    local_path = Path(__file__).parent.parent / "cookies" / f"{user_id}.json"
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, "w") as f:
+            json.dump(cookies, f, indent=2)
+        logger.info("[linkedin_browser] saved %d cookies locally for user_hash %s", len(cookies), user_hash)
+    except Exception as exc:
+        logger.error("[linkedin_browser] failed to save cookies locally: %s", exc)
+
+    # Try S3
+    key = _cookie_key(user_id)
     try:
         _s3().put_object(
             Bucket=_COOKIE_BUCKET,
@@ -90,9 +121,9 @@ def save_cookies(user_id: str, cookies: list[dict]) -> None:
             Body=json.dumps(cookies, ensure_ascii=False).encode(),
             ContentType="application/json",
         )
-        logger.info("[linkedin_browser] saved %d cookies for user_hash %s", len(cookies), user_hash)
+        logger.info("[linkedin_browser] saved %d cookies to S3 for user_hash %s", len(cookies), user_hash)
     except Exception as exc:
-        logger.error("[linkedin_browser] S3 save error for user_hash %s: %s", user_hash, exc)
+        logger.warning("[linkedin_browser] S3 save bypassed or failed for user_hash %s: %s", user_hash, exc)
 
 
 # ---------------------------------------------------------------------------

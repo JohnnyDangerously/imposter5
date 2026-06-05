@@ -1,0 +1,32 @@
+[
+  {
+    "name": "LinkedIn Feed",
+    "url": "https://www.linkedin.com/feed",
+    "description": "Persistent LinkedIn feed simulation. Supports advanced feed reading, comment expansion, profile peeks, notifications checks, and avatar clicks."
+  },
+  {
+    "name": "The Last Human Line Sandbox",
+    "url": "http://127.0.0.1:5190/sandbox",
+    "description": "Adversarial Blue Team Anti-Bot Evaluation Sandbox. Tests browser environment integrity (Layer 2) and biometric kinetics (Layer 3)."
+  },
+  {
+    "name": "Wikipedia AI",
+    "url": "https://en.wikipedia.org/wiki/Artificial_intelligence",
+    "description": "Public Wikipedia article on AI. Great for testing multi-page link clicks and reading pauses."
+  },
+  {
+    "name": "Wikipedia Machine Learning",
+    "url": "https://en.wikipedia.org/wiki/Machine_learning",
+    "description": "Wikipedia article on ML. Perfect for testing search-like queries and scroll-and-read behaviors."
+  },
+  {
+    "name": "Yahoo News",
+    "url": "https://news.yahoo.com",
+    "description": "Dynamic news portal. Good for testing feed scans, comments, and fast-paced browsing."
+  },
+  {
+    "name": "Hacker News",
+    "url": "https://news.ycombinator.com",
+    "description": "Text-heavy tech feed. Ideal for testing precise, low-touch link clicks and methodic scanner pacing."
+  }
+]

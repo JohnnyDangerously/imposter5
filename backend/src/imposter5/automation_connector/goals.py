@@ -137,8 +137,44 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
 
     steps: list[GoalStep] = [GoalStep("visit_start_url", "visit")]
 
-    # Very basic action interp for common cases (pass 1; expand with LLM later)
-    if any(k in p for k in ("search", "find", "look for", "query", "google")):
+    import re
+
+    # Check for click links pattern (e.g., "click 5 links", "click three random links", "click links")
+    click_links_match = re.search(r"click\s+(\d+|five|four|three|two|one)?\s*links?", p)
+
+    if click_links_match:
+        num_str = click_links_match.group(1)
+        num_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+        if not num_str:
+            n_links = 3
+        elif num_str.isdigit():
+            n_links = int(num_str)
+        else:
+            n_links = num_map.get(num_str, 3)
+
+        n_links = min(10, max(1, n_links))
+        
+        for i in range(1, n_links + 1):
+            steps.append(GoalStep(f"click_random_link_{i}", "click", params={"selector": "random_link"}))
+            steps.append(GoalStep(f"wait_after_click_{i}", "wait"))
+            steps.append(GoalStep(f"scroll_new_page_{i}", "scroll", required=False))
+            steps.append(GoalStep(f"wait_on_new_page_{i}", "wait"))
+            steps.append(GoalStep(f"go_back_to_start_{i}", "backtrack"))
+            steps.append(GoalStep(f"wait_after_back_{i}", "wait"))
+            
+    elif any(k in p for k in ("sandbox", "lhhl", "audit", "last human line")) or "sandbox" in url.lower():
+        # Dedicated LHHL Sandbox Audit Flow
+        steps.extend([
+            GoalStep("settle_page", "wait"),
+            GoalStep("click_sandbox", "click", params={"selector": "#sandbox"}),
+            GoalStep("scroll_sandbox", "scroll", required=False),
+            GoalStep("click_input", "click", params={"selector": "#text-input"}),
+            GoalStep("type_text", "type", params={"selector": "#text-input", "text": "Imposter5 Evasion Test"}),
+            GoalStep("click_submit", "click", params={"selector": "#submit-btn"}),
+            GoalStep("wait_for_audit", "wait"),
+            GoalStep("record_visible_state", "record")
+        ])
+    elif any(k in p for k in ("search", "find", "look for", "query", "google")):
         # Assume a search flow; selectors are illustrative / will be made robust in runner or by caller providing params
         steps.append(GoalStep("focus_search", "click", params={"selector": "input[type=search], input[name=q], textarea[title*='Search']"}))
         # Extract query heuristically
@@ -170,7 +206,7 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
     return GoalSpec(
         name=name,
         start_url=url,
-        desired_outcome="prompt_executed" if any(k in p for k in ("search", "click", "type", "browse", "extract")) else DEFAULT_OUTCOME,
+        desired_outcome="prompt_executed" if any(k in p for k in ("search", "click", "type", "browse", "extract", "link")) else DEFAULT_OUTCOME,
         steps=tuple(steps),
         prompt=prompt,
     )
