@@ -66,14 +66,11 @@ from datetime import datetime
 from typing import Any
 
 # --- Config / paths (local only) ---
-TOKYO_WT = os.environ.get(
-    "TOKYO_AUTOMATION_PATH",
-    "/Users/john/repos/internal-app-tokyo",
-)
-if TOKYO_WT not in sys.path:
-    sys.path.insert(0, TOKYO_WT)
-
 FP_AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CLASSIFIER_TRAINING_SRC = os.path.join(FP_AGENT_ROOT, "classifier_training", "src")
+if CLASSIFIER_TRAINING_SRC not in sys.path:
+    sys.path.insert(0, CLASSIFIER_TRAINING_SRC)
+
 HONEY_DIR = os.path.join(FP_AGENT_ROOT, "honey_website")
 MUS_JS = os.path.join(
     HONEY_DIR, "static_sites", "honey_site", "js", "mus.js"
@@ -95,17 +92,17 @@ DEFAULT_EVASION_HUMAN_CONFIG = {
 BOT_LIKENESS_THRESHOLD = 0.55  # below this = "evades current clusters" for our purposes
 
 # --- Imports from our landed redteam improvements ---
-from server.automation_connector.behavior_policy import build_behavior_plan
-from server.automation_connector.interaction_primitives import (
+from imposter5.automation_connector.behavior_policy import build_behavior_plan
+from imposter5.automation_connector.interaction_primitives import (
     click_element,
     move_pointer,
     scroll_page,
     wait_human,
     enable_visible_mouse_tracking,
 )
-from server.automation_connector.session_recorder import SessionRecorder
+from imposter5.automation_connector.session_recorder import SessionRecorder
 
-from loaders.cloak_runtime import (
+from imposter5.loaders.cloak_runtime import (
     automation_connector_cloak_options,
     automation_connector_locale,
     automation_connector_timezone,

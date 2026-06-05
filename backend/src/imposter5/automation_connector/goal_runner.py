@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from server.automation_connector.behavior_policy import planned_scroll_passes
-from server.automation_connector.goals import GoalSpec
-from server.automation_connector.interaction_primitives import (
+from imposter5.automation_connector.behavior_policy import planned_scroll_passes
+from imposter5.automation_connector.goals import GoalSpec
+from imposter5.automation_connector.interaction_primitives import (
     click_element,
     hover_element,
     maybe_backtrack,
@@ -14,7 +14,7 @@ from server.automation_connector.interaction_primitives import (
     type_text,
     wait_human,
 )
-from server.automation_connector.session_recorder import SessionRecorder
+from imposter5.automation_connector.session_recorder import SessionRecorder
 
 
 def compile_goal_actions(goal: GoalSpec, behavior_plan: dict[str, Any] | None = None) -> list[dict[str, Any]]:

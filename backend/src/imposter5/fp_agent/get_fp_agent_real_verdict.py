@@ -31,6 +31,12 @@ import os
 import sys
 from typing import Any
 
+# Add classifier_training/src to sys.path so we can import from it
+FP_AGENT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CLASSIFIER_TRAINING_SRC = os.path.join(FP_AGENT_ROOT, "classifier_training", "src")
+if CLASSIFIER_TRAINING_SRC not in sys.path:
+    sys.path.insert(0, CLASSIFIER_TRAINING_SRC)
+
 # The sorted class order for the "browsing_agents_only" (Human removed) models.
 # This matches what their AgentClassificationDataset.create_label_mapping does on sorted keys.
 BROWSING_AGENTS_ONLY_LABELS: list[str] = [

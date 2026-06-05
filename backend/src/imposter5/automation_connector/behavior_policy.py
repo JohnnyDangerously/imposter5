@@ -12,7 +12,7 @@ import random
 import secrets
 from typing import Any
 
-from server.automation_connector.goals import GoalSpec, goal_spec_to_payload
+from imposter5.automation_connector.goals import GoalSpec, goal_spec_to_payload
 
 POLICY_VERSION = "goal-behavior-v1"
 

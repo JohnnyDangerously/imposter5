@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from loaders.cloak_runtime import automation_connector_humanize_enabled
+from imposter5.loaders.cloak_runtime import automation_connector_humanize_enabled
 
 
 class BrowserRunnerUnavailable(RuntimeError):
@@ -30,7 +30,7 @@ class CloakBrowserRunner:
         # Use the centralized launcher (in loaders/cloak_runtime) so Cloak API changes or
         # human_config evolution are not duplicated. The runner still provides the swappable
         # BrowserRunner boundary for camoufox vs cloak selection.
-        from loaders.cloak_runtime import launch_automation_browser
+        from imposter5.loaders.cloak_runtime import launch_automation_browser
 
         try:
             return launch_automation_browser(headless=headless)

@@ -15,13 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-# Ensure backend root and server directory are in sys.path
+# Ensure backend root and src directory are in sys.path
 backend_dir = str(Path(__file__).parent.resolve())
+src_dir = str(Path(backend_dir) / "src")
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from server.errors import success_response, error_response
-from server.automation_connector.models import Imposter5RunRequest
+from imposter5.errors import success_response, error_response
+from imposter5.automation_connector.models import Imposter5RunRequest
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,11 +43,8 @@ app.add_middleware(
 
 
 def _get_fp_agent_verdict(frames: list) -> dict | None:
-    fp_agent_path = os.path.join(backend_dir, "fp_agent")
-    if fp_agent_path not in sys.path:
-        sys.path.insert(0, fp_agent_path)
     try:
-        from fp_agent_local_redteam_detector_test import try_real_fp_agent_verdict
+        from imposter5.fp_agent.fp_agent_local_redteam_detector_test import try_real_fp_agent_verdict
         return try_real_fp_agent_verdict(frames, print_header=False)
     except Exception as e:
         logger.error(f"[imposter5] could not import try_real_fp_agent_verdict: {e}")
@@ -55,7 +55,7 @@ def _get_fp_agent_verdict(frames: list) -> dict | None:
 async def imposter5_personas():
     """Return available personas for the UI."""
     try:
-        from server.automation_connector.behavior_policy import PERSONAS
+        from imposter5.automation_connector.behavior_policy import PERSONAS
         return success_response({
             "personas": [
                 {
@@ -75,12 +75,12 @@ async def imposter5_personas():
 async def imposter5_run(body: Imposter5RunRequest):
     """Launch an Imposter5 red team simulation with custom behavior packs and techniques."""
     # Build the behavior plan
-    from server.automation_connector.behavior_policy import build_behavior_plan, PERSONAS
-    from server.automation_connector.goals import goal_spec_from_payload
-    from server.automation_connector.goal_runner import run_visible_state_goal
-    from server.automation_connector.session_recorder import SessionRecorder
-    from server.automation_connector.interaction_primitives import enable_visible_mouse_tracking
-    from server.automation_connector.browser_runner import get_browser_runner
+    from imposter5.automation_connector.behavior_policy import build_behavior_plan, PERSONAS
+    from imposter5.automation_connector.goals import goal_spec_from_payload
+    from imposter5.automation_connector.goal_runner import run_visible_state_goal
+    from imposter5.automation_connector.session_recorder import SessionRecorder
+    from imposter5.automation_connector.interaction_primitives import enable_visible_mouse_tracking
+    from imposter5.automation_connector.browser_runner import get_browser_runner
 
     # 1. Build base plan
     fake_target = {
@@ -143,7 +143,7 @@ async def imposter5_run(body: Imposter5RunRequest):
     latest_codex_path = ""
 
     try:
-        from loaders.cloak_runtime import (
+        from imposter5.loaders.cloak_runtime import (
             apply_anti_fingerprint_init_script,
             automation_connector_stealth_context_kwargs,
         )
@@ -179,8 +179,7 @@ async def imposter5_run(body: Imposter5RunRequest):
         if body.run_fp_agent:
             logs.append(f"[{datetime.now().isoformat()}] Starting mus.js behavioral recording for fp-agent analysis")
             try:
-                sys.path.insert(0, os.path.join(backend_dir, "fp_agent"))
-                from fp_agent_local_redteam_detector_test import ensure_mus_recording
+                from imposter5.fp_agent.fp_agent_local_redteam_detector_test import ensure_mus_recording
                 ensure_mus_recording(page)
             except Exception as e:
                 logs.append(f"[{datetime.now().isoformat()}] Warning: could not start mus recording: {e}")
@@ -188,7 +187,7 @@ async def imposter5_run(body: Imposter5RunRequest):
         # Run the actual goal
         if body.provider == "linkedin":
             logs.append(f"[{datetime.now().isoformat()}] Executing LinkedIn feed scrape")
-            from loaders.linkedin_feed_scraper import scrape_feed
+            from imposter5.loaders.linkedin_feed_scraper import scrape_feed
             try:
                 posts = scrape_feed(
                     "visible_watch_session",
@@ -220,7 +219,7 @@ async def imposter5_run(body: Imposter5RunRequest):
         # If running fp-agent, stop mus recording and get frames
         if body.run_fp_agent:
             try:
-                from fp_agent_local_redteam_detector_test import stop_and_get_mus_frames
+                from imposter5.fp_agent.fp_agent_local_redteam_detector_test import stop_and_get_mus_frames
                 all_captured_frames = stop_and_get_mus_frames(page)
                 logs.append(f"[{datetime.now().isoformat()}] Stopped mus.js recording. Captured {len(all_captured_frames)} frames")
             except Exception as e:
@@ -283,8 +282,7 @@ async def imposter5_run(body: Imposter5RunRequest):
     if body.run_fp_agent and all_captured_frames:
         logs.append(f"[{datetime.now().isoformat()}] Running fp-agent evasion detector analysis")
         try:
-            sys.path.insert(0, os.path.join(backend_dir, "fp_agent"))
-            from fp_agent_local_redteam_detector_test import (
+            from imposter5.fp_agent.fp_agent_local_redteam_detector_test import (
                 compute_straightness_and_curvature,
                 compute_timing_cv,
                 count_overshoot_proxies,

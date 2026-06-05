@@ -10,11 +10,11 @@ import random
 import string
 from typing import Any
 
-from server.automation_connector.behavior_policy import (
+from imposter5.automation_connector.behavior_policy import (
     planned_scroll_delta,
     planned_wait_ms,
 )
-from server.automation_connector.session_recorder import SessionRecorder
+from imposter5.automation_connector.session_recorder import SessionRecorder
 
 
 def _seeded_rng(plan: dict[str, Any] | None, namespace: str) -> random.Random:

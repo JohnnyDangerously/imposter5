@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imposter5"
+version = "1.0.0"
+description = "Imposter5 Red Team Human Mechanics Suite"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.42.0",
+    "xgboost>=2.0.0",
+    "scikit-learn>=1.4.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "orjson>=3.9.0",
+    "pyyaml>=6.0.0",
+    "tqdm>=4.66.0",
+    "cloakbrowser>=0.3.31,<0.4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imposter5"]

@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from server.automation_connector.platforms import DEFAULT_AUTOMATION_URL
+from imposter5.automation_connector.platforms import DEFAULT_AUTOMATION_URL
 
 
 class AutomationConnectorSessionRequest(BaseModel):

@@ -30,19 +30,19 @@ import time
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-from server.automation_connector.behavior_policy import (
+from imposter5.automation_connector.behavior_policy import (
     behavior_summary,
     planned_scroll_delta,
     planned_scroll_passes,
     planned_wait_ms,
 )
-from server.automation_connector.interaction_primitives import (
+from imposter5.automation_connector.interaction_primitives import (
     maybe_expand_comments,
     move_pointer,
     scroll_page,
     wait_human,
 )
-from server.automation_connector.session_recorder import SessionRecorder
+from imposter5.automation_connector.session_recorder import SessionRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -903,7 +903,7 @@ def scrape_feed(
         Up to 10 post dicts.  Returns [] if not authenticated or on any error
         unless ``raise_on_error`` is true.
     """
-    from loaders.linkedin_browser import LinkedInBrowserSession, is_logged_in
+    from imposter5.loaders.linkedin_browser import LinkedInBrowserSession, is_logged_in
 
     user_hash = _log_user_id(user_id)
     try:
@@ -912,7 +912,7 @@ def scrape_feed(
         ) as page:
             if visible:
                 try:
-                    from server.automation_connector.interaction_primitives import enable_visible_mouse_tracking
+                    from imposter5.automation_connector.interaction_primitives import enable_visible_mouse_tracking
                     enable_visible_mouse_tracking(page)
                     try:
                         page.bring_to_front()
@@ -1055,7 +1055,7 @@ def scrape_feed(
 
 def scrape_post_identity(user_id: str, post_url: str, *, raise_on_error: bool = False, headless: bool = True) -> dict | None:
     """Open one LinkedIn post permalink and return its visible identity metadata."""
-    from loaders.linkedin_browser import LinkedInBrowserSession, is_logged_in
+    from imposter5.loaders.linkedin_browser import LinkedInBrowserSession, is_logged_in
 
     if not _is_linkedin_post_url(post_url):
         return None
