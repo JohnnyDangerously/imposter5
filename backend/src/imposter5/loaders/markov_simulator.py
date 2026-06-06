@@ -104,7 +104,7 @@ def run_markov_simulation(
     recorder = recorder or SessionRecorder(plan)
     
     # Load transition matrix from plan if provided (e.g., custom user upload), otherwise use default
-    matrix = plan.get("markov_matrix", DEFAULT_HUMAN_MATRIX)
+    matrix = plan.get("markov_matrix") or plan.get("variations", {}).get("markov_matrix") or DEFAULT_HUMAN_MATRIX
     
     update_status_ticker(page, "🎲 MARKOV INITIALIZED", "Generating probabilistic pathing...")
     wait_human(page, plan, 0, 1000, recorder=recorder)

@@ -92,6 +92,7 @@ export default function App() {
   const [variations, setVariations] = useState({
     bidirectional_scroll: true,
     hover_and_read: true,
+    use_markov_pathing: false,
     expand_comments: true,
     profile_peeks: false,
     notifications_check: false,
@@ -548,7 +549,7 @@ export default function App() {
                   <div className="mb-4">
                     <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider block mb-2">Generic Browsing Techniques (All Sites)</span>
                     <div className="grid grid-cols-2 gap-2">
-                      {['bidirectional_scroll', 'hover_and_read'].map((key) => {
+                      {['bidirectional_scroll', 'hover_and_read', 'use_markov_pathing'].map((key) => {
                         const active = variations[key as keyof typeof variations];
                         return (
                           <button
