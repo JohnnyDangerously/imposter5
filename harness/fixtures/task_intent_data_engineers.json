@@ -1,0 +1,19 @@
+{
+  "schema": "lhhl-task-intent/v1",
+  "site": "gauntlet",
+  "archetype": "social_feed",
+  "describe": "search data engineers, scan the results, open relevant profiles, read",
+  "objective": {
+    "main_scenes": ["search_open", "search_query", "results_scan", "profile_open", "profile_read", "profile_back"],
+    "query_hint": "data engineers",
+    "goal_predicate": { "type": "scan_fraction", "target": 0.5, "jitter": 0.15 }
+  },
+  "curiosity": {
+    "tangent_chance": 0.25,
+    "max_tangents": 3,
+    "max_depth": 1,
+    "tangent_scenes": ["tangent_open_profile", "tangent_read", "tangent_back", "tangent_research", "tangent_refresh"]
+  },
+  "variance": { "dwell_cv": 0.4, "order_jitter": true, "partial_substitution": true },
+  "cadence": "~1/day"
+}
