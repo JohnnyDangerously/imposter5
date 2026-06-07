@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Gauntlet Fixture (contract-conformant, local dev only)</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: #1f2933; background: #f4f6f9; }
+  #g-topbar { position: sticky; top: 0; display: flex; align-items: center; gap: 12px;
+              padding: 10px 16px; background: #fff; border-bottom: 1px solid #e2e8f0; z-index: 10; }
+  #g-logo { font-weight: 800; color: #2563eb; font-size: 18px; }
+  [role=search] { display: flex; align-items: center; gap: 6px; flex: 1; max-width: 520px; }
+  #g-search-input { flex: 1; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 999px; font-size: 14px; }
+  #g-search-go { padding: 8px 14px; border: 0; border-radius: 999px; background: #2563eb; color: #fff; cursor: pointer; }
+  nav#g-nav { display: flex; gap: 10px; margin-left: auto; }
+  nav#g-nav a { text-decoration: none; color: #475569; font-size: 13px; padding: 6px 8px; border-radius: 8px; }
+  nav#g-nav a:hover { background: #eef2ff; }
+  main { max-width: 760px; margin: 16px auto; padding: 0 16px; }
+  .g-view { display: none; }
+  .g-view.active { display: block; }
+  .g-feed-post { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+  #g-results-list { max-height: 520px; overflow-y: auto; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; }
+  .g-result-card { padding: 14px 16px; border-bottom: 1px solid #eef2f6; display: flex; flex-direction: column; gap: 4px; }
+  .g-result-name { font-weight: 600; color: #2563eb; text-decoration: none; }
+  .g-result-headline { color: #64748b; font-size: 13px; }
+  .g-result-connect { align-self: flex-start; margin-top: 6px; padding: 5px 12px; border: 1px solid #2563eb;
+                      background: #fff; color: #2563eb; border-radius: 999px; cursor: pointer; font-size: 12px; }
+  #g-view-profile { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; max-height: 560px; overflow-y: auto; }
+  #g-profile-back { margin: 12px; padding: 6px 12px; border: 1px solid #cbd5e1; background: #fff; border-radius: 8px; cursor: pointer; }
+  #g-profile-header { padding: 0 16px 12px; font-size: 20px; font-weight: 700; }
+  .g-profile-section { padding: 16px; border-top: 1px solid #eef2f6; }
+  .g-profile-section h3 { margin: 0 0 8px; font-size: 15px; }
+  .g-profile-section p { margin: 0; color: #475569; line-height: 1.5; }
+  /* --- Honeypot styling (traps a naive bot; a human/Red never reaches these) --- */
+  .hp-displaynone { display: none !important; }
+  .hp-offscreen { position: absolute !important; left: -9999px !important; top: -9999px !important; }
+  .hp-transparent { opacity: 0 !important; }
+  .hp-collapsed { visibility: hidden !important; }
+</style>
+</head>
+<body>
+  <header id="g-topbar">
+    <span id="g-logo">gauntlet</span>
+    <div role="search" aria-label="Site search">
+      <input id="g-search-input" type="search" placeholder="Search people, posts, jobs" aria-label="Search" />
+      <button id="g-search-go" type="submit" aria-label="Search">Go</button>
+      <!-- Honeypot submit: invisible trap that a naive crawler might fire. -->
+      <button id="g-search-go-trap" aria-label="Search" tabindex="-1" class="hp-offscreen">Go</button>
+    </div>
+    <nav id="g-nav" aria-label="Primary">
+      <a id="g-nav-home" href="#home">Home</a>
+      <a id="g-nav-network" href="#network">Network</a>
+      <a id="g-nav-jobs" href="#jobs">Jobs</a>
+      <a id="g-nav-notifications" href="#notifications">Alerts</a>
+      <a id="g-nav-messages" href="#messages">Messages</a>
+      <a id="g-nav-me" href="#me">Me</a>
+      <!-- Honeypot nav link: aria-hidden + tabindex trap. -->
+      <a id="g-nav-trap" href="#trap" aria-hidden="true" tabindex="-1" class="hp-transparent">Admin</a>
+    </nav>
+  </header>
+
+  <main>
+    <!-- DEFAULT VIEW: feed -->
+    <section id="g-view-feed" class="g-view active" aria-label="Feed">
+      <div class="g-feed-post" data-post-id="p1"><strong>Ada N.</strong><p>Shipping a new data pipeline this week. Thoughts on streaming vs batch?</p></div>
+      <div class="g-feed-post" data-post-id="p2"><strong>Bo R.</strong><p>Hiring data engineers. DM me if interested.</p></div>
+      <div class="g-feed-post" data-post-id="p3"><strong>Chi L.</strong><p>Great meetup last night on warehouse modeling.</p></div>
+      <div class="g-feed-post" data-post-id="p4"><strong>Dee P.</strong><p>Hot take: dbt changed everything.</p></div>
+      <div class="g-feed-post" data-post-id="p5"><strong>Evan S.</strong><p>Anyone using DuckDB in prod?</p></div>
+    </section>
+
+    <!-- RESULTS VIEW (revealed on search) -->
+    <section id="g-view-results" class="g-view" aria-label="Search results">
+      <div id="g-results-list" role="list" aria-label="Search results"></div>
+    </section>
+
+    <!-- PROFILE VIEW (revealed on opening a result) -->
+    <section id="g-view-profile" class="g-view" role="region" aria-label="Profile">
+      <button id="g-profile-back" aria-label="Back">&larr; Back</button>
+      <div id="g-profile-header">Profile</div>
+      <section class="g-profile-section" data-section="about"><h3>About</h3><p id="g-profile-about">A seasoned data engineer focused on reliable, observable pipelines. Enjoys mentoring and open source. Has spent years building streaming systems and batch warehouses across several teams, with a strong bias toward simple, well-tested designs and clear data contracts between producers and consumers.</p></section>
+      <section class="g-profile-section" data-section="experience"><h3>Experience</h3><p>Staff Data Engineer, Acme (2021–present). Senior Data Engineer, Globex (2017–2021). Built ingestion, transformation, and serving layers; led migrations to columnar storage; owned data quality SLAs and on-call rotations across multiple high-volume domains for years.</p></section>
+      <section class="g-profile-section" data-section="skills"><h3>Skills</h3><p>SQL, Python, Spark, Kafka, dbt, Airflow, warehouse modeling, streaming, observability, cost optimization, schema evolution, contract testing, and a long tail of glue tooling accumulated over a long career in data platforms.</p></section>
+      <section class="g-profile-section" data-section="education"><h3>Education</h3><p>B.S. Computer Science. Numerous certifications and a steady habit of reading papers, writing internal design docs, and giving the occasional conference talk on data reliability.</p></section>
+      <!-- Honeypot profile action: 1px transparent trap. -->
+      <button id="g-profile-trap" aria-label="Connect" class="hp-transparent" style="width:1px;height:1px;">trap</button>
+    </section>
+  </main>
+
+  <script>
+  (function () {
+    var NAMES = [
+      "Ada Lovelace","Bo Reynolds","Chi Nakamura","Dee Patel","Evan Stone","Fay Ibarra","Gus Romano",
+      "Hana Kim","Ivo Petrov","Jia Wen","Kai Larsson","Lena Diaz","Moe Hassan","Nia Brooks","Omar Vidal",
+      "Pia Costa","Quincy Ade","Rosa Mejia","Sami Toth","Tia Park","Uri Hahn","Vee Cruz","Wes Boyd","Xiu Lan"
+    ];
+    var HEADLINES = [
+      "Senior Data Engineer","Staff Data Engineer","Analytics Engineer","Data Platform Lead",
+      "ML Data Engineer","Streaming Data Engineer","Data Infrastructure Engineer"
+    ];
+
+    function buildResults() {
+      var list = document.getElementById("g-results-list");
+      if (list.dataset.built === "1") return;
+      for (var i = 0; i < NAMES.length; i++) {
+        var card = document.createElement("div");
+        card.className = "g-result-card";
+        card.setAttribute("role", "listitem");
+        card.setAttribute("data-person-id", "person-" + (1000 + i));
+        var a = document.createElement("a");
+        a.className = "g-result-name";
+        a.href = "#profile-" + (1000 + i);
+        a.textContent = NAMES[i];
+        a.addEventListener("click", function (e) { e.preventDefault(); showView("profile"); });
+        var hl = document.createElement("div");
+        hl.className = "g-result-headline";
+        hl.textContent = HEADLINES[i % HEADLINES.length];
+        var btn = document.createElement("button");
+        btn.className = "g-result-connect";
+        btn.textContent = "Connect";
+        card.appendChild(a); card.appendChild(hl); card.appendChild(btn);
+        list.appendChild(card);
+      }
+      // Honeypot result cards (a naive scraper that ignores visibility opens these).
+      var hpHidden = document.createElement("div");
+      hpHidden.className = "g-result-card hp-displaynone";
+      hpHidden.setAttribute("role", "listitem");
+      hpHidden.setAttribute("data-person-id", "trap-hidden");
+      hpHidden.innerHTML = '<a class="g-result-name" href="#trap">TRAP Hidden</a><div class="g-result-headline">do not click</div>';
+      list.appendChild(hpHidden);
+
+      var hpOff = document.createElement("div");
+      hpOff.className = "g-result-card hp-offscreen";
+      hpOff.setAttribute("role", "listitem");
+      hpOff.setAttribute("data-person-id", "trap-offscreen");
+      hpOff.innerHTML = '<a class="g-result-name" href="#trap" tabindex="-1">TRAP Offscreen</a><div class="g-result-headline">do not click</div>';
+      list.appendChild(hpOff);
+
+      list.dataset.built = "1";
+    }
+
+    function showView(name) {
+      var views = document.querySelectorAll(".g-view");
+      for (var i = 0; i < views.length; i++) views[i].classList.remove("active");
+      if (name === "results") buildResults();
+      var el = document.getElementById("g-view-" + name);
+      if (el) el.classList.add("active");
+      window.scrollTo(0, 0);
+    }
+
+    function doSearch() {
+      var q = (document.getElementById("g-search-input").value || "").trim();
+      showView("results");
+    }
+
+    document.getElementById("g-search-go").addEventListener("click", function (e) { e.preventDefault(); doSearch(); });
+    document.getElementById("g-search-input").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); doSearch(); }
+    });
+    document.getElementById("g-profile-back").addEventListener("click", function () { showView("results"); });
+
+    // Expose for debugging / harness inspection (not used by the executor).
+    window.__gauntlet = { showView: showView };
+  })();
+  </script>
+</body>
+</html>
