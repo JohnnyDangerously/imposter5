@@ -106,7 +106,6 @@ class StoryExecutor:
 
         self._resume_stack: list[dict[str, Any]] = []
         self._opened_objective_keys: set[str] = set()
-        self._scanned_keys: set[str] = set()  # cumulative "items seen" for window lists
         self.trace: list[dict[str, Any]] = []
         self.tangents_fired = 0
         self.tangents_returned = 0
