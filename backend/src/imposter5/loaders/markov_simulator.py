@@ -1,17 +1,21 @@
-"""Markov Chain Pathing Simulator for Imposter5.
+"""Semi-Markov Pathing Simulator for Imposter5.
 
-Generates dynamic, non-linear, probabilistic browsing sessions based on a 
-transition probability matrix. Bypasses rigid script execution in favor of 
-natural human state transitions.
+Generates dynamic, non-linear, probabilistic browsing sessions based on a
+transition probability matrix plus an explicit per-state dwell (sojourn) time.
+This makes the process a *semi-Markov* one: the next state is chosen from the
+transition matrix, and the time spent in that state is sampled from a per-state
+log-normal sojourn distribution rather than a flat uniform draw.
 """
 
 from __future__ import annotations
 
 import logging
-import random
+import math
 from typing import Any
 
+from imposter5.automation_connector.humanize_dist import lognormal_ms, weibull_ms
 from imposter5.automation_connector.interaction_primitives import (
+    _session_rng,
     click_element,
     hover_element,
     move_pointer,
@@ -24,7 +28,9 @@ from imposter5.automation_connector.session_recorder import SessionRecorder
 
 logger = logging.getLogger(__name__)
 
-# Default human transition matrix trained on real browsing sessions
+# Default human transition matrix — hand-tuned defaults (a hand-typed constant,
+# not learned from data). Each row is the distribution over next states given
+# the current state; rows are re-normalized at runtime so small edits stay safe.
 DEFAULT_HUMAN_MATRIX = {
     "idle": {
         "idle": 0.15,
@@ -91,6 +97,190 @@ DEFAULT_HUMAN_MATRIX = {
     }
 }
 
+# Per-state sojourn-time table for the semi-Markov process: (mean_ms, cv).
+# Hand-tuned defaults: idle/reading dwells longest, clicks are quick, typing
+# and scrolling sit in the middle. Sampled via a log-normal so the long tail
+# (occasional long pauses) looks human rather than uniformly bounded.
+STATE_DWELL_MS: dict[str, tuple[float, float]] = {
+    "idle": (2400.0, 0.55),
+    "mousemove": (520.0, 0.45),
+    "scroll_down": (900.0, 0.50),
+    "scroll_up": (820.0, 0.50),
+    "hover": (760.0, 0.45),
+    "click": (380.0, 0.40),
+    "typing": (1300.0, 0.50),
+}
+
+# Short transition gap between leaving one state and entering the next.
+INTER_STEP_MEAN_MS = 320.0
+INTER_STEP_CV = 0.45
+
+# Global clamps so log-normal tails stay plausible.
+DWELL_LO_MS = 80
+DWELL_HI_MS = 12_000
+GAP_HI_MS = 4_000
+
+TYPING_QUERIES = ("hello", "markov chains", "last human line", "cybersecurity", "evasion")
+
+# --- Hierarchical goal/intent layer ----------------------------------------------
+#
+# Real browsing is not a flat metronomic move/pause loop: it is organized into
+# higher-level INTENTS ("read this for a bit", "scan down the page", "engage with an
+# element", "fill a field") that each bias the low-level action mix for a stretch and
+# then hand off to another intent. This is a hierarchical (goal -> subaction) model,
+# and the intent layer is itself a semi-Markov process (each intent has a sampled
+# sojourn in sub-steps before switching). The result is structurally human bursts of
+# related activity whose OBSERVABLE event mix differs every run, instead of a fixed
+# action chain. Models of web behavior describe exactly these higher-order "browsing
+# states"/sessions over primitive events (e.g. Montgomery et al., 2004, *Marketing
+# Science*, on clickstream "browsing states"; Catledge & Pitkow, 1995).
+#
+# Each intent supplies multiplicative biases applied to the base transition row and
+# then renormalized, so the underlying transition structure is preserved while the
+# emphasis shifts.
+INTENT_BIAS: dict[str, dict[str, float]] = {
+    "reading": {"idle": 2.4, "scroll_down": 1.4, "scroll_up": 1.3, "mousemove": 0.7, "hover": 0.6, "click": 0.3, "typing": 0.2},
+    "scanning": {"idle": 0.6, "scroll_down": 1.9, "mousemove": 1.6, "scroll_up": 0.7, "hover": 0.9, "click": 0.5, "typing": 0.2},
+    "engaging": {"idle": 0.8, "hover": 1.9, "click": 1.9, "mousemove": 1.3, "scroll_down": 0.7, "scroll_up": 0.6, "typing": 0.6},
+    "form_filling": {"typing": 3.2, "click": 1.6, "hover": 1.2, "mousemove": 1.0, "idle": 0.7, "scroll_down": 0.4, "scroll_up": 0.2},
+}
+
+# Intent-to-intent transition weights (the higher-level semi-Markov chain). Rows are
+# renormalized at runtime; diagonal weight gives natural "stickiness" so an intent
+# persists for a human-plausible burst before switching.
+INTENT_TRANSITIONS: dict[str, dict[str, float]] = {
+    "reading": {"reading": 0.45, "scanning": 0.35, "engaging": 0.15, "form_filling": 0.05},
+    "scanning": {"scanning": 0.40, "reading": 0.30, "engaging": 0.25, "form_filling": 0.05},
+    "engaging": {"engaging": 0.35, "reading": 0.30, "scanning": 0.25, "form_filling": 0.10},
+    "form_filling": {"form_filling": 0.40, "engaging": 0.30, "reading": 0.20, "scanning": 0.10},
+}
+
+# Per-intent sojourn in sub-steps (mean, cv) for a log-normal draw.
+INTENT_SOJOURN_STEPS: dict[str, tuple[float, float]] = {
+    "reading": (4.0, 0.5),
+    "scanning": (3.5, 0.5),
+    "engaging": (3.0, 0.6),
+    "form_filling": (4.5, 0.5),
+}
+
+# Occasional distraction/idle: a heavy-tailed Weibull gap modelling the operator
+# briefly looking away (shape < 1 => heavy tail of rare long pauses).
+DISTRACTION_CHANCE = 0.06
+DISTRACTION_SCALE_MS = 2_200.0
+DISTRACTION_SHAPE = 0.8
+DISTRACTION_HI_MS = 30_000.0
+
+
+def _visible_text_amount(page: Any) -> int:
+    """Best-effort character count of the currently visible body text.
+
+    Used to correlate reading-pause length with how much content is on screen:
+    humans dwell longer on text-dense views. Silent reading proceeds at ~238 wpm
+    (Brysbaert, 2019), i.e. a few hundred ms per word. Failures return 0 (honest
+    "unknown"), which leaves the base dwell unscaled rather than fabricating content.
+    """
+    try:
+        txt = page.inner_text("body")
+    except Exception:
+        return 0
+    return len(str(txt or ""))
+
+
+def _reading_scale(char_count: int) -> float:
+    """Map visible-text amount to a dwell multiplier in ~[0.7, 1.8].
+
+    Roughly: sparse pages read faster (less to take in), dense pages slower. The
+    log keeps the scaling sub-linear so a very long page does not produce an absurd
+    pause. Anchored so ~600 chars (a typical visible paragraph) maps near 1.0.
+    """
+    if char_count <= 0:
+        return 1.0
+    scale = 0.7 + 0.18 * math.log2(1.0 + char_count / 150.0)
+    return max(0.7, min(1.8, scale))
+
+
+def _choose_intent(rng: Any, current: str) -> str:
+    row = INTENT_TRANSITIONS.get(current, INTENT_TRANSITIONS["reading"])
+    intents = list(row.keys())
+    weights = list(row.values())
+    total = sum(weights) or 1.0
+    weights = [w / total for w in weights]
+    return rng.choices(intents, weights=weights, k=1)[0]
+
+
+def _biased_row(base_row: dict[str, float], intent: str) -> tuple[list[str], list[float]]:
+    """Apply the current intent's multiplicative bias to a base transition row."""
+    bias = INTENT_BIAS.get(intent, {})
+    states = list(base_row.keys())
+    weights = [float(base_row[s]) * float(bias.get(s, 1.0)) for s in states]
+    total = sum(weights)
+    if total <= 0:
+        # Degenerate after biasing: fall back to the unbiased row rather than guessing.
+        weights = [float(base_row[s]) for s in states]
+        total = sum(weights) or 1.0
+    return states, [w / total for w in weights]
+
+
+def _normalize_matrix(matrix: dict[str, Any], *, source: str) -> dict[str, dict[str, float]]:
+    """Validate each transition row and return a normalized copy.
+
+    Rows that do not sum to ~1.0 are normalized and reported (logged); rows that
+    are empty or non-positive are a real defect and raise rather than silently
+    degrade to a fabricated distribution.
+    """
+    normalized: dict[str, dict[str, float]] = {}
+    for state, probs in matrix.items():
+        if not isinstance(probs, dict) or not probs:
+            raise ValueError(f"markov_matrix row '{state}' is empty or not a mapping")
+        total = sum(float(v) for v in probs.values())
+        if total <= 0:
+            raise ValueError(f"markov_matrix row '{state}' sums to {total}; cannot normalize")
+        if abs(total - 1.0) > 1e-6:
+            logger.warning(
+                "[markov_simulator] %s matrix row '%s' sums to %.4f; normalizing to 1.0",
+                source, state, total,
+            )
+            normalized[state] = {k: float(v) / total for k, v in probs.items()}
+        else:
+            normalized[state] = {k: float(v) for k, v in probs.items()}
+    return normalized
+
+
+def _sample_dwell_ms(rng: Any, state: str) -> int:
+    mean_ms, cv = STATE_DWELL_MS.get(state, STATE_DWELL_MS["idle"])
+    return int(lognormal_ms(rng, mean_ms=mean_ms, cv=cv, lo=DWELL_LO_MS, hi=DWELL_HI_MS))
+
+
+def _pick_visible_locator(page: Any, rng: Any, selector: str, *, limit: int = 40) -> Any | None:
+    """Return a single visible element handle chosen with the seeded rng, or None.
+
+    Resolving the multi-match selector to one concrete (`.first`-friendly) element
+    handle here keeps the downstream click/hover primitives unambiguous and lets
+    the seeded rng own the link pick for run reproducibility.
+    """
+    try:
+        candidates = page.locator(selector).all()
+    except Exception:
+        return None
+    visible = []
+    for loc in candidates[:limit]:
+        try:
+            if not loc.is_visible() or not loc.is_enabled():
+                # Skip hidden and disabled controls (e.g. the harness auto-submit
+                # button is disabled; clicking it just burns the action timeout).
+                continue
+            el_id = (loc.get_attribute("id") or "").lower()
+            if "submit" in el_id or "honeypot" in el_id:
+                # Never let the random walk fire the form submit or a honeypot
+                # trap; submit timing and trap evasion are owned elsewhere.
+                continue
+            visible.append(loc)
+        except Exception:
+            continue
+    if not visible:
+        return None
+    return rng.choice(visible)
+
 
 def run_markov_simulation(
     page: Any,
@@ -99,105 +289,158 @@ def run_markov_simulation(
     recorder: SessionRecorder | None = None,
     max_steps: int = 25,
 ) -> dict[str, Any]:
-    """Execute a dynamic, Markov-chain-driven browsing session."""
+    """Execute a dynamic, semi-Markov-driven browsing session."""
     plan = behavior_plan or {}
     recorder = recorder or SessionRecorder(plan)
-    
-    # Load transition matrix from plan if provided (e.g., custom user upload), otherwise use default
-    matrix = plan.get("markov_matrix") or plan.get("variations", {}).get("markov_matrix") or DEFAULT_HUMAN_MATRIX
-    
-    update_status_ticker(page, "🎲 MARKOV INITIALIZED", "Generating probabilistic pathing...")
+
+    # Single advancing per-session RNG (see interaction_primitives). By DEFAULT this
+    # is fresh OS entropy so every run produces a different, non-repeating sequence;
+    # an explicit plan ``session_seed`` reproduces the whole walk for debugging.
+    rng = _session_rng(page, plan)
+
+    # Load transition matrix from the plan if provided (e.g. custom user upload),
+    # otherwise use the hand-tuned default. A provided matrix is validated and
+    # row-normalized up front; bad rows are reported, not silently swapped out.
+    custom_matrix = plan.get("markov_matrix") or plan.get("variations", {}).get("markov_matrix")
+    if custom_matrix:
+        matrix = _normalize_matrix(custom_matrix, source="custom")
+        logger.info("[markov_simulator] using custom transition matrix with %d rows", len(matrix))
+    else:
+        matrix = DEFAULT_HUMAN_MATRIX
+
+    update_status_ticker(page, "🎲 SEMI-MARKOV INITIALIZED", "Generating probabilistic pathing...")
     wait_human(page, plan, 0, 1000, recorder=recorder)
 
     current_state = "idle"
     steps_executed = 0
-    
-    # Track state history for summary
     history = [current_state]
+
+    # Higher-level intent (goal) layer: a semi-Markov chain over intents, each with a
+    # sampled sojourn in sub-steps. The active intent biases the low-level row.
+    intent = _choose_intent(rng, "reading")
+    intent_history = [intent]
+    intent_steps_left = max(1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
+                                                cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12)))
 
     while steps_executed < max_steps:
         steps_executed += 1
-        
-        # 1. Choose next state based on transition probabilities of current state
+
+        # Higher-level transition: when the current intent's sojourn elapses, pick a
+        # new intent (with stickiness) and resample its sub-step budget.
+        if intent_steps_left <= 0:
+            intent = _choose_intent(rng, intent)
+            intent_history.append(intent)
+            intent_steps_left = max(1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
+                                                        cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12)))
+            update_status_ticker(page, "🎯 INTENT", f"Switching focus -> {intent}")
+        intent_steps_left -= 1
+
+        # 1. Choose next state from the intent-biased current transition row.
         probs = matrix.get(current_state, DEFAULT_HUMAN_MATRIX["idle"])
-        
-        # Normalize probabilities to ensure they sum to exactly 1.0
-        states = list(probs.keys())
-        weights = list(probs.values())
-        total_w = sum(weights)
-        if total_w > 0:
-            weights = [w / total_w for w in weights]
-        else:
-            weights = [1.0 / len(states)] * len(states)
-            
-        next_state = random.choices(states, weights=weights, k=1)[0]
-        
-        logger.info("[markov_simulator] Step %d: %s -> %s", steps_executed, current_state, next_state)
+        if not probs or sum(probs.values()) <= 0:
+            # An all-zero row is a real defect; report it rather than guessing.
+            raise ValueError(f"transition row for '{current_state}' has non-positive weight sum")
+        states, weights = _biased_row(probs, intent)
+
+        next_state = rng.choices(states, weights=weights, k=1)[0]
+
+        logger.info("[markov_simulator] Step %d [%s]: %s -> %s", steps_executed, intent, current_state, next_state)
         history.append(next_state)
 
-        # 2. Execute interaction primitive corresponding to next state
+        # 2. Sample the explicit per-state sojourn time for this visit. Reading/idle
+        #    dwell is correlated with the amount of visible content on screen.
+        dwell_ms = _sample_dwell_ms(rng, next_state)
+        if next_state in ("idle", "scroll_down", "scroll_up"):
+            dwell_ms = int(dwell_ms * _reading_scale(_visible_text_amount(page)))
+            dwell_ms = max(DWELL_LO_MS, min(DWELL_HI_MS, dwell_ms))
+
+        # 3. Execute the interaction primitive corresponding to the next state.
         try:
             if next_state == "idle":
-                # Pause and read
-                dwell = random.randint(800, 3000)
-                update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell}ms)...")
-                wait_human(page, plan, 0, dwell, recorder=recorder)
-                
+                # Idle has no interaction; the sojourn wait below is the read pause.
+                update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")
+
             elif next_state == "mousemove":
-                # Move pointer to a random visual content area
-                cx = random.randint(200, 1000)
-                cy = random.randint(150, 700)
+                cx = rng.randint(200, 1000)
+                cy = rng.randint(150, 700)
                 update_status_ticker(page, "🖱️ MOVING", f"Moving mouse to ({cx}, {cy})...")
                 move_pointer(page, cx, cy, plan, recorder=recorder)
-                
+
             elif next_state == "scroll_down":
-                # Scroll down
-                delta = random.randint(300, 800)
-                update_status_ticker(page, "📜 SCROLLING", f"Scrolling down {delta}px...")
+                delta = rng.randint(300, 800)
+                update_status_ticker(page, "📜 SCROLLING", f"Scrolling down ~{delta}px...")
                 scroll_page(page, plan, pass_index=steps_executed, fallback_delta_y=delta, recorder=recorder)
-                
+
             elif next_state == "scroll_up":
-                # Scroll up (re-reading)
-                delta = -random.randint(150, 500)
-                update_status_ticker(page, "📜 SCROLLING", f"Scrolling up {-delta}px (re-reading)...")
+                # Negative signed delta: honored downstream by planned_scroll_delta
+                # so the wheel actually scrolls UP for a re-read.
+                delta = -rng.randint(150, 500)
+                update_status_ticker(page, "📜 SCROLLING", f"Scrolling up ~{-delta}px (re-reading)...")
                 scroll_page(page, plan, pass_index=steps_executed, fallback_delta_y=delta, recorder=recorder)
-                
+
             elif next_state == "hover":
-                # Hover over a random link or element
                 update_status_ticker(page, "👁️ HOVERING", "Looking for hover target...")
-                hover_element(page, "a[href], button, input", plan, recorder=recorder)
-                
+                target = _pick_visible_locator(page, rng, "a[href], button, input")
+                if target is not None:
+                    hover_element(page, target, plan, recorder=recorder)
+                else:
+                    logger.info("[markov_simulator] no visible hover target; skipping hover step")
+
             elif next_state == "click":
-                # Click a link or button
                 update_status_ticker(page, "🖱️ CLICKING", "Choosing element to click...")
-                click_element(page, "a[href], button", plan, recorder=recorder)
-                # Settle after click
-                wait_human(page, plan, 0, 1200, recorder=recorder)
-                
+                target = _pick_visible_locator(page, rng, "a[href], button")
+                if target is not None:
+                    click_element(page, target, plan, recorder=recorder)
+                else:
+                    logger.info("[markov_simulator] no visible click target; skipping click step")
+
             elif next_state == "typing":
-                # Type into a text input if visible
                 inputs = page.locator("input[type=text], textarea, input[type=search]").all()
                 visible_inputs = [i for i in inputs if i.is_visible()]
                 if visible_inputs:
-                    target_input = random.choice(visible_inputs)
-                    text = random.choice(["hello", "markov chains", "last human line", "cybersecurity", "evasion"])
+                    target_input = rng.choice(visible_inputs)
+                    text = rng.choice(TYPING_QUERIES)
                     update_status_ticker(page, "⌨️ TYPING", f"Typing query: '{text}'")
                     type_text(page, target_input, text, plan, recorder=recorder)
                 else:
-                    # Fallback to mouse move if no inputs are visible
-                    cx = random.randint(200, 1000)
-                    cy = random.randint(150, 700)
+                    # No input present: a mouse move is the honest no-op for this
+                    # state, not a fabricated typing success.
+                    cx = rng.randint(200, 1000)
+                    cy = rng.randint(150, 700)
                     move_pointer(page, cx, cy, plan, recorder=recorder)
-                    
+
         except Exception as e:
             logger.warning("[markov_simulator] Error during state execution (%s): %s", next_state, e)
-            
-        current_state = next_state
-        wait_human(page, plan, 0, random.randint(200, 600), recorder=recorder)
 
-    update_status_ticker(page, "🏁 COMPLETED", "Markov simulation finished.")
+        # 4. Semi-Markov sojourn: linger in the chosen state for its sampled dwell.
+        page.wait_for_timeout(dwell_ms)
+        if recorder is not None:
+            recorder.record("dwell", metadata={"state": next_state, "dwell_ms": dwell_ms})
+
+        current_state = next_state
+
+        # 5. Short inter-step transition gap (right-skewed log-normal, not uniform).
+        gap_ms = int(
+            lognormal_ms(rng, mean_ms=INTER_STEP_MEAN_MS, cv=INTER_STEP_CV, lo=DWELL_LO_MS, hi=GAP_HI_MS)
+        )
+        page.wait_for_timeout(gap_ms)
+
+        # 6. Occasional distraction: a rare, heavy-tailed pause where the operator
+        #    briefly looks away. Modelled by a Weibull (shape < 1 => heavy tail).
+        if rng.random() < DISTRACTION_CHANCE:
+            distract_ms = int(
+                weibull_ms(rng, scale_ms=DISTRACTION_SCALE_MS, shape=DISTRACTION_SHAPE, lo=400.0, hi=DISTRACTION_HI_MS)
+            )
+            update_status_ticker(page, "💤 DISTRACTED", f"Brief attention lapse ({distract_ms}ms)...")
+            page.wait_for_timeout(distract_ms)
+            if recorder is not None:
+                recorder.record("distraction", metadata={"distract_ms": distract_ms})
+
+    update_status_ticker(page, "🏁 COMPLETED", "Semi-Markov simulation finished.")
     return {
         "steps_executed": steps_executed,
         "state_history": history,
-        "final_state": current_state
+        "intent_history": intent_history,
+        "final_state": current_state,
+        "final_intent": intent,
     }

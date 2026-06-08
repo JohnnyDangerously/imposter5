@@ -1,0 +1,66 @@
+[
+  {
+    "name": "focused_power_user",
+    "patience": "medium",
+    "scroll_style": "direct_scan",
+    "dwell_multiplier": 0.82,
+    "scroll_multiplier": 1.1,
+    "interaction_style": "low_touch"
+  },
+  {
+    "name": "curious_reader",
+    "patience": "high",
+    "scroll_style": "pause_and_read",
+    "dwell_multiplier": 1.25,
+    "scroll_multiplier": 0.82,
+    "interaction_style": "inspect_then_move"
+  },
+  {
+    "name": "impatient_scanner",
+    "patience": "low",
+    "scroll_style": "long_skim",
+    "dwell_multiplier": 0.68,
+    "scroll_multiplier": 1.25,
+    "interaction_style": "minimal"
+  },
+  {
+    "name": "slow_reader",
+    "patience": "high",
+    "scroll_style": "short_partial_scrolls",
+    "dwell_multiplier": 1.55,
+    "scroll_multiplier": 0.72,
+    "interaction_style": "inspect_then_move"
+  },
+  {
+    "name": "methodical_operator",
+    "patience": "medium",
+    "scroll_style": "section_scan",
+    "dwell_multiplier": 1.05,
+    "scroll_multiplier": 0.95,
+    "interaction_style": "confirm_before_click"
+  },
+  {
+    "name": "mobile_checker",
+    "patience": "medium",
+    "scroll_style": "short_swipes",
+    "dwell_multiplier": 1.15,
+    "scroll_multiplier": 0.7,
+    "interaction_style": "touch_first"
+  },
+  {
+    "name": "late_day_review",
+    "patience": "high",
+    "scroll_style": "pause_and_read",
+    "dwell_multiplier": 1.35,
+    "scroll_multiplier": 0.78,
+    "interaction_style": "low_touch"
+  },
+  {
+    "name": "naive_bot",
+    "patience": "low",
+    "scroll_style": "instantaneous",
+    "dwell_multiplier": 0.01,
+    "scroll_multiplier": 2.0,
+    "interaction_style": "robotic"
+  }
+]

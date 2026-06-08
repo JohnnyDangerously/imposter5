@@ -13,6 +13,7 @@ import secrets
 from typing import Any
 
 from imposter5.automation_connector.goals import GoalSpec, goal_spec_to_payload
+from imposter5.automation_connector.humanize_dist import lognormal_ms
 
 POLICY_VERSION = "goal-behavior-v1"
 
@@ -217,6 +218,218 @@ def _bool_from_target(target: dict[str, Any], name: str, default: bool = False) 
     return bool(raw)
 
 
+def _stable_noisy(
+    identity_rng: random.Random,
+    session_rng: random.Random,
+    *,
+    lo: float,
+    hi: float,
+    session_jitter: float,
+) -> float:
+    """Draw a parameter that is STABLE per identity yet NEVER identical per session.
+
+    The identity owns a baseline drawn once from ``identity_rng`` (so the same
+    identity reproduces the same baseline across all its sessions). Each session then
+    perturbs that baseline by a small multiplicative noise from ``session_rng``
+    (``±session_jitter``). This is the empirical signature of a real person: motor
+    and timing parameters are self-consistent across days but exhibit trial-to-trial
+    variability driven by signal-dependent neuromotor noise (Harris & Wolpert, 1998,
+    *Nature*). It is also what defeats long-term cross-session clustering: two
+    sessions of one identity are self-similar but distinct, while two identities draw
+    different baselines and are clearly separated.
+    """
+    baseline = identity_rng.uniform(lo, hi)
+    jit = max(0.0, float(session_jitter))
+    value = baseline * (1.0 + session_rng.uniform(-jit, jit))
+    return max(lo, min(hi, value))
+
+
+def build_identity_kinematics(
+    identity_rng: random.Random,
+    session_rng: random.Random,
+) -> dict[str, Any]:
+    """Build a per-identity, per-session kinematic + timing profile.
+
+    Returns a dict with ``human_config`` (motor/scroll physics knobs consumed by
+    ``interaction_primitives``), ``typing`` overrides, a ``fatigue`` block (slow
+    intra-session drift), and an ``identity`` summary. Every numeric knob is drawn
+    via :func:`_stable_noisy` so it is reproducible-per-identity but freshly varied
+    per session.
+
+    The chosen ranges are anchored to published human-motor / HCI values:
+
+    - ``fitts_a_ms`` / ``fitts_b_ms``: Fitts's law intercept and slope. Human
+      pointing throughput ``1/b`` is typically ~3.7–8 bits/s (Card, English &
+      Burr, 1978; MacKenzie, 1992), i.e. ``b`` ≈ 125–270 ms/bit, with a small
+      non-informational intercept ``a``.
+    - ``tremor_hz`` / ``tremor_amp_px``: physiological hand tremor is a roughly
+      8–12 Hz oscillation always superimposed on voluntary movement (Elble &
+      Koller, 1990, *Tremor*; McAuley & Marsden, 2000, *Brain*).
+    - ``power_law_gain``: strength of the 2/3 power law (Lacquaniti et al., 1983).
+    - ``corrective_submovement_chance`` / ``_max``: the optimized-submovement model
+      (Meyer et al., 1988, *Psychol. Rev.*) — aimed movements are a primary
+      ballistic phase plus one or more corrective submovements near the target,
+      more frequent for higher-difficulty acquisitions.
+    - typing: silent reading ~238 wpm (Brysbaert, 2019, *J. Mem. Lang.*); inter-key
+      latency and key-hold times vary per typist with digraph dependence
+      (Dhakal et al., 2018, *CHI*, "Observations on Typing from 136M Keystrokes";
+      Killourhy & Maxion, 2009).
+    """
+    s = _stable_noisy
+
+    human_config: dict[str, Any] = {
+        # Fitts's law movement-time parameters (per-person intercept/slope).
+        "fitts_a_ms": s(identity_rng, session_rng, lo=70.0, hi=150.0, session_jitter=0.10),
+        "fitts_b_ms": s(identity_rng, session_rng, lo=120.0, hi=230.0, session_jitter=0.10),
+        # Per-sample emission cadence; total step count is derived from Fitts MT.
+        "mouse_step_delay_ms": s(identity_rng, session_rng, lo=6.0, hi=14.0, session_jitter=0.12),
+        "mouse_step_delay_cv": s(identity_rng, session_rng, lo=0.30, hi=0.60, session_jitter=0.10),
+        "mouse_max_steps": int(round(s(identity_rng, session_rng, lo=28.0, hi=40.0, session_jitter=0.06))),
+        # Curvature of the ballistic arc (control-point bow as a fraction of travel).
+        "mouse_curve_bow": s(identity_rng, session_rng, lo=0.07, hi=0.20, session_jitter=0.15),
+        # 8–12 Hz physiological tremor superimposed on the path.
+        "tremor_hz": s(identity_rng, session_rng, lo=8.0, hi=12.0, session_jitter=0.06),
+        "tremor_amp_px": s(identity_rng, session_rng, lo=0.20, hi=1.10, session_jitter=0.20),
+        # 2/3 power-law application strength.
+        "power_law_gain": s(identity_rng, session_rng, lo=0.55, hi=1.0, session_jitter=0.10),
+        # Minimum-jerk velocity-profile asymmetry (slightly longer deceleration).
+        "min_jerk_skew": s(identity_rng, session_rng, lo=0.0, hi=0.22, session_jitter=0.20),
+        # Endpoint accuracy and overshoot/correction tendencies.
+        "mouse_imprecision_px": s(identity_rng, session_rng, lo=1.5, hi=5.0, session_jitter=0.18),
+        "mouse_overshoot_chance": s(identity_rng, session_rng, lo=0.04, hi=0.16, session_jitter=0.18),
+        "corrective_submovement_chance": s(identity_rng, session_rng, lo=0.30, hi=0.70, session_jitter=0.15),
+        "corrective_submovement_max": int(round(s(identity_rng, session_rng, lo=1.0, hi=2.0, session_jitter=0.0))),
+        # Scroll-momentum personality.
+        "scroll_max_steps": int(round(s(identity_rng, session_rng, lo=5.0, hi=11.0, session_jitter=0.10))),
+        "scroll_decay": s(identity_rng, session_rng, lo=0.45, hi=0.75, session_jitter=0.10),
+        "scroll_step_pause_ms": s(identity_rng, session_rng, lo=38.0, hi=80.0, session_jitter=0.15),
+        "scroll_step_pause_cv": s(identity_rng, session_rng, lo=0.30, hi=0.55, session_jitter=0.10),
+        "scroll_settle_ms": s(identity_rng, session_rng, lo=160.0, hi=320.0, session_jitter=0.15),
+    }
+
+    typing: dict[str, Any] = {
+        # Per-typist mean inter-key latency window and typo propensity. Dhakal et
+        # al. (2018) report mean inter-key intervals clustering ~120–240 ms across a
+        # wide population; faster typists sit lower.
+        "base_interkey_ms": s(identity_rng, session_rng, lo=95.0, hi=210.0, session_jitter=0.12),
+        "interkey_cv": s(identity_rng, session_rng, lo=0.30, hi=0.50, session_jitter=0.10),
+        # Key-hold (dwell) time, the press-to-release interval; ~70–120 ms typical.
+        "key_hold_ms": s(identity_rng, session_rng, lo=70.0, hi=120.0, session_jitter=0.15),
+        "typo_chance": s(identity_rng, session_rng, lo=0.01, hi=0.05, session_jitter=0.20),
+    }
+
+    fatigue: dict[str, Any] = {
+        # Slow within-session drift (fatigue/adaptation): by the end of a long
+        # session, movement time, tremor and endpoint scatter grow modestly while
+        # the operator gets a little slower/sloppier. ``half_actions`` is the number
+        # of actions at which roughly half of the configured drift is reached.
+        "enabled": True,
+        "max_slowdown": s(identity_rng, session_rng, lo=0.08, hi=0.22, session_jitter=0.20),
+        "max_sloppiness": s(identity_rng, session_rng, lo=0.10, hi=0.35, session_jitter=0.20),
+        "half_actions": int(round(s(identity_rng, session_rng, lo=40.0, hi=90.0, session_jitter=0.10))),
+    }
+
+    identity_summary = {
+        "fitts_b_ms": round(human_config["fitts_b_ms"], 1),
+        "tremor_hz": round(human_config["tremor_hz"], 2),
+        "overshoot_chance": round(human_config["mouse_overshoot_chance"], 3),
+        "base_interkey_ms": round(typing["base_interkey_ms"], 1),
+    }
+
+    return {
+        "human_config": human_config,
+        "typing": typing,
+        "fatigue": fatigue,
+        "identity": identity_summary,
+    }
+
+
+def _apply_human_config_overrides(human_config: dict[str, Any], target: dict[str, Any]) -> None:
+    """Let explicit ``target`` values pin individual physics knobs over identity defaults.
+
+    Only keys actually present (and parseable) on ``target`` override the
+    identity-derived baseline; everything else keeps its stable-but-noisy value.
+    """
+    float_keys = {
+        "fitts_a_ms": (40.0, 400.0),
+        "fitts_b_ms": (80.0, 400.0),
+        "mouse_step_delay_ms": (1.0, 50.0),
+        "mouse_step_delay_cv": (0.0, 2.0),
+        "mouse_curve_bow": (0.0, 0.5),
+        "tremor_hz": (5.0, 14.0),
+        "tremor_amp_px": (0.0, 3.0),
+        "power_law_gain": (0.0, 1.0),
+        "min_jerk_skew": (0.0, 0.45),
+        "mouse_imprecision_px": (0.0, 12.0),
+        "mouse_overshoot_chance": (0.0, 0.5),
+        "corrective_submovement_chance": (0.0, 0.95),
+        "scroll_decay": (0.2, 0.95),
+        "scroll_step_pause_ms": (4.0, 400.0),
+        "scroll_step_pause_cv": (0.0, 2.0),
+        "scroll_settle_ms": (20.0, 1500.0),
+    }
+    for key, (lo, hi) in float_keys.items():
+        if key in target:
+            human_config[key] = _bounded_float(target.get(key), lower=lo, upper=hi, default=human_config.get(key, lo))
+    int_keys = {
+        "mouse_max_steps": (12, 60),
+        "scroll_max_steps": (1, 20),
+        "corrective_submovement_max": (0, 3),
+    }
+    for key, (lo_i, hi_i) in int_keys.items():
+        if key in target:
+            human_config[key] = _bounded_int(target.get(key), lower=lo_i, upper=hi_i, default=int(human_config.get(key, lo_i)))
+
+
+def _build_typing_block(target: dict[str, Any], identity_typing: dict[str, Any]) -> dict[str, Any]:
+    """Merge identity typing defaults with explicit target overrides.
+
+    Emits both the digraph-aware keys consumed by the rewritten ``type_text``
+    (``base_interkey_ms``, ``interkey_cv``, ``key_hold_ms``, ``typo_chance``) and the
+    legacy ``min_delay_ms``/``max_delay_ms`` window so older callers/tests keep
+    working. Inter-key latency and key-hold/dwell vary per typist with digraph
+    dependence (Dhakal et al., 2018; Killourhy & Maxion, 2009).
+    """
+    base_interkey = _bounded_float(
+        target.get("typing_base_interkey_ms", identity_typing.get("base_interkey_ms")),
+        lower=40.0,
+        upper=400.0,
+        default=140.0,
+    )
+    interkey_cv = _bounded_float(
+        target.get("typing_interkey_cv", identity_typing.get("interkey_cv")),
+        lower=0.05,
+        upper=1.0,
+        default=0.4,
+    )
+    key_hold = _bounded_float(
+        target.get("typing_key_hold_ms", identity_typing.get("key_hold_ms")),
+        lower=20.0,
+        upper=250.0,
+        default=95.0,
+    )
+    typo_chance = _bounded_float(
+        target.get("typing_typo_chance", identity_typing.get("typo_chance")),
+        lower=0.0,
+        upper=0.08,
+        default=0.015,
+    )
+    # Legacy window kept for backward compatibility (rewritten type_text prefers the
+    # digraph-aware base_interkey_ms but falls back to this band).
+    min_delay = _bounded_int(target.get("typing_min_delay_ms"), lower=20, upper=400, default=int(round(base_interkey * 0.55)))
+    max_delay = _bounded_int(target.get("typing_max_delay_ms"), lower=45, upper=800, default=int(round(base_interkey * 1.9)))
+    return {
+        "base_interkey_ms": base_interkey,
+        "interkey_cv": interkey_cv,
+        "key_hold_ms": key_hold,
+        "min_delay_ms": min_delay,
+        "max_delay_ms": max(min_delay, max_delay),
+        "typo_chance": typo_chance,
+        "correction_chance": _bounded_float(target.get("typing_correction_chance"), lower=0.0, upper=1.0, default=0.92),
+        "pause_mid_query_chance": _bounded_float(target.get("typing_pause_mid_query_chance"), lower=0.0, upper=0.35, default=0.08),
+    }
+
+
 def build_behavior_plan(
     target: dict[str, Any],
     *,
@@ -224,10 +437,38 @@ def build_behavior_plan(
     goal: Any = "observe_visible_page_state",
     seed: str | None = None,
 ) -> dict[str, Any]:
-    """Return a JSON-safe pacing and interaction plan for one automation run."""
+    """Return a JSON-safe pacing and interaction plan for one automation run.
+
+    ``run_id`` is ALWAYS fresh per call so two runs never share an entropy seed by
+    default ("random like a human": full per-session stochasticity). An explicit
+    ``seed`` makes the session reproducible for debugging — it is threaded onto the
+    plan as ``session_seed`` and consumed by the single advancing per-session RNG in
+    ``interaction_primitives``; when ``seed`` is None the primitives draw fresh OS
+    entropy so sessions genuinely differ.
+
+    ``target["identity_id"]`` (optional) names a persistent person: their persona and
+    kinematic baseline are derived deterministically from it (stable across sessions)
+    while each session perturbs those baselines slightly, so the same identity is
+    self-similar but never identical and distinct identities are clearly separated
+    (cross-session anti-clustering; see :func:`build_identity_kinematics`).
+    """
     run_id = secrets.token_hex(8)
+    session_seed = None if seed is None else str(seed)
+    # Per-session RNG used for plan-build draws and per-session kinematic jitter.
     rng = random.Random(seed or f"{run_id}:{target.get('id')}:{provider}")
-    persona = rng.choice(PERSONAS)
+
+    # Identity: stable across an identity's sessions when ``identity_id`` is given,
+    # otherwise a one-off identity keyed to this run.
+    identity_id = target.get("identity_id")
+    if identity_id is not None and str(identity_id).strip():
+        identity_rng = random.Random(f"identity:{identity_id}")
+        persona = identity_rng.choice(PERSONAS)
+    else:
+        identity_id = None
+        identity_rng = random.Random(f"identity:{run_id}")
+        persona = rng.choice(PERSONAS)
+
+    kinematics = build_identity_kinematics(identity_rng, rng)
     ladder = _configured_completion_ladder(target)
     completion = _choose_completion(rng, ladder)
     goal_payload = _goal_payload(goal)
@@ -237,18 +478,37 @@ def build_behavior_plan(
     base_wait = _env_int("AUTOMATION_CONNECTOR_WAIT_MS", DEFAULT_WAIT_MS)
     base_scroll = _env_int("AUTOMATION_CONNECTOR_SCROLL_DELTA_Y", DEFAULT_SCROLL_DELTA_Y)
     scroll_passes = min(completion.max_scroll_passes, MAX_SCROLL_PASSES)
+    # Per-pass human wait/think times are sampled from a log-normal (right-skewed
+    # like real reading pauses) centered on the persona-scaled base wait, instead
+    # of a flat uniform band.
     waits = [
-        _bounded_ms(base_wait * persona.dwell_multiplier * rng.uniform(0.55, 1.75), lower=250, upper=12_000)
+        int(lognormal_ms(rng, mean_ms=base_wait * persona.dwell_multiplier, cv=0.55, lo=250, hi=12_000))
         for _ in range(max(1, scroll_passes))
     ]
+    # Scroll deltas are pixel magnitudes (not timing); keep them positive and
+    # let callers signal direction via the sign of the fallback in
+    # planned_scroll_delta.
     scroll_deltas = [
         _bounded_ms(base_scroll * persona.scroll_multiplier * rng.uniform(0.5, 1.6), lower=120, upper=2_000)
         for _ in range(max(0, scroll_passes - 1))
     ]
 
+    # Identity-driven physics/typing/fatigue knobs. Explicit target overrides win
+    # over the identity defaults so callers can still pin specific values.
+    human_config = dict(kinematics["human_config"])
+    _apply_human_config_overrides(human_config, target)
+    typing_block = _build_typing_block(target, kinematics["typing"])
+
     return {
         "policy_version": POLICY_VERSION,
         "run_id": run_id,
+        # None => primitives use fresh OS entropy per session (default). A string
+        # seed => the whole session's RNG stream is reproducible for debugging.
+        "session_seed": session_seed,
+        "identity_id": identity_id,
+        "identity": kinematics["identity"],
+        "human_config": human_config,
+        "fatigue": kinematics["fatigue"],
         "provider": provider,
         "persona": {
             "name": persona.name,
@@ -274,23 +534,7 @@ def build_behavior_plan(
             "wait_ms": waits,
             "scroll_delta_y": scroll_deltas,
         },
-        "typing": {
-            "min_delay_ms": _bounded_int(target.get("typing_min_delay_ms"), lower=20, upper=400, default=55),
-            "max_delay_ms": _bounded_int(target.get("typing_max_delay_ms"), lower=45, upper=800, default=170),
-            "typo_chance": _bounded_float(target.get("typing_typo_chance"), lower=0.0, upper=0.08, default=0.015),
-            "correction_chance": _bounded_float(
-                target.get("typing_correction_chance"),
-                lower=0.0,
-                upper=1.0,
-                default=0.92,
-            ),
-            "pause_mid_query_chance": _bounded_float(
-                target.get("typing_pause_mid_query_chance"),
-                lower=0.0,
-                upper=0.35,
-                default=0.08,
-            ),
-        },
+        "typing": typing_block,
         "pointer": {
             "move_style": rng.choice(("direct", "slight_arc", "two_step")),
             "hover_before_click_chance": _bounded_float(
@@ -364,6 +608,8 @@ def behavior_summary(plan: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "policy_version": plan.get("policy_version"),
         "run_id": plan.get("run_id"),
+        "identity_id": plan.get("identity_id"),
+        "identity": plan.get("identity") if isinstance(plan.get("identity"), dict) else {},
         "provider": plan.get("provider"),
         "goal": goal_spec.get("name"),
         "persona": persona.get("name"),
@@ -384,10 +630,24 @@ def planned_wait_ms(plan: dict[str, Any] | None, pass_index: int, fallback: int)
 
 
 def planned_scroll_delta(plan: dict[str, Any] | None, pass_index: int, fallback: int) -> int:
+    """Return a planned scroll delta, HONORING the sign of `fallback`.
+
+    The plan's pacing list stores positive pixel magnitudes; the caller signals
+    direction through the sign of `fallback` (negative => scroll up / re-read).
+    We take the magnitude from the plan (or the fallback magnitude) and re-apply
+    the caller's sign so scroll-up requests are not silently flipped to scroll-down.
+    """
+    sign = -1 if fallback < 0 else 1
     pacing = plan.get("pacing") if isinstance(plan, dict) else None
     deltas = pacing.get("scroll_delta_y") if isinstance(pacing, dict) else None
     if isinstance(deltas, list) and deltas:
-        return _bounded_int(deltas[min(pass_index, len(deltas) - 1)], lower=50, upper=2_000, default=fallback)
+        magnitude = _bounded_int(
+            abs(deltas[min(pass_index, len(deltas) - 1)]),
+            lower=50,
+            upper=2_000,
+            default=abs(fallback),
+        )
+        return sign * magnitude
     return fallback
 
 

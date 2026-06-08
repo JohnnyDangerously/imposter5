@@ -6,22 +6,121 @@ Use move_pointer / scroll_page etc (or _safe_mouse_move for robustness); never r
 """
 from __future__ import annotations
 
+import logging
+import math
+import os
 import random
 import string
+import time
 from typing import Any
 
 from imposter5.automation_connector.behavior_policy import (
     planned_scroll_delta,
     planned_wait_ms,
 )
+from imposter5.automation_connector.humanize_dist import (
+    fitts_movement_time_ms,
+    lognormal_ms,
+    min_jerk_progress,
+    scroll_decay_deltas,
+    two_thirds_power_dwell_scale,
+)
 from imposter5.automation_connector.session_recorder import SessionRecorder
+
+logger = logging.getLogger(__name__)
 
 
 def _seeded_rng(plan: dict[str, Any] | None, namespace: str) -> random.Random:
+    """Legacy per-namespace deterministic RNG (kept for backward compatibility).
+
+    NOTE: new interactive code paths should use :func:`_session_rng`, the single
+    advancing per-session stream, so that the same start/end never produces the same
+    path. Re-seeding a fresh RNG from a fixed ``run_id:namespace`` made repeated
+    actions byte-identical, which violates human trial-to-trial motor variability
+    (Harris & Wolpert, 1998). This helper remains only for callers that explicitly
+    want a reproducible side-channel draw.
+    """
     seed = ""
     if isinstance(plan, dict):
         seed = str(plan.get("run_id") or "")
     return random.Random(f"{seed}:{namespace}")
+
+
+# --- Single advancing per-session RNG + session state -----------------------------
+#
+# Human motor output is never repeated identically: trial-to-trial variability is a
+# fundamental property of the motor system, driven by signal-dependent neuromotor
+# noise (Harris & Wolpert, 1998, *Nature*; Faisal, Selen & Wolpert, 2008, *Nat. Rev.
+# Neurosci.*). A real person who moves the cursor from A to B twice produces two
+# different trajectories. To match that, ALL interactive randomness in a session is
+# drawn from ONE advancing ``random.Random`` stored on the page (the session), so
+# every draw is fresh. By DEFAULT the stream is seeded from fresh OS entropy, so
+# sessions genuinely differ ("random like a human"); when the plan carries an
+# explicit ``session_seed`` the entire session is reproducible for debugging.
+
+
+def _session_state(page: Any, plan: dict[str, Any] | None) -> dict[str, Any]:
+    """Return (creating if needed) the per-session state bag attached to the page.
+
+    Holds the single advancing RNG, the session start time, and an action counter
+    used for intra-session fatigue drift.
+    """
+    state = getattr(page, "_imposter_session", None)
+    if isinstance(state, dict) and isinstance(state.get("rng"), random.Random):
+        return state
+
+    seed: Any = None
+    if isinstance(plan, dict):
+        seed = plan.get("session_seed")
+    if seed is not None and str(seed) != "":
+        rng = random.Random(str(seed))
+        source = "seed"
+    else:
+        # Fresh per-session entropy: never the same twice by default.
+        rng = random.Random(os.urandom(16))
+        source = "entropy"
+
+    state = {"rng": rng, "started": time.monotonic(), "actions": 0, "seed_source": source}
+    try:
+        page._imposter_session = state
+    except Exception:
+        logger.exception("[interaction_primitives] could not attach _imposter_session to page")
+        # If the page rejects attributes (some mocks), stash on the plan dict so the
+        # stream still advances within the session rather than silently re-seeding.
+        if isinstance(plan, dict):
+            plan["_imposter_session"] = state
+    return state
+
+
+def _session_rng(page: Any, plan: dict[str, Any] | None) -> random.Random:
+    """The one advancing RNG for this session (see module note)."""
+    return _session_state(page, plan)["rng"]
+
+
+def _fatigue(page: Any, plan: dict[str, Any] | None) -> dict[str, float]:
+    """Advance the action counter and return current intra-session drift factors.
+
+    Real operators get slightly slower and sloppier over a long session
+    (mental-fatigue / time-on-task effects degrade motor precision and slow
+    responses; e.g. Boksem & Tops, 2008, *Brain Res. Rev.*). The drift is a smooth
+    saturating curve in the number of actions taken: ``frac = n / (n + half)`` rises
+    from 0 toward 1, reaching 0.5 at ``half_actions``. We return a ``slowdown``
+    multiplier (>= 1, scales movement/keystroke time up) and a ``sloppiness``
+    multiplier (>= 1, scales tremor amplitude and endpoint scatter up).
+    """
+    state = _session_state(page, plan)
+    state["actions"] = int(state.get("actions", 0)) + 1
+    n = float(state["actions"])
+
+    cfg = plan.get("fatigue") if isinstance(plan, dict) else None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if not bool(cfg.get("enabled", True)):
+        return {"slowdown": 1.0, "sloppiness": 1.0}
+    max_slow = _bounded_float(cfg.get("max_slowdown"), lower=0.0, upper=0.6, default=0.15)
+    max_sloppy = _bounded_float(cfg.get("max_sloppiness"), lower=0.0, upper=0.8, default=0.20)
+    half = float(_bounded_int(cfg.get("half_actions"), lower=5, upper=400, default=60))
+    frac = n / (n + half)
+    return {"slowdown": 1.0 + max_slow * frac, "sloppiness": 1.0 + max_sloppy * frac}
 
 
 def _safe_mouse_move(page: Any, x: float, y: float, plan: dict[str, Any] | None, rng: random.Random | None = None, *, recorder: SessionRecorder | None = None) -> dict[str, Any]:
@@ -59,6 +158,19 @@ def _bounded_float(value: Any, *, lower: float, upper: float, default: float) ->
     return max(lower, min(upper, parsed))
 
 
+def _human_config(plan: dict[str, Any] | None) -> dict[str, Any]:
+    """Physics/humanization knobs live on the plan (not os.environ).
+
+    Returns ``plan["human_config"]`` when present and a dict, else an empty dict so
+    callers can use ``.get(..., default)`` for every tunable.
+    """
+    if isinstance(plan, dict):
+        hc = plan.get("human_config", {})
+        if isinstance(hc, dict):
+            return hc
+    return {}
+
+
 def wait_human(
     page: Any,
     plan: dict[str, Any] | None,
@@ -85,23 +197,46 @@ def scroll_page(
     recorder: SessionRecorder | None = None,
 ) -> int:
     """Scroll using a planned bounded delta, with mouse positioning over content first so the wheel is accompanied by realistic mouse events (for detectors and human twin traces). Returns the actual delta used."""
+    # Compute the planned delta BEFORE the naive_bot branch so naive_bot doesn't hit
+    # an UnboundLocalError referencing delta_y.
+    delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
+
     if plan and plan.get("persona", {}).get("name") == "naive_bot":
         page.mouse.wheel(0, delta_y)
         if recorder is not None:
             recorder.record("scroll", metadata={"pass_index": pass_index, "delta_y": delta_y})
         return delta_y
 
-    delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
-    rng = _seeded_rng(plan, f"scroll:{pass_index}")
+    rng = _session_rng(page, plan)
     update_status_ticker(page, "📜 SCROLLING", f"Delta: {delta_y}px (pass {pass_index})")
     # Position the mouse over a content area before the wheel so the scroll "event" has an associated cursor position (mouse scroll realism, not just raw wheel from nowhere).
     _position_mouse_over_content(page, plan, rng, recorder)
-    page.mouse.wheel(0, delta_y)
+
+    # Real scroll-momentum decay: one big wheel burst that geometrically bleeds off,
+    # emitting decreasing wheel events with short waits + a final settle pause.
+    # Sign is honored (scroll-up == negative delta_y => all-negative steps).
+    hc = _human_config(plan)
+    max_steps = _bounded_int(hc.get("scroll_max_steps"), lower=1, upper=20, default=8)
+    decay = _bounded_float(hc.get("scroll_decay"), lower=0.2, upper=0.95, default=0.6)
+    step_mean = _bounded_float(hc.get("scroll_step_pause_ms"), lower=4.0, upper=400.0, default=55.0)
+    step_cv = _bounded_float(hc.get("scroll_step_pause_cv"), lower=0.0, upper=2.0, default=0.4)
+    settle_mean = _bounded_float(hc.get("scroll_settle_ms"), lower=20.0, upper=1500.0, default=220.0)
+
+    deltas = scroll_decay_deltas(rng, total_px=float(delta_y), max_steps=max_steps, decay=decay)
+    for step_delta in deltas:
+        page.mouse.wheel(0, step_delta)
+        page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=step_mean, cv=step_cv, lo=4.0, hi=400.0)))
+    # Settle pause (eyes catch up to the content after the flick stops).
+    page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=settle_mean, cv=0.4, lo=20.0, hi=1500.0)))
+
     # Small post-scroll mouse adjustment (simulates eyes/hand following the content after scroll).
     if rng.random() < 0.4:
         _micro_mouse_adjust(page, plan, rng, recorder)
     if recorder is not None:
-        recorder.record("scroll", metadata={"pass_index": pass_index, "delta_y": delta_y})
+        recorder.record(
+            "scroll",
+            metadata={"pass_index": pass_index, "delta_y": delta_y, "steps": len(deltas)},
+        )
     return delta_y
 
 
@@ -143,55 +278,250 @@ def _neighboring_char(char: str) -> str:
     if lower not in alphabet:
         return char
     idx = alphabet.index(lower)
-    replacement = alphabet[min(len(alphabet) - 1, idx + 1)]
+    # Pick an adjacent letter; for the last letter ('z') step back instead of
+    # clamping to itself (which produced a no-op "typo").
+    neighbor_idx = idx - 1 if idx >= len(alphabet) - 1 else idx + 1
+    replacement = alphabet[neighbor_idx]
     return replacement.upper() if char.isupper() else replacement
+
+
+# --- Stateful honeypot detection (Layer 4 defense) -------------------------------
+#
+# Honeypots are real DOM nodes that are styled invisible/unreachable to humans but
+# present to naive automation. We must evaluate the trap test on the SAME element
+# that will be clicked/hovered (resolve the locator's .first / an element handle and
+# run the check on THAT element), never on a fresh ``document.querySelector`` first
+# match — a strict-mode selector can resolve to several elements and the first DOM
+# match is frequently not the one Playwright would act on.
+_HONEYPOT_CHECK_JS = r"""
+(el) => {
+    if (!el) return "";
+    const reasons = [];
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+
+    if (style.display === 'none') reasons.push('display:none');
+    if (style.visibility === 'hidden' || style.visibility === 'collapse') reasons.push('visibility:hidden');
+    if (parseFloat(style.opacity) <= 0.01) reasons.push('opacity~0');
+
+    // Off-screen positioning (fully outside the viewport in any direction).
+    if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) {
+        reasons.push('offscreen');
+    }
+    if (rect.width === 0 || rect.height === 0) reasons.push('zero-size');
+    // ~1px sizing (classic hidden honeypot input).
+    else if (rect.width <= 1 && rect.height <= 1) reasons.push('1px-size');
+
+    if (parseFloat(style.fontSize) === 0) reasons.push('fontSize:0');
+
+    const z = parseInt(style.zIndex, 10);
+    if (!isNaN(z) && z < -1000) reasons.push('zIndex<-1000');
+
+    if ((el.getAttribute('aria-hidden') || '') === 'true') reasons.push('aria-hidden');
+    if ((el.getAttribute('tabindex') || '') === '-1') reasons.push('tabindex=-1');
+
+    const clip = (style.clip || '').replace(/\s+/g, '');
+    const clipPath = (style.clipPath || '').replace(/\s+/g, '');
+    if (clip === 'rect(0px,0px,0px,0px)' || clipPath.indexOf('inset(100%') !== -1) reasons.push('clip-inset');
+
+    const ti = parseFloat(style.textIndent);
+    if (!isNaN(ti) && ti <= -1000) reasons.push('text-indent');
+
+    return reasons.join(',');
+}
+"""
+
+
+def _honeypot_state(page: Any) -> dict[str, Any]:
+    """Per-page honeypot memory, persisted on the page object across calls."""
+    state = getattr(page, "_honeypot_state", None)
+    if not isinstance(state, dict) or "seen" not in state:
+        state = {"seen": set(), "count": 0}
+        try:
+            page._honeypot_state = state
+        except Exception:
+            logger.exception("[interaction_primitives] could not attach _honeypot_state to page")
+    return state
+
+
+def _detect_honeypot_reason(target: Any) -> str:
+    """Run the trap test on the concrete element the caller will act on.
+
+    ``target`` is a Playwright Locator (we narrow to ``.first``) or an ElementHandle
+    (used directly). Returns a comma-joined reason string when the element is a
+    honeypot, otherwise an empty string. Detection failures are logged (not silently
+    swallowed) and treated as "not a honeypot" so a flaky check never blocks a real
+    interaction.
+    """
+    try:
+        if hasattr(target, "first"):  # Locator
+            return target.first.evaluate(_HONEYPOT_CHECK_JS) or ""
+        return target.evaluate(_HONEYPOT_CHECK_JS) or ""
+    except Exception:
+        logger.exception("[interaction_primitives] honeypot detection evaluate failed")
+        return ""
+
+
+def _register_honeypot(page: Any, label: str, reason: str, recorder: SessionRecorder | None) -> dict[str, Any]:
+    """Record a detected trap into per-page state and the session recorder."""
+    state = _honeypot_state(page)
+    signature = f"{label}|{reason}"
+    state["seen"].add(signature)
+    state["count"] = int(state.get("count", 0)) + 1
+    update_status_ticker(page, "⚠️ EVADING HONEYPOT", f"Trap ({reason}) on {label}; bypassing.")
+    meta = {
+        "selector": label,
+        "reason": reason,
+        "total_evaded": state["count"],
+        "unique_traps": len(state["seen"]),
+    }
+    if recorder is not None:
+        recorder.record("honeypot_evaded", metadata=meta)
+    return meta
+
+
+# QWERTY hand/finger map for digraph-dependent keystroke timing. Inter-key latency
+# in human typing depends strongly on the key PAIR, not a flat per-key delay:
+# alternating-hand digraphs are faster than same-hand ones, and same-FINGER digraphs
+# are the slowest (Dhakal et al., 2018, CHI, "Observations on Typing from 136M
+# Keystrokes"; Gentner, 1983). We approximate this with a coarse layout map.
+_QWERTY_LEFT = set("qwertasdfgzxcvb12345")
+_QWERTY_RIGHT = set("yuiophjklnm67890")
+_QWERTY_FINGER: dict[str, int] = {}
+for _row in ("qwertyuiop", "asdfghjkl", "zxcvbnm"):
+    for _i, _ch in enumerate(_row):
+        # Coarse finger index 0..9 by column; good enough to flag same-finger pairs.
+        _QWERTY_FINGER[_ch] = _i
+
+
+def _digraph_latency_factor(prev: str, cur: str) -> float:
+    """Multiplier on the base inter-key latency for the (prev -> cur) digraph.
+
+    Reflects well-replicated typing-dynamics effects: repeated keys and
+    alternating-hand pairs are quick; same-hand pairs are slower; same-finger pairs
+    are slowest; a space/word boundary adds a small planning pause.
+    """
+    if not prev:
+        return 1.0
+    p, c = prev.lower(), cur.lower()
+    if c == " " or p == " ":
+        return 1.35  # word-boundary planning pause
+    if p == c:
+        return 0.80  # key repeat (e.g. "ll")
+    p_left, c_left = p in _QWERTY_LEFT, c in _QWERTY_LEFT
+    p_right, c_right = p in _QWERTY_RIGHT, c in _QWERTY_RIGHT
+    if (p_left and c_right) or (p_right and c_left):
+        return 0.82  # alternating hands: fast
+    if p in _QWERTY_FINGER and c in _QWERTY_FINGER and _QWERTY_FINGER[p] == _QWERTY_FINGER[c]:
+        return 1.55  # same finger, different key: slow/awkward
+    return 1.05  # same hand, different finger
 
 
 def type_text(
     page: Any,
-    selector: str,
+    selector: Any,
     text: str,
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
-    """Type text into a selector with bounded delays and occasional corrections."""
+    """Type text with digraph-dependent rhythm, key-hold dwell, and corrected typos.
+
+    ``selector`` may be a string selector OR an already-resolved Locator / element
+    handle (matching ``click_element``'s contract).
+
+    Realism model:
+    - Inter-key latency is a per-digraph multiplier (:func:`_digraph_latency_factor`)
+      on the typist's identity base latency, sampled through a log-normal so the
+      rhythm is right-skewed (occasional hesitations) rather than constant.
+    - Each key carries a key-hold (press-to-release) dwell.
+    - Occasional adjacent-key typos are usually corrected with a backspace
+      (Dhakal et al., 2018); error rate and latency both grow with intra-session
+      fatigue.
+    All draws come from the single advancing per-session RNG.
+    """
+    label = selector if isinstance(selector, str) else "element_handle"
+    locator = page.locator(selector) if isinstance(selector, str) else selector
+
     if plan and plan.get("persona", {}).get("name") == "naive_bot":
         locator.fill(text)
         result = {"typed_chars": len(text), "typos": 0, "corrections": 0}
         if recorder is not None:
-            recorder.record("type_text", metadata={"selector": selector, **result})
+            recorder.record("type_text", metadata={"selector": label, **result})
         return result
 
-    update_status_ticker(page, "⌨️ TYPING", f"Input: {selector} - '{text[:20]}...'")
+    update_status_ticker(page, "⌨️ TYPING", f"Input: {label} - '{text[:20]}...'")
     typing_plan = plan.get("typing") if isinstance(plan, dict) else {}
     typing_plan = typing_plan if isinstance(typing_plan, dict) else {}
-    min_delay = int(typing_plan.get("min_delay_ms", 55))
-    max_delay = max(min_delay, int(typing_plan.get("max_delay_ms", 170)))
-    typo_chance = float(typing_plan.get("typo_chance", 0.0))
+
+    rng = _session_rng(page, plan)
+    drift = _fatigue(page, plan)
+
+    # Two timing modes for backward compatibility:
+    # - DIGRAPH mode (modern plans carry ``base_interkey_ms`` / ``key_hold_ms``):
+    #   digraph-dependent inter-key gaps + per-key hold dwell + fatigue.
+    # - LEGACY mode (only ``min_delay_ms``/``max_delay_ms`` present): a single
+    #   log-normal keystroke ``delay`` drawn from that window, no separate inter-key
+    #   gap. Preserves the original contract for callers that pin those knobs.
+    use_digraph = "base_interkey_ms" in typing_plan
+    use_hold = "key_hold_ms" in typing_plan
+
+    min_delay = float(typing_plan.get("min_delay_ms", 55))
+    max_delay = max(min_delay, float(typing_plan.get("max_delay_ms", 170)))
+    legacy_mid = (min_delay + max_delay) / 2.0
+    base_interkey = float(typing_plan.get("base_interkey_ms", legacy_mid)) * drift["slowdown"]
+    interkey_cv = float(typing_plan.get("interkey_cv", 0.4))
+    key_hold = float(typing_plan.get("key_hold_ms", legacy_mid))
+    typo_chance = float(typing_plan.get("typo_chance", 0.0)) * drift["sloppiness"]
     correction_chance = float(typing_plan.get("correction_chance", 1.0))
     pause_chance = float(typing_plan.get("pause_mid_query_chance", 0.0))
-    rng = _seeded_rng(plan, f"type:{selector}:{text}")
 
-    locator = page.locator(selector)
+    def _press_delay() -> int:
+        if use_hold:
+            return int(lognormal_ms(rng, mean_ms=key_hold, cv=0.30, lo=20.0, hi=260.0))
+        # Legacy: keystroke delay sampled from the [min, max] window.
+        return int(lognormal_ms(rng, mean_ms=legacy_mid, cv=0.35, lo=min_delay, hi=max_delay))
+
+    def _interkey(prev: str, cur: str) -> int:
+        mean = base_interkey * _digraph_latency_factor(prev, cur)
+        return int(lognormal_ms(rng, mean_ms=mean, cv=interkey_cv, lo=18.0, hi=900.0))
+
     typed = 0
     typos = 0
     corrections = 0
+    prev_char = ""
     locator.click()
     for index, char in enumerate(text):
+        # Digraph-dependent inter-key gap precedes the keystroke (digraph mode only;
+        # the first key has no preceding digraph).
+        if use_digraph and index > 0:
+            page.wait_for_timeout(_interkey(prev_char, char))
+        # Occasional mid-stream "thinking" pause.
         if rng.random() < pause_chance and index > 0:
             page.wait_for_timeout(rng.randint(250, 900))
+
+        type_correct = True
         if typo_chance > 0 and char.strip() and rng.random() < typo_chance:
-            locator.type(_neighboring_char(char), delay=rng.randint(min_delay, max_delay))
+            locator.type(_neighboring_char(char), delay=_press_delay())
             typos += 1
             if rng.random() < correction_chance:
+                # Noticed the error: brief reaction pause, then backspace and retype.
+                if use_digraph:
+                    page.wait_for_timeout(_interkey(char, char))
                 locator.press("Backspace")
                 corrections += 1
-        locator.type(char, delay=rng.randint(min_delay, max_delay))
+            else:
+                # Uncorrected typo: leave ONLY the wrong char.
+                type_correct = False
+
+        if type_correct:
+            locator.type(char, delay=_press_delay())
         typed += 1
+        prev_char = char
+
     result = {"typed_chars": typed, "typos": typos, "corrections": corrections}
     if recorder is not None:
-        recorder.record("type_text", metadata={"selector": selector, **result})
+        recorder.record("type_text", metadata={"selector": label, **result})
     return result
 
 
@@ -220,8 +550,8 @@ def click_element(
         return result
 
     pointer = _pointer_plan(plan)
-    rng = _seeded_rng(plan, f"click:{selector}")
-    
+    rng = _session_rng(page, plan)
+
     # Handle random link selection for red-team multi-page browsing simulations
     if selector == "random_link":
         update_status_ticker(page, "🖱️ CLICKING", "Choosing random link...")
@@ -266,12 +596,27 @@ def click_element(
                     except Exception:
                         pass
 
-            if valid_links:
-                locator, box = rng.choice(valid_links)
+            # Drop any chosen link that is actually a hidden honeypot, checking the
+            # SAME element we'd click. Re-roll among the remaining candidates.
+            chosen = None
+            candidates = list(valid_links)
+            while candidates:
+                cand_loc, cand_box = rng.choice(candidates)
+                reason = _detect_honeypot_reason(cand_loc)
+                if reason:
+                    _register_honeypot(page, "random_link", reason, recorder)
+                    candidates = [c for c in candidates if c[0] is not cand_loc]
+                    continue
+                chosen = (cand_loc, cand_box)
+                break
+
+            if chosen:
+                locator, box = chosen
+                locator = locator.first if hasattr(locator, "first") else locator
                 cx = box["x"] + box["width"] * rng.uniform(0.28, 0.72)
                 cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
                 update_status_ticker(page, "🖱️ CLICKING", f"Clicking: random link at ({round(cx)}, {round(cy)})")
-                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder)
+                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
                 locator.click()
                 result = {
                     "hovered": False,
@@ -308,56 +653,25 @@ def click_element(
             page.mouse.click(cx, cy)
             return {"clicked_fallback_spot": True}
 
+    # Resolve to the concrete element we will click. For string selectors that can
+    # match multiple nodes (e.g. "a[href], button"), narrow to ``.first`` so the
+    # click never throws Playwright strict-mode "resolved to N elements".
     if isinstance(selector, str):
-        # --- Stateful Honeypot Evasion (Layer 4 Defense) ---
-        # Before clicking, check if the selector points to a hidden / honeypot element.
-        # Honeypots are styled to be invisible to humans but are visible in the DOM.
-        try:
-            loc = page.locator(selector)
-            is_honeypot = page.evaluate("""
-                (sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    
-                    // 1. Standard hidden styles
-                    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-                        return true;
-                    }
-                    
-                    // 2. Off-screen positioning (common honeypot technique)
-                    const rect = el.getBoundingClientRect();
-                    if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth || rect.top > window.innerHeight) {
-                        return true;
-                    }
-                    
-                    // 3. Zero dimensions
-                    if (rect.width === 0 || rect.height === 0) {
-                        return true;
-                    }
-                    
-                    // 4. Hidden by absolute positioning/z-index or tiny font size
-                    if (parseFloat(style.fontSize) === 0 || parseInt(style.zIndex) < -1000) {
-                        return true;
-                    }
-                    
-                    return false;
-                }
-            """, selector)
-            
-            if is_honeypot:
-                update_status_ticker(page, "⚠️ EVADING HONEYPOT", f"Detected hidden honeypot: {selector}. Bypassing click.")
-                if recorder is not None:
-                    recorder.record("honeypot_evaded", metadata={"selector": selector})
-                return {"hovered": False, "honeypot_evaded": True}
-        except Exception as e:
-            pass
-
-        locator = page.locator(selector)
-        update_status_ticker(page, "🖱️ CLICKING", f"Clicking: {selector}")
+        locator = page.locator(selector).first
+        label = selector
     else:
-        locator = selector
-        update_status_ticker(page, "🖱️ CLICKING", "Clicking element handle")
+        locator = selector.first if hasattr(selector, "first") else selector
+        label = "element_handle"
+
+    # --- Stateful Honeypot Evasion (Layer 4 Defense) ---
+    # Run the trap test on the SAME element we just resolved (not a fresh
+    # document.querySelector first match), so we evade the element we'd actually click.
+    reason = _detect_honeypot_reason(locator)
+    if reason:
+        _register_honeypot(page, label, reason, recorder)
+        return {"hovered": False, "honeypot_evaded": True, "honeypot_reason": reason}
+
+    update_status_ticker(page, "🖱️ CLICKING", f"Clicking: {label}")
 
     hovered = False
     move_meta: dict[str, Any] | None = None
@@ -370,7 +684,7 @@ def click_element(
             if box:
                 cx = box["x"] + box["width"] * rng.uniform(0.28, 0.72)
                 cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
-                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder)
+                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
         except Exception:
             pass
     locator.click()
@@ -413,18 +727,27 @@ def hover_element(
     dwell_ms = _bounded_int(hover.get("hover_dwell_ms"), lower=150, upper=1_500, default=450)
     
     if isinstance(selector, str):
-        locator = page.locator(selector)
-        update_status_ticker(page, "👁️ HOVERING", f"Hovering: {selector} (dwell {dwell_ms}ms)")
+        locator = page.locator(selector).first
+        label = selector
     else:
-        locator = selector
-        update_status_ticker(page, "👁️ HOVERING", f"Hovering element handle (dwell {dwell_ms}ms)")
+        locator = selector.first if hasattr(selector, "first") else selector
+        label = "element_handle"
+
+    # Same-element honeypot guard before hovering.
+    reason = _detect_honeypot_reason(locator)
+    if reason:
+        _register_honeypot(page, label, reason, recorder)
+        return {"hovered": False, "honeypot_evaded": True, "honeypot_reason": reason}
+
+    update_status_ticker(page, "👁️ HOVERING", f"Hovering: {label} (dwell {dwell_ms}ms)")
 
     try:
         box = locator.bounding_box()
         if box:
-            hx = box["x"] + box["width"] * _seeded_rng(plan, f"hover:{selector}").uniform(0.25, 0.75)
-            hy = box["y"] + box["height"] * _seeded_rng(plan, f"hover:{selector}").uniform(0.25, 0.75)
-            move_pointer(page, hx, hy, plan, recorder=recorder)
+            rng = _session_rng(page, plan)
+            hx = box["x"] + box["width"] * rng.uniform(0.25, 0.75)
+            hy = box["y"] + box["height"] * rng.uniform(0.25, 0.75)
+            move_pointer(page, hx, hy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
     except Exception:
         pass
     locator.hover()
@@ -447,7 +770,7 @@ def maybe_expand_comments(
     hover = hover if isinstance(hover, dict) else {}
     max_expansions = _bounded_int(hover.get("max_expansions"), lower=0, upper=3, default=1)
     chance = _bounded_float(hover.get("expand_comments_chance"), lower=0.0, upper=0.35, default=0.0)
-    rng = _seeded_rng(plan, "expand_comments")
+    rng = _session_rng(page, plan)
     clicked = 0
     attempted = 0
     for selector in selectors:
@@ -472,7 +795,7 @@ def maybe_backtrack(page: Any, plan: dict[str, Any] | None = None, *, recorder: 
     backtracking = backtracking if isinstance(backtracking, dict) else {}
     chance = _bounded_float(backtracking.get("micro_abandon_chance"), lower=0.0, upper=0.25, default=0.0)
     max_backtracks = _bounded_int(backtracking.get("max_backtracks"), lower=0, upper=2, default=0)
-    should_backtrack = max_backtracks > 0 and _seeded_rng(plan, "backtrack").random() < chance
+    should_backtrack = max_backtracks > 0 and _session_rng(page, plan).random() < chance
     if should_backtrack:
         page.go_back(wait_until="domcontentloaded")
     result = {"backtracked": should_backtrack, "max_backtracks": max_backtracks}
@@ -518,6 +841,215 @@ def _pointer_plan(plan: dict[str, Any] | None) -> dict[str, Any]:
     return {}
 
 
+def _viewport_center(page: Any) -> tuple[float, float]:
+    """Best-effort viewport center; used as the cursor's first-move origin."""
+    try:
+        vp = page.viewport_size
+        if isinstance(vp, dict) and vp.get("width") and vp.get("height"):
+            return float(vp["width"]) / 2.0, float(vp["height"]) / 2.0
+    except Exception:
+        logger.exception("[interaction_primitives] viewport_size read failed; using default center")
+    return 640.0, 400.0
+
+
+def _get_cursor(page: Any) -> tuple[float, float]:
+    """Read the tracked cursor position, defaulting to viewport center on first move."""
+    cur = getattr(page, "_imposter_cursor", None)
+    if isinstance(cur, (tuple, list)) and len(cur) == 2:
+        try:
+            return float(cur[0]), float(cur[1])
+        except (TypeError, ValueError):
+            pass
+    return _viewport_center(page)
+
+
+def _set_cursor(page: Any, x: float, y: float) -> None:
+    try:
+        page._imposter_cursor = (float(x), float(y))
+    except Exception:
+        logger.exception("[interaction_primitives] could not persist _imposter_cursor on page")
+
+
+def _bezier_point(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    t: float,
+) -> tuple[float, float]:
+    """Cubic Bezier: B(t) = (1-t)^3 P0 + 3(1-t)^2 t P1 + 3(1-t) t^2 P2 + t^3 P3."""
+    mt = 1.0 - t
+    a = mt * mt * mt
+    b = 3.0 * mt * mt * t
+    c = 3.0 * mt * t * t
+    d = t * t * t
+    x = a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0]
+    y = a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]
+    return x, y
+
+
+def _bezier_controls(
+    p0: tuple[float, float],
+    p3: tuple[float, float],
+    rng: random.Random,
+    *,
+    wobble_cap: float,
+    bow: float = 0.14,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Build P1/P2 offset PERPENDICULAR to the P0->P3 vector at ~1/3 and ~2/3 along.
+
+    Hand reaches do not travel in straight lines; they bow gently to one side, the
+    curvature being a person-stable trait. ``bow`` is the identity's baseline arc
+    fraction (offset as a fraction of travel distance); the magnitude is then jittered
+    per draw from the advancing session RNG so longer moves bow more and no two moves
+    bow identically. P1/P2 usually bow the same way (a gentle C arc); occasionally
+    opposite (an S-curve), matching observed cursor-path variety.
+    """
+    dx = p3[0] - p0[0]
+    dy = p3[1] - p0[1]
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        return p3, p3
+    # Unit perpendicular to the travel direction.
+    perp_x = -dy / dist
+    perp_y = dx / dist
+
+    b = max(0.0, float(bow))
+    amp = dist * b * rng.uniform(0.7, 1.4)
+    if wobble_cap > 0.0:
+        amp = min(amp, wobble_cap)
+
+    sign1 = 1.0 if rng.random() < 0.5 else -1.0
+    sign2 = sign1 if rng.random() < 0.7 else -sign1
+    off1 = amp * sign1 * rng.uniform(0.7, 1.0)
+    off2 = amp * sign2 * rng.uniform(0.7, 1.0)
+
+    p1 = (p0[0] + dx / 3.0 + perp_x * off1, p0[1] + dy / 3.0 + perp_y * off1)
+    p2 = (p0[0] + 2.0 * dx / 3.0 + perp_x * off2, p0[1] + 2.0 * dy / 3.0 + perp_y * off2)
+    return p1, p2
+
+
+def _curvature(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    """Approximate the local path curvature κ = 1/R at point ``b`` from neighbours.
+
+    Uses the circumscribed-circle formula κ = 4·Area(abc) / (|ab|·|bc|·|ca|). Used to
+    apply the 2/3 power law (slow through tight curves).
+    """
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    cbx, cby = b[0] - c[0], b[1] - c[1]
+    acx, acy = c[0] - a[0], c[1] - a[1]
+    area2 = abs(abx * (-cby) - (-cbx) * aby)  # 2*area = |ab x cb|
+    d_ab = math.hypot(abx, aby)
+    d_cb = math.hypot(cbx, cby)
+    d_ac = math.hypot(acx, acy)
+    denom = d_ab * d_cb * d_ac
+    if denom < 1e-9:
+        return 0.0
+    return (2.0 * area2) / denom
+
+
+def _velocity_progress(u: float, skew: float) -> float:
+    """Time→displacement reparameterization combining minimum-jerk with mild skew.
+
+    Base is the minimum-jerk profile (Flash & Hogan, 1985), a symmetric bell-shaped
+    velocity. Real reaches are slightly asymmetric with a longer deceleration phase
+    (the corrective tail); ``skew`` in [0, ~0.25] blends in an ease-out term
+    ``1-(1-u)^3`` that reaches mid-displacement earlier, lengthening the decel phase.
+    Monotonic with progress(0)=0, progress(1)=1.
+    """
+    base = min_jerk_progress(u)
+    if skew <= 0.0:
+        return base
+    fast = 1.0 - (1.0 - u) ** 3
+    return (1.0 - skew) * base + skew * fast
+
+
+def _emit_bezier(
+    page: Any,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    *,
+    steps: int,
+    rng: random.Random,
+    total_ms: float,
+    clock: list[float],
+    tremor_hz: float,
+    tremor_amp_px: float,
+    power_law_gain: float,
+    min_jerk_skew: float,
+) -> tuple[float, float]:
+    """Sample and emit a Bezier segment honoring three human motor invariants.
+
+    1. VELOCITY PROFILE — samples are placed in time via :func:`_velocity_progress`
+       (minimum-jerk + skew), so the cursor accelerates, peaks, then decelerates.
+    2. 2/3 POWER LAW — the per-sample dwell is scaled by local curvature
+       (:func:`two_thirds_power_dwell_scale`): the cursor slows through tight curves
+       and speeds up on straight segments (Lacquaniti et al., 1983). Dwells are
+       normalized so the segment takes ~``total_ms``.
+    3. PHYSIOLOGICAL TREMOR — an ~8–12 Hz, sub-pixel oscillation (two slightly
+       detuned sinusoids, since real tremor is band- not line-spectrum) is added
+       perpendicular to the path (Elble & Koller, 1990). ``clock`` is a 1-element
+       list carrying elapsed ms across segments so tremor phase stays continuous.
+
+    The final sample lands on P3 (sans tremor) so the endpoint is exact.
+    """
+    n = max(2, int(steps))
+    # Pass 1: positions along the curve under the velocity reparam.
+    raw: list[tuple[float, float]] = []
+    for i in range(1, n + 1):
+        u = i / n
+        t = _velocity_progress(u, min_jerk_skew)
+        raw.append(_bezier_point(p0, p1, p2, p3, t))
+
+    # Curvature per interior sample (endpoints reuse neighbours).
+    curv: list[float] = []
+    for i in range(len(raw)):
+        a = raw[i - 1] if i - 1 >= 0 else p0
+        b = raw[i]
+        c = raw[i + 1] if i + 1 < len(raw) else raw[i]
+        curv.append(_curvature(a, b, c))
+    positive = [k for k in curv if k > 1e-9]
+    ref = (sum(positive) / len(positive)) if positive else 1e-6
+
+    # Per-step dwell weights from the 2/3 power law, normalized to total_ms.
+    weights = [two_thirds_power_dwell_scale(k, ref_curvature=ref, gain=power_law_gain) for k in curv]
+    wsum = sum(weights) or float(len(weights))
+    dwell_ms = [max(1.0, total_ms * (w / wsum)) for w in weights]
+
+    amp = max(0.0, float(tremor_amp_px))
+    hz = max(1.0, float(tremor_hz))
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    phase2 = rng.uniform(0.0, 2.0 * math.pi)
+
+    last = p3
+    for i in range(len(raw)):
+        px, py = raw[i]
+        if amp > 0.0 and i < len(raw) - 1:
+            # Perpendicular tremor using the local travel tangent.
+            nx, ny = raw[i + 1]
+            tx, ty = (nx - px), (ny - py)
+            tlen = math.hypot(tx, ty) or 1.0
+            perp_x, perp_y = -ty / tlen, tx / tlen
+            t_s = clock[0] / 1000.0
+            # Band tremor: two detuned ~8-12Hz components + small longitudinal term.
+            osc = (
+                0.7 * math.sin(2.0 * math.pi * hz * t_s + phase)
+                + 0.3 * math.sin(2.0 * math.pi * (hz * 1.27) * t_s + phase2)
+            )
+            jx = perp_x * amp * osc
+            jy = perp_y * amp * osc
+            page.mouse.move(px + jx, py + jy)
+        else:
+            page.mouse.move(px, py)
+        last = (px, py)
+        clock[0] += dwell_ms[i]
+        if i < len(raw) - 1:
+            page.wait_for_timeout(int(round(dwell_ms[i])))
+    return last
+
+
 def move_pointer(
     page: Any,
     x: float,
@@ -525,10 +1057,33 @@ def move_pointer(
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
+    target_w: float | None = None,
+    target_h: float | None = None,
 ) -> dict[str, Any]:
-    """Move cursor to coordinates honoring the plan's pointer.move_style, imprecision, and overshoot."""
+    """Move the cursor to ``(x, y)`` along a human-realistic aimed movement.
+
+    The trajectory models the published invariants of human aimed movement, drawing
+    ALL randomness from the single advancing per-session RNG so that the same
+    start/end never produces the same path (motor variability; Harris & Wolpert,
+    1998):
+
+    - DURATION follows Fitts's law: movement time grows with log2(distance/width)
+      (Fitts, 1954). ``target_w`` (e.g. a button's width) sharpens the prediction;
+      absent it, a nominal acquisition width is used.
+    - The PRIMARY ballistic phase is a cubic Bezier (gentle person-stable arc) sampled
+      with a minimum-jerk velocity profile and curvature-dependent (2/3 power-law)
+      timing, with ~8-12 Hz physiological tremor superimposed (see ``_emit_bezier``).
+    - SECONDARY corrective submovement(s) near the target follow the optimized-
+      submovement model (Meyer et al., 1988): a short homing hop whose probability
+      rises with the index of difficulty, plus the existing overshoot-and-return.
+    - Intra-session FATIGUE slows the movement and grows tremor/endpoint scatter
+      over a long session.
+
+    The cursor ends exactly on the (imprecision-jittered) target, recorded on the page.
+    """
     if plan and plan.get("persona", {}).get("name") == "naive_bot":
         page.mouse.move(x, y)
+        _set_cursor(page, x, y)
         res = {
             "x": round(x),
             "y": round(y),
@@ -541,51 +1096,133 @@ def move_pointer(
         return res
 
     pointer = _pointer_plan(plan)
-    style = str(pointer.get("move_style") or "direct")
-    imprec = _bounded_int(pointer.get("imprecision_px"), lower=0, upper=20, default=3)
-    ovr_ch = _bounded_float(pointer.get("overshoot_chance"), lower=0.0, upper=0.5, default=0.04)
-    rng = _seeded_rng(plan, f"ptr:{round(x)}:{round(y)}")
+    rng = _session_rng(page, plan)
+    drift = _fatigue(page, plan)
 
+    # Physics knobs live on the plan's human_config (identity-derived, see
+    # behavior_policy.build_identity_kinematics).
+    hc = _human_config(plan)
+    imprec = _bounded_float(
+        hc.get("mouse_imprecision_px", pointer.get("imprecision_px")), lower=0.0, upper=20.0, default=3.0
+    ) * drift["sloppiness"]
+    max_steps = _bounded_int(hc.get("mouse_max_steps"), lower=12, upper=60, default=32)
+    step_dt = _bounded_float(hc.get("mouse_step_delay_ms"), lower=1.0, upper=50.0, default=8.0)
+    wobble_cap = _bounded_float(hc.get("mouse_wobble_max"), lower=0.0, upper=400.0, default=0.0)
+    bow = _bounded_float(hc.get("mouse_curve_bow"), lower=0.0, upper=0.5, default=0.14)
+    tremor_hz = _bounded_float(hc.get("tremor_hz"), lower=5.0, upper=14.0, default=10.0)
+    tremor_amp = _bounded_float(hc.get("tremor_amp_px"), lower=0.0, upper=3.0, default=0.6) * drift["sloppiness"]
+    pl_gain = _bounded_float(hc.get("power_law_gain"), lower=0.0, upper=1.0, default=0.8)
+    mj_skew = _bounded_float(hc.get("min_jerk_skew"), lower=0.0, upper=0.45, default=0.12)
+    fitts_a = _bounded_float(hc.get("fitts_a_ms"), lower=40.0, upper=400.0, default=100.0)
+    fitts_b = _bounded_float(hc.get("fitts_b_ms"), lower=80.0, upper=400.0, default=140.0)
+    ovr_ch = _bounded_float(
+        hc.get("mouse_overshoot_chance", pointer.get("overshoot_chance")), lower=0.0, upper=0.5, default=0.08
+    )
+    corr_ch = _bounded_float(hc.get("corrective_submovement_chance"), lower=0.0, upper=0.95, default=0.45)
+    corr_max = _bounded_int(hc.get("corrective_submovement_max"), lower=0, upper=3, default=1)
+    ovr_px = hc.get("mouse_overshoot_px")
+    if isinstance(ovr_px, (list, tuple)) and len(ovr_px) == 2:
+        ovr_lo, ovr_hi = float(ovr_px[0]), float(ovr_px[1])
+    else:
+        ovr_lo, ovr_hi = 4.0, 14.0
+
+    # Jittered target (human endpoint imprecision) — the curve's true endpoint.
     tx = float(x) + rng.uniform(-imprec, imprec)
     ty = float(y) + rng.uniform(-imprec, imprec)
+    target = (tx, ty)
 
-    segments: list[tuple[float, float]] = []
-    used = style
-    if style == "slight_arc":
-        off = rng.uniform(18, 48) * (1 if rng.random() < 0.5 else -1)
-        segments.append((tx + off * 0.7, ty - 18))
-        segments.append((tx, ty))
-        used = "slight_arc"
-    elif style == "two_step":
-        offx = rng.uniform(10, 32) * (1 if rng.random() < 0.5 else -1)
-        offy = rng.uniform(6, 22) * (1 if rng.random() < 0.5 else -1)
-        segments.append((tx + offx, ty + offy))
-        segments.append((tx, ty))
-        used = "two_step"
+    start = _get_cursor(page)
+    dx = tx - start[0]
+    dy = ty - start[1]
+    dist = math.hypot(dx, dy)
+
+    # Effective target width for Fitts: prefer the real element extent (the smaller
+    # of width/height is the limiting acquisition dimension), else a nominal value.
+    if target_w is not None or target_h is not None:
+        w = min([d for d in (target_w, target_h) if d is not None] or [24.0])
+        eff_w = max(6.0, float(w))
     else:
-        segments.append((tx, ty))
-        used = "direct"
+        eff_w = 24.0
 
-    for sx, sy in segments:
-        page.mouse.move(sx, sy)
-        if len(segments) > 1:
-            page.wait_for_timeout(rng.randint(6, 22))
+    # Index of difficulty drives both movement time (Fitts) and how likely a homing
+    # correction is needed (harder acquisitions => more corrective submovements).
+    idx_diff = math.log2(dist / eff_w + 1.0) if dist > 0 else 0.0
+    mt_ms = fitts_movement_time_ms(dist, eff_w, a_ms=fitts_a, b_ms=fitts_b) * drift["slowdown"]
+    # Step count is the movement time divided by the per-sample cadence, bounded.
+    steps = max(8, min(max_steps, int(round(mt_ms / max(1.0, step_dt)))))
 
-    overshot = False
-    if rng.random() < ovr_ch:
-        ox = tx + rng.uniform(3, 11) * (1 if rng.random() < 0.5 else -1)
-        oy = ty + rng.uniform(2, 7) * (1 if rng.random() < 0.5 else -1)
-        page.mouse.move(ox, oy)
-        page.wait_for_timeout(rng.randint(18, 55))
-        page.mouse.move(tx + rng.uniform(-0.9, 0.9), ty + rng.uniform(-0.9, 0.9))
-        overshot = True
+    clock = [0.0]  # shared elapsed-ms clock so tremor phase is continuous across hops.
+    overshot = rng.random() < ovr_ch
+
+    def _emit(p_from: tuple[float, float], p_to: tuple[float, float], n_steps: int, segment_ms: float) -> None:
+        p1, p2 = _bezier_controls(p_from, p_to, rng, wobble_cap=wobble_cap, bow=bow)
+        _emit_bezier(
+            page,
+            p_from,
+            p1,
+            p2,
+            p_to,
+            steps=n_steps,
+            rng=rng,
+            total_ms=segment_ms,
+            clock=clock,
+            tremor_hz=tremor_hz,
+            tremor_amp_px=tremor_amp,
+            power_law_gain=pl_gain,
+            min_jerk_skew=mj_skew,
+        )
+
+    submovements = 1
+    if overshot and dist > 1e-6:
+        # Ballistic phase deliberately overshoots, then a corrective return.
+        ext = rng.uniform(ovr_lo, ovr_hi)
+        ux, uy = dx / dist, dy / dist
+        over_pt = (tx + ux * ext, ty + uy * ext)
+        _emit(start, over_pt, steps, mt_ms)
+        page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=max(step_dt * 3.0, 20.0), cv=0.4, lo=10.0, hi=160.0)))
+        corr_steps = max(6, steps // 3)
+        _emit(over_pt, target, corr_steps, mt_ms * 0.35)
+        submovements = 2
+        used = "ballistic_overshoot_correct"
+    else:
+        # Primary ballistic phase aims slightly short of the target (undershoot bias
+        # is the common case in Meyer's model), then optional homing submovements.
+        if dist > 1e-6 and corr_ch > 0.0:
+            undershoot = rng.uniform(0.03, 0.10)
+            primary_pt = (start[0] + dx * (1.0 - undershoot), start[1] + dy * (1.0 - undershoot))
+        else:
+            primary_pt = target
+        _emit(start, primary_pt, steps, mt_ms)
+        used = "ballistic"
+
+        # Corrective submovements: probability rises with the index of difficulty.
+        cur = primary_pt
+        eff_corr_ch = min(0.95, corr_ch * (0.5 + 0.18 * idx_diff))
+        for _ in range(corr_max):
+            if cur == target:
+                break
+            if rng.random() >= eff_corr_ch:
+                break
+            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=max(step_dt * 2.0, 18.0), cv=0.45, lo=8.0, hi=140.0)))
+            corr_steps = max(5, steps // 4)
+            _emit(cur, target, corr_steps, mt_ms * 0.30)
+            cur = target
+            submovements += 1
+            used = "ballistic_correct"
+            eff_corr_ch *= 0.4  # each successive correction is much less likely.
+
+    _set_cursor(page, tx, ty)
 
     res = {
         "x": round(tx),
         "y": round(ty),
         "style": used,
-        "imprecision_px": imprec,
+        "imprecision_px": round(imprec, 2),
         "overshot": overshot,
+        "submovements": submovements,
+        "movement_time_ms": round(mt_ms, 1),
+        "index_of_difficulty": round(idx_diff, 2),
+        "steps": steps,
     }
     if recorder is not None:
         recorder.record("mouse_move", metadata=res)
@@ -1122,8 +1759,10 @@ def move_pointer(
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
+    target_w: float | None = None,
+    target_h: float | None = None,
 ) -> dict[str, Any]:
-    res = _orig_move_pointer(page, x, y, plan, recorder=recorder)
+    res = _orig_move_pointer(page, x, y, plan, recorder=recorder, target_w=target_w, target_h=target_h)
     # Drive the QA synthetic cursor if present (harness / visible Watch / movie).
     # The evaluate is a no-op if the fn is not on window (normal invisible runs).
     try:
