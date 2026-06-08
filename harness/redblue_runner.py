@@ -134,6 +134,13 @@ def _launch(engine: str, headless: bool):
     # without a trusted-CA requirement. This does not change Red's fingerprint.
     ctx_kwargs["ignore_https_errors"] = True
 
+    # Optional watchable recording: set HARNESS_VIDEO_DIR to capture a .webm of the
+    # session (e.g. to eyeball whether the motion looks natural). No effect when unset.
+    _video_dir = os.environ.get("HARNESS_VIDEO_DIR")
+    if _video_dir:
+        ctx_kwargs["record_video_dir"] = _video_dir
+        ctx_kwargs["record_video_size"] = {"width": 1280, "height": 800}
+
     if engine in ("auto", "cloak"):
         try:
             from imposter5.loaders.cloak_runtime import launch_automation_browser
@@ -392,6 +399,16 @@ def run_matchup(
             mus_armed = _arm_mus_persistent(page)
         page.goto(nav_url, wait_until="domcontentloaded")
         page.wait_for_timeout(400)
+
+        # When recording, draw the synthetic cursor overlay so the .webm shows the
+        # analog pointer path (init-script based, so it survives story reloads).
+        if os.environ.get("HARNESS_VIDEO_DIR"):
+            try:
+                from imposter5.automation_connector.interaction_primitives import inject_synthetic_cursor
+
+                inject_synthetic_cursor(page)
+            except Exception:  # noqa: BLE001 - recording overlay is best-effort
+                pass
 
         # Arm the real fp-agent mus.js recorder before driving so the partner's
         # XGBoost sees the same behavioral stream Blue's statistical L3 does.

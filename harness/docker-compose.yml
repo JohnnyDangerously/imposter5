@@ -1,0 +1,61 @@
+# Red-vs-Blue anti-bot harness.
+#
+# Two containers on a private user-defined bridge network. Blue (detector) and
+# Red (bot) share NO process, NO code, and NO in-memory signatures. Red reaches
+# Blue strictly over real HTTP at http://blue:5190, so the telemetry Blue scores
+# is produced by a real headless browser navigating a real page.
+#
+# Isolation provided: separate filesystem + network namespaces per container,
+# resolved only by the bridge DNS name `blue`. No cross-wiring.
+#
+# Authenticity ceiling (read before trusting results): a Linux-container headless
+# Chromium renders via SwiftShader/llvmpipe with headless flags, which Blue's
+# Layer 2 environment checks flag as server-GPU/headless. This compose path
+# fairly tests BEHAVIORAL layers but is NOT a fair environment-evasion test.
+# For environment authenticity, run Red headed on real consumer hardware against
+# Blue on a separate host/domain (see RUNBOOK.md, "Isolation & authenticity").
+name: redblue-harness
+
+networks:
+  redblue_net:
+    driver: bridge
+
+services:
+  blue:
+    build:
+      context: ../../last-human-line
+      dockerfile: Dockerfile
+    networks:
+      - redblue_net
+    # Host publish is optional and only for inspecting Blue from your machine.
+    # Remove this block to keep Blue reachable only on the private network.
+    ports:
+      - "5190:5190"
+    healthcheck:
+      # python:3.11-slim has no curl; use urllib against the real health route.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5190/system/health', timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  red:
+    build:
+      context: ..
+      dockerfile: harness/Dockerfile.red
+    depends_on:
+      blue:
+        condition: service_healthy
+    environment:
+      BLUE_BASE_URL: http://blue:5190
+      PERSONA: focused_power_user
+      ENGINE: auto
+    networks:
+      - redblue_net
+    # Combined Red+Blue report lands on the host at ./harness/out/red.json.
+    volumes:
+      - ./out:/out

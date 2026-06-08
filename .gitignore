@@ -43,3 +43,7 @@ Thumbs.db
 .codex-outputs/
 backend/.codex-outputs/
 frontend/dist/
+
+# Harness run artifacts (JSON reports, logs, recorded videos) — large, regenerable
+harness/out/*
+!harness/out/.gitkeep
