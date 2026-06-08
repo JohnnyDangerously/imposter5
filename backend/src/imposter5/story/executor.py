@@ -443,6 +443,28 @@ class StoryExecutor:
             pass
         # The view changed: drop cached affordance maps so re-resolution is fresh.
         self.mapper._cache.clear()
+        # A person cannot act on a freshly rendered view instantly: eyes must
+        # saccade, fixate, and comprehend before the hand starts moving. Pay that
+        # perceive-decide-initiate latency before the first action on the new view.
+        self._perceive_after_render()
+
+    def _perceive_after_render(self) -> None:
+        """Pause for a human perceive-decide-initiate latency after a render.
+
+        Human-factors reaction time for orienting to new screen content and
+        initiating a movement lives in the hundreds of milliseconds (visual
+        intake + decision + motor onset); it is never sub-~200 ms. We draw from
+        the shared log-normal timing primitive and enforce an absolute
+        physiological floor so even compressed/preview runs cannot emit an
+        instantaneous (and therefore impossible) reaction. The floor is on the
+        ground truth of human cognition, not on any detector threshold.
+        """
+        base = lognormal_ms(self.rng, mean_ms=450.0, cv=0.4, lo=250.0, hi=1600.0)
+        ms = max(250.0, base * max(self.dwell_scale, 0.25))
+        try:
+            self.page.wait_for_timeout(int(ms))
+        except Exception:
+            logger.debug("[story] perceive latency wait failed", exc_info=True)
 
     # --- tangent handlers ---------------------------------------------------------
     def _do_tangent(self, scene: Scene) -> dict[str, Any]:
@@ -517,6 +539,8 @@ class StoryExecutor:
     # --- run ----------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
         update_status_ticker(self.page, "STORY MODE", f"goal={self.plan.goal_predicate.type}")
+        # The page just rendered: take in the landing view before the first move.
+        self._perceive_after_render()
         for i, scene in enumerate(self.plan.scenes):
             try:
                 if scene.tangent:
