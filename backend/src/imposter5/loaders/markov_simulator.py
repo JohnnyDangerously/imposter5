@@ -19,6 +19,7 @@ from imposter5.automation_connector.interaction_primitives import (
     click_element,
     hover_element,
     move_pointer,
+    perceive_after_render,
     scroll_page,
     type_text,
     update_status_ticker,
@@ -390,7 +391,18 @@ def run_markov_simulation(
                 update_status_ticker(page, "🖱️ CLICKING", "Choosing element to click...")
                 target = _pick_visible_locator(page, rng, "a[href], button")
                 if target is not None:
+                    try:
+                        url_before = page.url
+                    except Exception:
+                        url_before = None
                     click_element(page, target, plan, recorder=recorder)
+                    # If the click navigated to a new view, perceive it before acting.
+                    try:
+                        navigated = url_before is not None and page.url != url_before
+                    except Exception:
+                        navigated = False
+                    if navigated:
+                        perceive_after_render(page, plan, recorder=recorder)
                 else:
                     logger.info("[markov_simulator] no visible click target; skipping click step")
 

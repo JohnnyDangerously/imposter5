@@ -26,6 +26,7 @@ from imposter5.automation_connector.interaction_primitives import (
     click_element,
     hover_element,
     move_pointer,
+    perceive_after_render,
     scroll_page,
     type_text,
     update_status_ticker,
@@ -451,20 +452,14 @@ class StoryExecutor:
     def _perceive_after_render(self) -> None:
         """Pause for a human perceive-decide-initiate latency after a render.
 
-        Human-factors reaction time for orienting to new screen content and
-        initiating a movement lives in the hundreds of milliseconds (visual
-        intake + decision + motor onset); it is never sub-~200 ms. We draw from
-        the shared log-normal timing primitive and enforce an absolute
-        physiological floor so even compressed/preview runs cannot emit an
-        instantaneous (and therefore impossible) reaction. The floor is on the
-        ground truth of human cognition, not on any detector threshold.
+        Delegates to the shared ``perceive_after_render`` primitive (single
+        source of truth, also used by the product runners) so the floor and
+        distribution stay consistent everywhere. ``dwell_scale`` compresses the
+        variable part for fast test/preview runs; the floor stays absolute.
         """
-        base = lognormal_ms(self.rng, mean_ms=450.0, cv=0.4, lo=250.0, hi=1600.0)
-        ms = max(250.0, base * max(self.dwell_scale, 0.25))
-        try:
-            self.page.wait_for_timeout(int(ms))
-        except Exception:
-            logger.debug("[story] perceive latency wait failed", exc_info=True)
+        perceive_after_render(
+            self.page, self.behavior_plan, scale=self.dwell_scale, recorder=self.recorder
+        )
 
     # --- tangent handlers ---------------------------------------------------------
     def _do_tangent(self, scene: Scene) -> dict[str, Any]:

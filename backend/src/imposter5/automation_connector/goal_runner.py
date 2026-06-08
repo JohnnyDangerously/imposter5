@@ -10,6 +10,7 @@ from imposter5.automation_connector.interaction_primitives import (
     hover_element,
     maybe_backtrack,
     mobile_swipe,
+    perceive_after_render,
     scroll_page,
     type_text,
     wait_human,
@@ -91,6 +92,8 @@ def run_visible_state_goal(
             url = action.get("url") or goal.start_url
             page.goto(url, wait_until="domcontentloaded")
             recorder.record("goto", label="visit_start_url", metadata={"url": url})
+            # New view rendered: take it in before the first action (no instant reaction).
+            perceive_after_render(page, behavior_plan, recorder=recorder)
         elif action_type == "wait":
             wait_ms = wait_human(page, behavior_plan, int(action.get("pass_index") or 0), 800, recorder=recorder)
             recorder.record("wait_complete", label="settle_page", metadata={"wait_ms": wait_ms})
@@ -126,6 +129,8 @@ def run_visible_state_goal(
             recorder.record("hover", metadata={"selector": sel})
         elif action_type == "backtrack":
             maybe_backtrack(page, behavior_plan, recorder=recorder)
+            # Back-navigation re-renders a prior view: perceive it before acting.
+            perceive_after_render(page, behavior_plan, recorder=recorder)
         elif action_type == "mobile_swipe":
             mobile_swipe(page, behavior_plan, int(action.get("pass_index") or 0), recorder=recorder)
         else:

@@ -188,6 +188,43 @@ def wait_human(
     return wait_ms
 
 
+def perceive_after_render(
+    page: Any,
+    plan: dict[str, Any] | None = None,
+    *,
+    scale: float = 1.0,
+    recorder: SessionRecorder | None = None,
+) -> int:
+    """Pay a human perceive-decide-initiate latency after a view/content render.
+
+    A sighted person must visually take in newly rendered content (saccade,
+    fixation, comprehension) and decide before the hand starts moving; that
+    latency lives in the hundreds of milliseconds and is never sub-~200 ms.
+    Call this after a navigation / view change and before the first interaction
+    on the new view so the first action reads as a genuine reaction rather than
+    an instantaneous (physiologically impossible) one. Drawn from the shared
+    log-normal timing primitive on the single advancing per-session RNG, with an
+    absolute physiological floor. The floor is grounded in human-factors
+    reaction time, not on any detector threshold.
+
+    ``scale`` compresses the variable part (test-only fast paths); the floor is
+    absolute and never compresses below it.
+    """
+    rng = _session_rng(page, plan)
+    base = lognormal_ms(rng, mean_ms=450.0, cv=0.4, lo=250.0, hi=1600.0)
+    ms = int(max(250.0, base * max(float(scale), 0.25)))
+    try:
+        page.wait_for_timeout(ms)
+    except Exception:
+        logger.debug("[interaction_primitives] perceive_after_render wait failed", exc_info=True)
+    if recorder is not None:
+        try:
+            recorder.record("perceive_after_render", metadata={"latency_ms": ms})
+        except Exception:
+            logger.debug("[interaction_primitives] perceive_after_render record failed", exc_info=True)
+    return ms
+
+
 def scroll_page(
     page: Any,
     plan: dict[str, Any] | None,
