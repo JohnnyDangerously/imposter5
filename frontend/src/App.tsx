@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Play,
   Pause,
@@ -32,14 +32,78 @@ import {
 
 interface Persona {
   name: string;
-  patience: number;
+  // Backend serializes patience as a categorical string ("low"/"medium"/"high"),
+  // not a number (see behavior_policy.Persona).
+  patience: string;
   scroll_style: string;
   interaction_style: string;
 }
 
+// Per-event metadata recorded by the backend SessionRecorder. Keys are dynamic
+// (selector/wait_ms/delta_y/url/text/pass_index/...), so the well-known fields
+// the UI reads are typed explicitly and the rest fall through the index signature.
+interface EventMetadata {
+  selector?: string;
+  wait_ms?: number;
+  delta_y?: number;
+  pass_index?: number;
+  url?: string;
+  text?: string;
+  note?: string;
+  [key: string]: unknown;
+}
+
+interface SessionEvent {
+  index: number;
+  action: string;
+  status: string;
+  label: string;
+  elapsed_ms: number;
+  metadata: EventMetadata;
+}
+
+interface SessionRecording {
+  run_id: string;
+  enabled: boolean;
+  event_count: number;
+  events: SessionEvent[];
+}
+
+interface GoalStepParams {
+  selector?: string;
+  [key: string]: unknown;
+}
+
+// Bounded behavior plan returned by behavior_policy.build_behavior_plan. Only the
+// stable, documented sections are typed; the index signature keeps it forward
+// compatible with the additional pacing/pointer/hover blocks the backend emits.
+interface BehaviorPlan {
+  policy_version: string;
+  run_id: string;
+  provider: string;
+  persona: {
+    name: string;
+    patience: string;
+    scroll_style: string;
+    interaction_style: string;
+  };
+  completion: {
+    name: string;
+    max_scroll_passes: number;
+    collect_visible_state: boolean;
+    ladder: Array<{ name: string; weight: number; max_scroll_passes: number }>;
+  };
+  pacing: { wait_ms: number[]; scroll_delta_y: number[] };
+  variations?: Record<string, unknown>;
+  variation_chances?: Record<string, number>;
+  recorder?: { enabled: boolean; max_events: number };
+  analytics?: { synthetic: boolean; labels: string[] };
+  [key: string]: unknown;
+}
+
 interface Imposter5Result {
   success: boolean;
-  plan: any;
+  plan: BehaviorPlan;
   goal?: {
     name: string;
     start_url: string;
@@ -49,7 +113,7 @@ interface Imposter5Result {
       name: string;
       action: string;
       required: boolean;
-      params?: any;
+      params?: GoalStepParams;
     }>;
   } | null;
   movie_filename: string;
@@ -64,24 +128,17 @@ interface Imposter5Result {
     all_proba?: number[];
   } | null;
   logs: string[];
-  session_recording?: {
-    run_id: string;
-    enabled: boolean;
-    event_count: number;
-    events: Array<{
-      index: number;
-      action: string;
-      status: string;
-      label: string;
-      elapsed_ms: number;
-      metadata: any;
-    }>;
-  } | null;
+  session_recording?: SessionRecording | null;
 }
 
 export default function App() {
   const [url, setUrl] = useState('https://en.wikipedia.org/wiki/Artificial_intelligence');
-  const [provider, setProvider] = useState<'generic' | 'linkedin'>('generic');
+  // provider is fully derived from the target URL; storing it as independent state
+  // and re-syncing in onChange handlers risked drift. Compute it once per url change.
+  const provider: 'generic' | 'linkedin' = useMemo(
+    () => (url.includes('linkedin.com') ? 'linkedin' : 'generic'),
+    [url],
+  );
   const [prompt, setPrompt] = useState('');
   const [persona, setPersona] = useState('curious_reader');
   const [completion, setCompletion] = useState('skim_visible_feed');
@@ -271,20 +328,6 @@ export default function App() {
     setResult(null);
     setSimLogs(['[SYSTEM] Initializing imposter5 simulation context...', '[SYSTEM] Preparing behavior pack and technique profiles...']);
 
-    const mockLogInterval = setInterval(() => {
-      const mockLogs = [
-        '⚙️ [CLOAK] Launching headed Chromium instance with stealth context...',
-        '💉 [INJECT] Injecting synthetic cursor overlay (__human_cursor__)...',
-        '🎯 [CALIBRATE] Executing 6-point glide calibration path...',
-        '🚀 [NAVIGATION] Navigating to target site...',
-        '🖱️ [PRIMITIVES] Driving humanized arcs and two-step curves...',
-        '📜 [SCROLL] Executing mouse-positioned wheel scrolls...',
-        '🔬 [DETECTOR] Recording behavioral frames via mus.js...',
-      ];
-      const randomLog = mockLogs[Math.floor(Math.random() * mockLogs.length)] || '';
-      setSimLogs((prev) => [...prev, randomLog]);
-    }, 3000);
-
     try {
       const formattedConfig = {
         mouse_wobble_max: humanConfig.mouse_wobble_max,
@@ -311,8 +354,6 @@ export default function App() {
         }),
       });
 
-      clearInterval(mockLogInterval);
-
       if (!response.ok) {
         throw new Error(`Server returned status ${response.status}`);
       }
@@ -324,10 +365,10 @@ export default function App() {
       } else {
         throw new Error(data.error || 'Simulation failed to complete.');
       }
-    } catch (err: any) {
-      clearInterval(mockLogInterval);
-      setError(err.message || 'Simulation failed.');
-      setSimLogs((prev) => [...prev, `❌ [ERROR] Simulation aborted: ${err.message}`]);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Simulation failed.';
+      setError(message);
+      setSimLogs((prev) => [...prev, `❌ [ERROR] Simulation aborted: ${message}`]);
     } finally {
       setLoading(false);
     }
@@ -385,11 +426,6 @@ export default function App() {
                         const match = websites.find((w) => w.name === name);
                         if (match) {
                           setUrl(match.url);
-                          if (match.url.includes('linkedin.com')) {
-                            setProvider('linkedin');
-                          } else {
-                            setProvider('generic');
-                          }
                         }
                       }}
                       className="flex-1 bg-slate-950 border border-slate-800 rounded-lg py-2 px-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-rose-500/50"
@@ -425,15 +461,7 @@ export default function App() {
                     <input
                       type="text"
                       value={url}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        setUrl(val);
-                        if (val.includes('linkedin.com')) {
-                          setProvider('linkedin');
-                        } else {
-                          setProvider('generic');
-                        }
-                      }}
+                      onChange={(e) => setUrl(e.target.value)}
                       className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 px-3 text-xs font-mono text-slate-200 focus:outline-none focus:border-rose-500/50"
                       placeholder="https://example.com"
                     />
@@ -1122,19 +1150,7 @@ export default function App() {
 interface LoomPlayerProps {
   movieUrl: string;
   movieFilename: string;
-  sessionRecording?: {
-    run_id: string;
-    enabled: boolean;
-    event_count: number;
-    events: Array<{
-      index: number;
-      action: string;
-      status: string;
-      label: string;
-      elapsed_ms: number;
-      metadata: any;
-    }>;
-  } | null;
+  sessionRecording?: SessionRecording | null;
 }
 
 function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerProps) {
@@ -1147,11 +1163,14 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
-  const [hoveredEvent, setHoveredEvent] = useState<any | null>(null);
+  const [hoveredEvent, setHoveredEvent] = useState<SessionEvent | null>(null);
   const [hoveredX, setHoveredX] = useState(0);
   const [activeEventIndex, setActiveEventIndex] = useState(-1);
 
-  const events = sessionRecording?.events || [];
+  // sessionRecording?.events || [] allocates a fresh array each render, which made
+  // the [currentTime, events] effect below churn every tick. Memoize on the
+  // recording reference so the effect only re-runs when time or events change.
+  const events = useMemo(() => sessionRecording?.events ?? [], [sessionRecording]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1351,7 +1370,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                     const isActive = idx === activeEventIndex;
                     return (
                       <button
-                        key={idx}
+                        key={ev.index}
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1455,7 +1474,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                 const isActive = idx === activeEventIndex;
                 return (
                   <button
-                    key={idx}
+                    key={ev.index}
                     type="button"
                     data-event-index={idx}
                     onClick={() => seekToEvent(ev.elapsed_ms)}

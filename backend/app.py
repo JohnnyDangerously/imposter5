@@ -10,10 +10,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # Ensure backend root and src directory are in sys.path
 backend_dir = str(Path(__file__).parent.resolve())
@@ -32,10 +32,21 @@ logger = logging.getLogger("imposter5")
 
 app = FastAPI(title="Imposter5 API", version="1.0.0")
 
-# Enable CORS for local development
+# Enable CORS for local development. Note: the wildcard origin "*" is invalid
+# together with allow_credentials=True (browsers reject it), so we pin explicit
+# local origins and keep credentials enabled.
+ALLOWED_ORIGINS = [
+    "http://localhost:5185",
+    "http://127.0.0.1:5185",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,6 +60,16 @@ def _get_fp_agent_verdict(frames: list) -> dict | None:
     except Exception as e:
         logger.error(f"[imposter5] could not import try_real_fp_agent_verdict: {e}")
         return None
+
+
+class Imposter5RunRequestWithMatrix(Imposter5RunRequest):
+    """Run request extended with an optional custom semi-Markov transition matrix.
+
+    Defined here (rather than in the shared models module) so app.py can thread a
+    user-supplied matrix into ``plan["markov_matrix"]`` for the simulator.
+    """
+
+    markov_matrix: dict[str, Any] | None = None
 
 
 class WebsiteSaveRequest(BaseModel):
@@ -247,7 +268,7 @@ def sanitize_human_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/imposter5/run")
-def imposter5_run(body: Imposter5RunRequest):
+def imposter5_run(body: Imposter5RunRequestWithMatrix):
     """Launch an Imposter5 red team simulation with custom behavior packs and techniques."""
     # Build the behavior plan
     from imposter5.automation_connector.behavior_policy import build_behavior_plan, PERSONAS
@@ -297,12 +318,17 @@ def imposter5_run(body: Imposter5RunRequest):
     if body.variations:
         plan.setdefault("variations", {}).update(body.variations)
 
-    # 5. Apply custom human_config
+    # 5. Apply custom human_config into the per-run plan (not os.environ, which
+    # would race across concurrent runs). Downstream humanization reads
+    # plan["human_config"].
     if body.human_config:
-        sanitized_cfg = sanitize_human_config(body.human_config)
-        os.environ["AUTOMATION_CONNECTOR_HUMAN_CONFIG"] = json.dumps(sanitized_cfg)
-    else:
-        os.environ.pop("AUTOMATION_CONNECTOR_HUMAN_CONFIG", None)
+        plan["human_config"] = sanitize_human_config(body.human_config)
+
+    # 5b. Thread an optional custom semi-Markov transition matrix into the plan so
+    # the simulator can consume it; providing one implies Markov pathing.
+    if body.markov_matrix:
+        plan["markov_matrix"] = body.markov_matrix
+        plan["use_markov_pathing"] = True
 
     # 6. Set up video directory
     video_dir = tempfile.mkdtemp(prefix="tokyo-imposter5-movie-")
@@ -330,6 +356,8 @@ def imposter5_run(body: Imposter5RunRequest):
     def run_simulation_thread():
         nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts
         import asyncio
+        # Initialize up front so the error path can never NameError / leak a handle.
+        browser = None
         try:
             loop = asyncio.get_running_loop()
             logs.append(f"[{datetime.now().isoformat()}] Thread running loop detected: {loop}")
@@ -541,7 +569,7 @@ def imposter5_run(body: Imposter5RunRequest):
 
         except Exception as e:
             logs.append(f"[{datetime.now().isoformat()}] Error during simulation: {e}")
-            if body.provider != "linkedin":
+            if browser is not None:
                 try:
                     browser.close()
                 except Exception:
