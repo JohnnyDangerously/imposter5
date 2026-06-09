@@ -31,6 +31,16 @@ class FakeLocator:
     def __init__(self, events: list[tuple[str, Any]]) -> None:
         self.events = events
 
+    @property
+    def first(self) -> "FakeLocator":
+        # Real Playwright locators expose ``.first``; the humanized primitives
+        # narrow string selectors to it before acting / honeypot-probing.
+        return self
+
+    def evaluate(self, script: str) -> str:
+        # Honeypot trap probe runs el-scoped JS; the fake element is never a trap.
+        return ""
+
     def click(self) -> None:
         self.events.append(("locator_click", None))
 
@@ -49,6 +59,10 @@ class FakeLocator:
 
 
 class FakePage:
+    # Humanized aimed movement (Fitts/min-jerk) reads viewport_size to seed the
+    # initial cursor position; provide it so the double matches Playwright.
+    viewport_size = {"width": 1280, "height": 800}
+
     def __init__(self) -> None:
         self.events: list[tuple[str, Any]] = []
         self.mouse = FakeMouse(self.events)
@@ -77,7 +91,12 @@ def test_wait_and_scroll_use_planned_values() -> None:
     # would have regressed the "mouse scroll event" feature).
     evs = page.events
     assert ("wait", 321) in evs
-    assert ("wheel", {"delta_x": 0, "delta_y": 654}) in evs
+    # Scroll now models momentum bleed-off: a decaying burst of wheel events whose
+    # signed deltas sum to (approximately) the planned 654px, not one raw wheel.
+    wheels = [e[1]["delta_y"] for e in evs if e[0] == "wheel"]
+    assert len(wheels) >= 2, "scroll should emit a multi-step decaying wheel burst"
+    assert all(d > 0 for d in wheels), "downward scroll => all-positive wheel deltas"
+    assert abs(sum(wheels) - 654) <= 2, "decaying burst should sum to the planned delta"
     assert any(e[0] == "locator" for e in evs), "scroll should probe for content area to position mouse"
     assert any(e[0] == "mouse_move" for e in evs), "scroll should produce mouse moves for realistic scroll events"
 
@@ -134,9 +153,15 @@ def test_hover_expand_and_mobile_primitives_record_metadata() -> None:
     swipe_result = mobile_swipe(page, plan, recorder=recorder)
 
     assert hover_result == {"selector": "a.person", "hover_dwell_ms": 200}
-    assert expand_result == {"attempted": 1, "expanded": 1, "max_expansions": 1}
     assert swipe_result == {"swiped": True, "delta_y": 444, "gesture_style": "short_swipe"}
-    assert recorder.payload()["event_count"] >= 3
+    # Comment expansion is now a human-realism coin flip (chance clamps to <=0.35),
+    # so assert the bounded structure rather than a guaranteed expansion.
+    assert expand_result["max_expansions"] == 1
+    assert 1 <= expand_result["attempted"] <= 2
+    assert 0 <= expand_result["expanded"] <= expand_result["attempted"]
+    assert expand_result["expanded"] <= expand_result["max_expansions"]
+    # Hover + mobile swipe always record; expansion may add one more.
+    assert recorder.payload()["event_count"] >= 2
 
 
 def test_backtrack_is_bounded_and_optional() -> None:
@@ -152,7 +177,7 @@ def test_backtrack_is_bounded_and_optional() -> None:
     assert ("go_back", "domcontentloaded") not in page.events
 
 
-def test_move_pointer_executes_planned_styles() -> None:
+def test_move_pointer_emits_human_aimed_movement() -> None:
     page = FakePage()
     plan = {
         "run_id": "rm1",
@@ -160,19 +185,29 @@ def test_move_pointer_executes_planned_styles() -> None:
     }
 
     res = move_pointer(page, 640, 360, plan)
-    assert res["style"] == "two_step"
-    assert res["overshot"] is False
-    assert len([e for e in page.events if e[0] == "mouse_move"]) == 2
+    # The humanized model reports the realized aimed-movement phase (Fitts duration +
+    # minimum-jerk Bezier + corrective submovements), not the old cosmetic move_style.
+    assert res["style"] in {"ballistic", "ballistic_correct", "ballistic_overshoot_correct"}
+    assert res["overshot"] is False  # overshoot_chance 0 => deterministically no overshoot
+    assert res["steps"] >= 8
+    assert res["submovements"] >= 1
+    # A real aimed movement is many micro-steps, not a fixed 2.
+    assert len([e for e in page.events if e[0] == "mouse_move"]) >= 8
+    # imprecision 0 => the cursor ends exactly on the requested target.
+    assert (res["x"], res["y"]) == (640, 360)
 
-    plan2 = {"run_id": "rm2", "pointer": {"move_style": "slight_arc", "imprecision_px": 1, "overshoot_chance": 0}}
-    res2 = move_pointer(page, 100, 100, plan2)
-    assert res2["style"] == "slight_arc"
-    assert len([e for e in page.events if e[0] == "mouse_move"]) > 2
-
-    plan3 = {"run_id": "rm3", "pointer": {"move_style": "direct", "overshoot_chance": 1.0}}
-    res3 = move_pointer(page, 50, 50, plan3)
-    assert res3["style"] == "direct"
-    assert res3["overshot"] is True
+    # Overshoot is probabilistic and physiologically capped (chance clamps to <=0.5),
+    # so drive several seeds to deterministically exercise the corrective-return path.
+    overshot_res = None
+    for i in range(40):
+        p = FakePage()
+        ri = move_pointer(p, 900, 600, {"run_id": f"ovr-{i}", "pointer": {"imprecision_px": 0, "overshoot_chance": 1.0}})
+        if ri["overshot"]:
+            overshot_res = ri
+            break
+    assert overshot_res is not None, "overshoot path should fire within a few dozen seeds at max chance"
+    assert overshot_res["style"] == "ballistic_overshoot_correct"
+    assert overshot_res["submovements"] == 2
 
 
 def test_click_and_hover_drive_pointer_moves() -> None:

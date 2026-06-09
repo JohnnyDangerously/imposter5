@@ -14,8 +14,15 @@ class FakeMouse:
     def wheel(self, delta_x: int, delta_y: int) -> None:
         self.events.append(("wheel", {"delta_x": delta_x, "delta_y": delta_y}))
 
+    def move(self, x: float, y: float) -> None:
+        # Humanized scroll positions the cursor over content before the wheel burst.
+        self.events.append(("mouse_move", {"x": round(x), "y": round(y)}))
+
 
 class FakePage:
+    # Humanized aimed movement reads viewport_size to seed the initial cursor.
+    viewport_size = {"width": 1280, "height": 800}
+
     def __init__(self) -> None:
         self.events: list[tuple[str, Any]] = []
         self.mouse = FakeMouse(self.events)
@@ -71,5 +78,10 @@ def test_run_visible_state_goal_records_actions_and_visible_state() -> None:
 
     assert result["title"] == "Accounts"
     assert result["summary"] == "Three customers renewed this week."
-    assert ("wheel", {"delta_x": 0, "delta_y": 333}) in page.events
+    # Scroll is now a decaying wheel burst (momentum bleed-off) summing to the
+    # planned 333px, rather than one raw wheel event.
+    wheels = [e[1]["delta_y"] for e in page.events if e[0] == "wheel"]
+    assert len(wheels) >= 2
+    assert all(d > 0 for d in wheels)
+    assert abs(sum(wheels) - 333) <= 2
     assert result["session_recording"]["event_count"] >= 5
