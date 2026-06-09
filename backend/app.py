@@ -353,6 +353,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     session_recorder_instance = None
     posts = []
     feasibility_result = None
+    linkedin_posts_result = None
 
     # Compile the prompt into a goal up-front so the pre-run pipeline (auth gate,
     # feasibility review) can reason about the actual requested steps. When there
@@ -385,7 +386,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         })
 
     def run_simulation_thread():
-        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result
+        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result
         import asyncio
         # Initialize up front so the error path can never NameError / leak a handle.
         browser = None
@@ -470,10 +471,12 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 browser.close()
                 logs.append(f"[{datetime.now().isoformat()}] Finalized video recording")
             else:
-                # 7. Launch browser for generic web simulation
-                runner = get_browser_runner()
-                browser = runner.launch_browser(headless=False)
-
+                # 7. Launch browser for prompt-driven web simulation. A LinkedIn
+                # target (provider or any linkedin.com URL) runs in the SAME
+                # authenticated persistent context the canned scraper uses (profile
+                # dir + restored cookies), so a prompt-driven LinkedIn run executes
+                # signed in instead of hitting the login wall. Every other target
+                # uses a fresh stealth context.
                 from imposter5.loaders.cloak_runtime import (
                     apply_anti_fingerprint_init_script,
                     automation_connector_stealth_context_kwargs,
@@ -482,15 +485,42 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 ctx_kwargs = automation_connector_stealth_context_kwargs()
                 ctx_kwargs["record_video_dir"] = video_dir
                 ctx_kwargs["record_video_size"] = {"width": 1440, "height": 900}
-                
-                context = browser.new_context(**ctx_kwargs)
-                if plan.get("persona", {}).get("name") != "naive_bot":
+
+                is_linkedin_target = body.provider == "linkedin" or "linkedin.com" in body.url.lower()
+                if is_linkedin_target:
+                    from imposter5.loaders.cloak_runtime import launch_automation_persistent_context
+                    from imposter5.loaders.linkedin_browser import linkedin_profile_dir, load_cookies
+                    from imposter5.automation_connector.auth_gate import RUN_USER_ID
+
+                    browser = None  # persistent context owns its own browser process
+                    context = launch_automation_persistent_context(
+                        linkedin_profile_dir(RUN_USER_ID), headless=False, **ctx_kwargs
+                    )
                     try:
                         apply_anti_fingerprint_init_script(context)
                     except Exception:
                         pass
-                context.set_default_timeout(25_000)
-                page = context.new_page()
+                    context.set_default_timeout(25_000)
+                    restored = load_cookies(RUN_USER_ID)
+                    if restored:
+                        try:
+                            context.add_cookies(restored)
+                            logs.append(f"[{datetime.now().isoformat()}] Restored {len(restored)} stored LinkedIn session cookies")
+                        except Exception as e:
+                            logs.append(f"[{datetime.now().isoformat()}] Warning: could not restore LinkedIn cookies: {e}")
+                    pages = getattr(context, "pages", None) or []
+                    page = pages[0] if pages else context.new_page()
+                else:
+                    runner = get_browser_runner()
+                    browser = runner.launch_browser(headless=False)
+                    context = browser.new_context(**ctx_kwargs)
+                    if plan.get("persona", {}).get("name") != "naive_bot":
+                        try:
+                            apply_anti_fingerprint_init_script(context)
+                        except Exception:
+                            pass
+                    context.set_default_timeout(25_000)
+                    page = context.new_page()
 
                 # Enable console logging for debugging
                 page.on("console", lambda msg: print(f"[BROWSER CONSOLE] {msg.text}", flush=True))
@@ -517,6 +547,16 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 logs.append(f"[{datetime.now().isoformat()}] Navigating to target URL: {body.url}")
                 page.goto(body.url, wait_until="domcontentloaded")
                 page.wait_for_timeout(1000)
+
+                if is_linkedin_target:
+                    try:
+                        from imposter5.loaders.linkedin_browser import is_logged_in as _li_logged_in
+                        if _li_logged_in(page):
+                            logs.append(f"[{datetime.now().isoformat()}] LinkedIn session authenticated")
+                        else:
+                            logs.append(f"[{datetime.now().isoformat()}] WARNING: LinkedIn not authenticated; prompt run may hit the login wall")
+                    except Exception:
+                        pass
 
                 recorder = SessionRecorder(plan)
                 session_recorder_instance = recorder
@@ -564,6 +604,9 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                     )
                 from imposter5.automation_connector.goals import goal_spec_to_payload
                 goal_payload = goal_spec_to_payload(goal)
+                linkedin_posts_result = visible_state.get("linkedin_posts") or None
+                if linkedin_posts_result:
+                    logs.append(f"[{datetime.now().isoformat()}] Extracted {len(linkedin_posts_result)} structured LinkedIn posts during the prompt run")
                 logs.append(f"[{datetime.now().isoformat()}] Simulation completed. Actions recorded: {len(visible_state.get('goal_actions', []))}")
 
                 # If running fp-agent, stop mus recording and get frames
@@ -575,9 +618,22 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                     except Exception as e:
                         logs.append(f"[{datetime.now().isoformat()}] Warning: could not stop mus recording: {e}")
 
+                # Persist refreshed LinkedIn session cookies before teardown (keeps
+                # the stored jar warm, like the scraper's session does).
+                if is_linkedin_target:
+                    try:
+                        from imposter5.loaders.linkedin_browser import save_cookies
+                        from imposter5.automation_connector.auth_gate import RUN_USER_ID as _RUID
+                        cks = context.cookies()
+                        if cks:
+                            save_cookies(_RUID, cks)
+                    except Exception:
+                        pass
+
                 # Close context and browser to finalize movie
                 context.close()
-                browser.close()
+                if browser is not None:
+                    browser.close()
                 logs.append(f"[{datetime.now().isoformat()}] Finalized video recording")
 
             # Copy the movie to desktop and .codex-outputs
@@ -713,6 +769,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         "auth": auth_decision.to_payload(),
         "feasibility": feasibility_result.to_payload() if feasibility_result is not None else None,
         "run_outcome": run_outcome.to_payload(),
+        "linkedin_posts": linkedin_posts_result,
         "movie_filename": movie_filename,
         "movie_url": f"/static/.codex-outputs/{movie_filename}" if movie_filename else "",
         "stamped_codex_path": stamped_codex_path,

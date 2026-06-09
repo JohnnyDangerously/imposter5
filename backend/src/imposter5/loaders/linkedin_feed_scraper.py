@@ -1061,6 +1061,53 @@ def scrape_feed(
         return []
 
 
+# --------------------------------------------------------------------------- #
+# Public adapter surface
+#
+# Consumed by the prompt-driven goal runner so the *organic* LinkedIn path reuses
+# the exact same structured extraction + human reading/side-trip mechanics as this
+# canned scraper, instead of duplicating them (one source of truth for LinkedIn
+# literacy). These are thin wrappers over the module-private helpers above.
+# --------------------------------------------------------------------------- #
+LINKEDIN_FEED_URL = _FEED_URL
+
+
+def extract_visible_posts(page: Any) -> list[dict]:
+    """Structured feed-post extraction for the current LinkedIn DOM (best-effort)."""
+    return _extract_posts(page)
+
+
+def merge_unique_posts(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    """Dedup-merge posts across scroll passes using stable identity keys."""
+    return _merge_unique_posts(existing, incoming)
+
+
+def run_feed_reading_variations(
+    page: Any,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    *,
+    variations: dict[str, Any] | None = None,
+    chances: dict[str, Any] | None = None,
+) -> list[str]:
+    """Hover-over-posts + comment-expand micro-reading behaviors on the current view."""
+    actions: list[str] = []
+    _simulate_feed_reading_behaviors(page, plan, recorder, variations or {}, chances or {}, actions)
+    return actions
+
+
+def visit_notifications(page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> bool:
+    """Click the notifications nav, read briefly, and return to the feed."""
+    actions: list[str] = []
+    return _visit_notifications_variation(page, plan, recorder, actions)
+
+
+def peek_random_profile(page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> bool:
+    """Click a visible actor, scroll their work history, then back to the feed."""
+    actions: list[str] = []
+    return _peek_random_profile_variation(page, plan, recorder, actions)
+
+
 def scrape_post_identity(user_id: str, post_url: str, *, raise_on_error: bool = False, headless: bool = True) -> dict | None:
     """Open one LinkedIn post permalink and return its visible identity metadata."""
     from imposter5.loaders.linkedin_browser import LinkedInBrowserSession, is_logged_in

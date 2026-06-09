@@ -139,6 +139,72 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
 
     import re
 
+    # --- LinkedIn site literacy ---------------------------------------------
+    # When the target is LinkedIn, map common intents (feed, notifications,
+    # messaging, people search) onto real LinkedIn affordances so the prompt
+    # drives concrete nav/search actions instead of a blind generic scroll. The
+    # feasibility review validates these selectors against the live DOM, and the
+    # goal runner's LinkedIn awareness extracts structured posts on read steps.
+    is_linkedin = (provider_hint or "").strip().lower() == "linkedin" or "linkedin.com" in url.lower()
+    if is_linkedin:
+        li_search_input = (
+            "input[aria-label*='Search' i], .search-global-typeahead__input, "
+            "input[placeholder*='Search' i]"
+        )
+        li_search_button = "button.search-global-typeahead__button, button[aria-label*='Search' i]"
+        li_notifications = "a[href*='/notifications/']"
+        li_messaging = "a[href*='/messaging/']"
+
+        if "notification" in p:
+            steps.extend([
+                GoalStep("open_notifications", "click", params={"selector": li_notifications}),
+                GoalStep("settle_notifications", "wait"),
+                GoalStep("read_notifications", "read"),
+                GoalStep("record_visible_state", "record"),
+            ])
+            outcome = "prompt_executed"
+        elif any(k in p for k in ("message", "messaging", "inbox", "dm")):
+            steps.extend([
+                GoalStep("open_messaging", "click", params={"selector": li_messaging}),
+                GoalStep("settle_messaging", "wait"),
+                GoalStep("read_messaging", "read"),
+                GoalStep("record_visible_state", "record"),
+            ])
+            outcome = "prompt_executed"
+        elif any(k in p for k in ("search", "find", "look for", "people", "connections", "profiles")):
+            q = prompt
+            for prefix in ("search for ", "look for ", "find ", "search "):
+                if prefix in prompt.lower():
+                    q = " ".join(prompt.split(prefix, 1)[1].strip().split()[0:8])
+                    break
+            steps.extend([
+                GoalStep("focus_search", "click", params={"selector": li_search_input}),
+                GoalStep("type_query", "type", params={"selector": li_search_input, "text": q}),
+                GoalStep("submit_search", "click", required=False, params={"selector": li_search_button}),
+                GoalStep("settle_results", "wait"),
+                GoalStep("inspect_results", "read"),
+                GoalStep("scroll_results", "scroll", required=False),
+                GoalStep("record_visible_state", "record"),
+            ])
+            outcome = "prompt_executed"
+        else:
+            # Feed / scroll / browse / default: scroll the feed and extract posts.
+            steps.extend([
+                GoalStep("settle_page", "wait"),
+                GoalStep("scroll_feed", "scroll", required=False),
+                GoalStep("inspect_visible_state", "read"),
+                GoalStep("record_visible_state", "record"),
+            ])
+            outcome = DEFAULT_OUTCOME
+
+        return GoalSpec(
+            name=name,
+            start_url=url,
+            desired_outcome=outcome,
+            steps=tuple(steps),
+            prompt=prompt,
+        )
+
     # Check for click links pattern (e.g., "click 5 links", "click three random links", "click links")
     click_links_match = re.search(r"click\s+(\d+|five|four|three|two|one)?\s*links?", p)
 
