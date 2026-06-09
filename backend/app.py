@@ -419,10 +419,24 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     # is no prompt, each provider's default goal is resolved inside the run.
     precompiled_goal = None
     if body.prompt:
-        from imposter5.automation_connector.goals import goal_spec_from_natural_prompt
+        from imposter5.automation_connector.goals import (
+            derive_plan_overrides,
+            goal_spec_from_natural_prompt,
+        )
         precompiled_goal = goal_spec_from_natural_prompt(
             body.prompt, start_url=body.url, provider_hint=body.provider
         )
+        # Bridge the compiled prompt into the behavior plan: ambient prompts engage
+        # the semi-Markov walk and parsed interest terms drive the goal+Markov
+        # hybrid's "open the post I care about" behavior. An explicitly-uploaded
+        # markov_matrix (set above) wins over the derived scan matrix.
+        overrides = derive_plan_overrides(precompiled_goal)
+        if overrides.get("use_markov_pathing"):
+            plan["use_markov_pathing"] = True
+        if overrides.get("interest_terms"):
+            plan["interest_terms"] = overrides["interest_terms"]
+        if overrides.get("markov_matrix") and not plan.get("markov_matrix"):
+            plan["markov_matrix"] = overrides["markov_matrix"]
 
     # Pipeline seam 1 — credential gate (workstream B). Runs before any browser is
     # opened: if the task needs credentials that are not ready, stop and tell the UI
@@ -691,6 +705,16 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                         "goal_actions": [{"step": s, "action": s} for s in markov_res.get("state_history", [])],
                         "success": True
                     }
+                    # The ambient Markov scan still serves the goal on LinkedIn:
+                    # harvest whatever feed posts the walk scrolled into view so an
+                    # ambient prompt ("casually browse LinkedIn") returns evidence
+                    # instead of only a state history.
+                    if is_linkedin_target:
+                        try:
+                            from imposter5.loaders.linkedin_feed_scraper import extract_visible_posts
+                            visible_state["linkedin_posts"] = extract_visible_posts(page)
+                        except Exception as exc:
+                            logs.append(f"[{datetime.now().isoformat()}] Markov LinkedIn extraction skipped: {exc}")
                     logs.append(f"[{datetime.now().isoformat()}] Markov simulation completed. States transitioned: {markov_res.get('steps_executed')}")
                 else:
                     visible_state = run_visible_state_goal(
