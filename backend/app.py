@@ -406,6 +406,12 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     # Distinguishes a genuinely failed canned LinkedIn scrape from a clean run so
     # the response can report honestly instead of always claiming success.
     linkedin_scrape_error = None
+    # Blue Team gauntlet run: the journey summary + the Blue evasion verdict
+    # (evasion_score / verdict / journey_verdict) captured from the gauntlet's own
+    # scorer, surfaced in the imposter session alongside the fp-agent verdict.
+    blue_report = None
+    gauntlet_summary = None
+    gauntlet_error = None
     # Offset (ms) between the event-log clock (SessionRecorder.elapsed_ms, which
     # starts when the recorder is constructed) and the video clock (which starts
     # when Playwright begins capturing the page). The player maps event time to
@@ -459,7 +465,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         })
 
     def run_simulation_thread():
-        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result, video_start_offset_ms, linkedin_scrape_error
+        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result, video_start_offset_ms, linkedin_scrape_error, blue_report, gauntlet_summary, gauntlet_error
         import asyncio
         # Initialize up front so the error path can never NameError / leak a handle.
         browser = None
@@ -516,6 +522,109 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 except Exception as exc:
                     linkedin_scrape_error = str(exc)
                     logs.append(f"[{datetime.now().isoformat()}] LinkedIn scrape raised: {exc}")
+            elif "/gauntlet" in body.url.lower() and not body.prompt:
+                # Blue Team gauntlet run: drive the full improved Red suite
+                # (Markov-continuity feed scan + interest-driven search/profile
+                # reads + notifications + glances) for a multi-minute session,
+                # record video like a LinkedIn run, then trigger the gauntlet's
+                # own scorer and capture the Blue evasion verdict.
+                logs.append(f"[{datetime.now().isoformat()}] Executing Blue Team gauntlet journey")
+                runner = get_browser_runner()
+                browser = runner.launch_browser(headless=False)
+
+                from imposter5.loaders.cloak_runtime import (
+                    apply_anti_fingerprint_init_script,
+                    automation_connector_stealth_context_kwargs,
+                )
+
+                ctx_kwargs = automation_connector_stealth_context_kwargs()
+                ctx_kwargs["record_video_dir"] = video_dir
+                ctx_kwargs["record_video_size"] = {"width": 1440, "height": 900}
+
+                context = browser.new_context(**ctx_kwargs)
+                try:
+                    apply_anti_fingerprint_init_script(context)
+                except Exception:
+                    pass
+                context.set_default_timeout(25_000)
+                page = context.new_page()
+                video_capture_start_monotonic = time.monotonic()
+
+                page.on("console", lambda msg: print(f"[BROWSER CONSOLE] {msg.text}", flush=True))
+                page.on("pageerror", lambda exc: print(f"[BROWSER EXCEPTION] {exc}", flush=True))
+                enable_visible_mouse_tracking(page)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+
+                if body.run_fp_agent:
+                    try:
+                        from imposter5.fp_agent.fp_agent_local_redteam_detector_test import ensure_mus_recording
+                        ensure_mus_recording(page)
+                    except Exception as e:
+                        logs.append(f"[{datetime.now().isoformat()}] Warning: could not start mus recording: {e}")
+
+                logs.append(f"[{datetime.now().isoformat()}] Navigating to gauntlet: {body.url}")
+                page.goto(body.url, wait_until="domcontentloaded")
+                page.wait_for_timeout(1000)
+
+                recorder = SessionRecorder(plan)
+                session_recorder_instance = recorder
+                if video_capture_start_monotonic is not None:
+                    video_start_offset_ms = round(
+                        (video_capture_start_monotonic - recorder.started_monotonic) * 1000
+                    )
+
+                try:
+                    from imposter5.loaders.gauntlet_journey import run_gauntlet_journey
+                    duration_s = float(plan.get("gauntlet_duration_s") or 240.0)
+                    gauntlet_summary = run_gauntlet_journey(
+                        page, plan, recorder=recorder, duration_s=duration_s
+                    )
+                    logs.append(
+                        f"[{datetime.now().isoformat()}] Gauntlet journey done in "
+                        f"{gauntlet_summary.get('duration_s')}s "
+                        f"(profiles={gauntlet_summary.get('profiles_opened')}, "
+                        f"notifs={gauntlet_summary.get('notifications_visited')}, "
+                        f"scans={gauntlet_summary.get('feed_scan_bursts')})"
+                    )
+                except Exception as exc:
+                    gauntlet_error = str(exc)
+                    logs.append(f"[{datetime.now().isoformat()}] Gauntlet journey raised: {exc}")
+
+                if body.run_fp_agent:
+                    try:
+                        from imposter5.fp_agent.fp_agent_local_redteam_detector_test import stop_and_get_mus_frames
+                        all_captured_frames = stop_and_get_mus_frames(page)
+                        logs.append(f"[{datetime.now().isoformat()}] Captured {len(all_captured_frames)} mus.js frames")
+                    except Exception as e:
+                        logs.append(f"[{datetime.now().isoformat()}] Warning: could not stop mus recording: {e}")
+
+                # Trigger the gauntlet's own telemetry submit + capture the Blue
+                # evasion verdict (the "much better stats" than a live run).
+                try:
+                    page.evaluate("window.lhhlSubmit && window.lhhlSubmit()")
+                    for _ in range(50):  # poll up to ~10s for the async score
+                        rep = page.evaluate("window.__lhhl_last_report || null")
+                        if rep:
+                            blue_report = rep
+                            break
+                        page.wait_for_timeout(200)
+                    if blue_report:
+                        logs.append(
+                            f"[{datetime.now().isoformat()}] Blue verdict: evasion_score="
+                            f"{blue_report.get('evasion_score')}% [{blue_report.get('verdict')}] "
+                            f"journey={blue_report.get('journey_verdict')}"
+                        )
+                    else:
+                        logs.append(f"[{datetime.now().isoformat()}] Blue verdict not returned (submit may have failed)")
+                except Exception as e:
+                    logs.append(f"[{datetime.now().isoformat()}] Warning: could not capture Blue verdict: {e}")
+
+                context.close()
+                browser.close()
+                logs.append(f"[{datetime.now().isoformat()}] Finalized gauntlet video recording")
             elif "wikipedia.org" in body.url.lower() and not body.prompt:
                 logs.append(f"[{datetime.now().isoformat()}] Executing advanced Wikipedia simulation")
                 runner = get_browser_runner()
@@ -882,11 +991,17 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         logs.append(f"[{datetime.now().isoformat()}] Wrote session sidecar {session_filename}")
 
     # Honest outcome: a canned LinkedIn scrape that raised or returned no posts is
-    # a failure, not a silent success.
+    # a failure, not a silent success. Same for a gauntlet journey that raised.
     scrape_path = body.provider == "linkedin" and not body.prompt
     scrape_failed = scrape_path and (linkedin_scrape_error is not None or not linkedin_posts_result)
-    run_success = not scrape_failed
-    run_status = "scrape_failed" if scrape_failed else "ran"
+    gauntlet_path = "/gauntlet" in body.url.lower() and not body.prompt
+    gauntlet_failed = gauntlet_path and (gauntlet_error is not None or gauntlet_summary is None)
+    run_success = not (scrape_failed or gauntlet_failed)
+    run_status = (
+        "scrape_failed" if scrape_failed
+        else "gauntlet_failed" if gauntlet_failed
+        else "ran"
+    )
 
     # Pipeline seam 3 — first-run verdict + optional scheduling (workstream D).
     from imposter5.automation_connector.scheduler import finalize_run
@@ -905,13 +1020,15 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     return success_response({
         "success": run_success,
         "status": run_status,
-        "error": linkedin_scrape_error,
+        "error": linkedin_scrape_error or gauntlet_error,
         "plan": plan,
         "goal": goal_payload,
         "auth": auth_decision.to_payload(),
         "feasibility": feasibility_result.to_payload() if feasibility_result is not None else None,
         "run_outcome": run_outcome.to_payload(),
         "linkedin_posts": linkedin_posts_result,
+        "blue_report": blue_report,
+        "gauntlet_summary": gauntlet_summary,
         "movie_filename": movie_filename,
         "movie_url": f"/static/.codex-outputs/{movie_filename}" if movie_filename else "",
         "session_url": f"/static/.codex-outputs/{session_filename}" if session_filename else "",

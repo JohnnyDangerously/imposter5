@@ -270,36 +270,55 @@ def scroll_page(
 
 
 def _position_mouse_over_content(page: Any, plan: dict[str, Any] | None, rng: random.Random, recorder: SessionRecorder | None = None) -> None:
-    """Best-effort move mouse to a plausible reading/viewport content spot before scroll.
+    """Move the mouse over a VISIBLE content spot before scrolling.
 
-    Uses ``query_selector`` (returns immediately, ``None`` when absent) + the
-    ElementHandle's non-blocking ``bounding_box`` so a missing/drifted selector
-    fails fast. Previously this used ``locator(sel).first.bounding_box()`` which
-    AUTO-WAITS up to the page default timeout (~20s) per missing selector — on
-    LinkedIn (drifted feed classes) that stacked into ~40s of dead air before
-    each scroll. If no real content target resolves we leave the cursor where it
-    is rather than drifting to a fixed coordinate (which reads as aimless).
+    This must land the cursor inside the current viewport, not merely inside the
+    first matching element's box. A content container (e.g. the first feed
+    ``article``) is frequently scrolled ABOVE the viewport after the first
+    scroll; aiming at its box then puts the cursor off-screen. Chromium still
+    scrolls the page from an off-screen cursor via the compositor, but it does
+    NOT dispatch a DOM ``wheel`` event — so every wheel-based detector (and the
+    Blue gauntlet's scroll-kinetics scorer) sees a session with zero scrolling
+    even though the page moved. Anchoring to a visible point keeps the cursor
+    over real content (more human, not less) and guarantees the wheel dispatches.
+
+    The visible target is computed in one JS pass (fast even on a 500-element
+    feed) by intersecting candidate containers with the viewport; a clamped
+    viewport-center point is the last resort so the wheel always has a real
+    on-screen origin.
     """
     try:
-        for sel in ("main", "article", "[role='main']", "section[aria-label*='feed' i]"):
-            try:
-                el = page.query_selector(sel)
-            except Exception:
-                el = None
-            if el is None:
-                continue
-            try:
-                b = el.bounding_box()
-            except Exception:
-                b = None
-            if b and b.get("width", 0) > 80 and b.get("height", 0) > 80:
-                x = b["x"] + b["width"] * rng.uniform(0.28, 0.62)
-                y = b["y"] + b["height"] * rng.uniform(0.32, 0.72)
-                _safe_mouse_move(page, x, y, plan, rng, recorder=recorder)
-                return
+        spot = _safe_evaluate(
+            page,
+            """() => {
+                const vw = window.innerWidth, vh = window.innerHeight;
+                const HEADER = 64;  // keep below a typical fixed app bar
+                const sels = ['article', 'main', "[role='main']",
+                              "section[aria-label*='feed' i]", '.g-feed-post'];
+                for (const s of sels) {
+                    const els = document.querySelectorAll(s);
+                    for (let i = 0; i < Math.min(els.length, 40); i++) {
+                        const r = els[i].getBoundingClientRect();
+                        const top = Math.max(r.top, HEADER), bot = Math.min(r.bottom, vh - 8);
+                        const left = Math.max(r.left, 8), right = Math.min(r.right, vw - 8);
+                        if (bot - top > 40 && right - left > 60) {
+                            return {left, top, w: right - left, h: bot - top};
+                        }
+                    }
+                }
+                return {left: vw * 0.30, top: HEADER, w: vw * 0.40, h: vh - HEADER - 8};
+            }""",
+        )
+    except Exception:
+        spot = None
+    if not isinstance(spot, dict):
+        return
+    try:
+        x = spot["left"] + spot["w"] * rng.uniform(0.28, 0.62)
+        y = spot["top"] + spot["h"] * rng.uniform(0.30, 0.70)
+        _safe_mouse_move(page, x, y, plan, rng, recorder=recorder)
     except Exception:
         pass
-    # No resolvable content target: do not drift to a fixed point.
 
 
 def _micro_mouse_adjust(page: Any, plan: dict[str, Any] | None, rng: random.Random, recorder: SessionRecorder | None = None) -> None:

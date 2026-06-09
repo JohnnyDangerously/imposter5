@@ -5,6 +5,11 @@
     "description": "Persistent LinkedIn feed simulation. Supports advanced feed reading, comment expansion, profile peeks, notifications checks, and avatar clicks."
   },
   {
+    "name": "Blue Team Gauntlet (full suite)",
+    "url": "http://127.0.0.1:5190/gauntlet",
+    "description": "LinkedIn-proportioned Blue Team field. Runs the full Red suite multi-minute: Markov-continuity feed scan, interest-driven search/profile reads, notifications, and surfaces the Blue evasion verdict + journey score."
+  },
+  {
     "name": "The Last Human Line Sandbox",
     "url": "http://127.0.0.1:5190/sandbox",
     "description": "Adversarial Blue Team Anti-Bot Evaluation Sandbox. Tests browser environment integrity (Layer 2) and biometric kinetics (Layer 3)."

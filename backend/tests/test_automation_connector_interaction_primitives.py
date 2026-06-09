@@ -80,9 +80,22 @@ class FakePage:
     # initial cursor position; provide it so the double matches Playwright.
     viewport_size = {"width": 1280, "height": 800}
 
+    default_timeout = 25_000
+
     def __init__(self) -> None:
         self.events: list[tuple[str, Any]] = []
         self.mouse = FakeMouse(self.events)
+
+    def set_default_timeout(self, timeout_ms: int) -> None:
+        self.default_timeout = timeout_ms
+
+    def evaluate(self, expression: str, *args: Any) -> Any:
+        # Pre-scroll mouse positioning now probes for a VISIBLE content rect via a
+        # single JS evaluate (intersecting containers with the viewport) instead of
+        # query_selector + bounding_box, so the cursor lands on-screen and the wheel
+        # actually dispatches a DOM event. Return a content-area rect for the fake.
+        self.events.append(("evaluate", expression))
+        return {"left": 200.0, "top": 120.0, "w": 700.0, "h": 600.0}
 
     def wait_for_timeout(self, timeout_ms: int) -> None:
         self.events.append(("wait", timeout_ms))
@@ -108,9 +121,10 @@ def test_wait_and_scroll_use_planned_values() -> None:
     assert scroll_page(page, plan, 0, 900) == 654
 
     # Positioning for realistic mouse+wheel (the quality improvement) now probes
-    # for the content area via a fast-fail query_selector (NOT locator.bounding_box,
-    # which auto-waits ~20s per missing selector) + mouse_move (via move_pointer)
-    # before the wheel. We assert the planned values are honored and that the
+    # for a VISIBLE content rect via a single fast JS evaluate (intersecting
+    # containers with the viewport), then moves the cursor there (via move_pointer)
+    # before the wheel — so the wheel has a real on-screen origin and dispatches a
+    # DOM wheel event. We assert the planned values are honored and that the
     # human-like mouse events for scroll happen.
     evs = page.events
     assert ("wait", 321) in evs
@@ -120,7 +134,7 @@ def test_wait_and_scroll_use_planned_values() -> None:
     assert len(wheels) >= 2, "scroll should emit a multi-step decaying wheel burst"
     assert all(d > 0 for d in wheels), "downward scroll => all-positive wheel deltas"
     assert abs(sum(wheels) - 654) <= 2, "decaying burst should sum to the planned delta"
-    assert any(e[0] == "query_selector" for e in evs), "scroll should fast-fail probe for content area to position mouse"
+    assert any(e[0] == "evaluate" for e in evs), "scroll should probe (via evaluate) for a visible content rect to position the mouse"
     assert any(e[0] == "mouse_move" for e in evs), "scroll should produce mouse moves for realistic scroll events"
 
 

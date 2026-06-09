@@ -179,12 +179,31 @@ def _visible_text_amount(page: Any) -> int:
     humans dwell longer on text-dense views. Silent reading proceeds at ~238 wpm
     (Brysbaert, 2019), i.e. a few hundred ms per word. Failures return 0 (honest
     "unknown"), which leaves the base dwell unscaled rather than fabricating content.
+
+    Counts only text of block elements intersecting the CURRENT VIEWPORT, not the
+    whole document. A human's reading pause tracks what is on screen; measuring the
+    entire body (e.g. a 500-post / infinite feed) pins the dwell at its ceiling and
+    makes every scan step pause for many seconds — both unnaturally slow and a tell.
     """
     try:
-        txt = page.inner_text("body")
+        n = page.evaluate(
+            """() => {
+                const vh = window.innerHeight, vw = window.innerWidth;
+                let total = 0, seen = 0;
+                const els = document.querySelectorAll('article, p, li, h1, h2, h3, .text');
+                for (let i = 0; i < els.length; i++) {
+                    const r = els[i].getBoundingClientRect();
+                    if (r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw && r.height > 0) {
+                        total += (els[i].innerText || '').length;
+                        if (++seen > 60) break;
+                    }
+                }
+                return total;
+            }"""
+        )
+        return int(n or 0)
     except Exception:
         return 0
-    return len(str(txt or ""))
 
 
 def _reading_scale(char_count: int) -> float:

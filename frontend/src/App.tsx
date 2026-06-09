@@ -207,6 +207,30 @@ interface LinkedInPost {
   [key: string]: unknown;
 }
 
+// The Blue Team gauntlet's own evasion verdict (captured from its scorer at the
+// end of a gauntlet run) + the Red journey summary that produced it.
+interface BlueReport {
+  evasion_score?: number;
+  verdict?: string;
+  journey_verdict?: string;
+  [key: string]: unknown;
+}
+
+interface GauntletSummary {
+  behavior_driver?: string;
+  duration_s?: number;
+  feed_scan_bursts?: number;
+  markov_steps?: number;
+  notifications_visited?: number;
+  profiles_opened?: number;
+  searches?: number;
+  likes?: number;
+  glances?: number;
+  interest_terms?: string[];
+  actions?: string[];
+  [key: string]: unknown;
+}
+
 interface Imposter5Result {
   success: boolean;
   status?: string;
@@ -214,6 +238,8 @@ interface Imposter5Result {
   video_start_offset_ms?: number | null;
   session_url?: string;
   linkedin_posts?: Array<LinkedInPost> | null;
+  blue_report?: BlueReport | null;
+  gauntlet_summary?: GauntletSummary | null;
   feasibility?: FeasibilityReport | null;
   run_outcome?: RunOutcome | null;
   plan: BehaviorPlan;
@@ -1152,6 +1178,87 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {/* Blue Team gauntlet verdict + journey summary */}
+            {result && (result.blue_report || result.gauntlet_summary || result.status === 'gauntlet_failed') && (() => {
+              const blue = result.blue_report ?? {};
+              const gs = result.gauntlet_summary ?? {};
+              const score = typeof blue.evasion_score === 'number' ? blue.evasion_score : null;
+              const verdict = (blue.verdict || '').toUpperCase();
+              const passed = verdict.includes('HUMAN') || (score !== null && score >= 70);
+              const scoreColor = score === null ? 'text-slate-400' : score >= 70 ? 'text-emerald-400' : score >= 45 ? 'text-amber-400' : 'text-rose-400';
+              const interestTerms = gs.interest_terms ?? [];
+              return (
+                <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5 backdrop-blur-md shadow-[0_4px_20px_rgba(0,0,0,0.3)]">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-sky-400 mb-3 flex items-center gap-1.5">
+                    <Shield className="h-4 w-4" /> Blue Team Gauntlet Verdict
+                  </h3>
+                  {result.status === 'gauntlet_failed' ? (
+                    <div className="rounded-lg border border-rose-500/40 bg-rose-950/20 p-3 text-xs font-mono text-rose-300">
+                      <span className="font-bold uppercase tracking-wider text-rose-400">Gauntlet run failed</span>
+                      <p className="mt-1 text-rose-200/80">{result.error || 'No error message returned.'}</p>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-4">
+                      <div className="flex items-center gap-4">
+                        <div className={`text-4xl font-black font-mono ${scoreColor}`}>
+                          {score === null ? '—' : `${score}%`}
+                        </div>
+                        <div className="flex flex-col gap-0.5">
+                          <span className={`text-sm font-bold uppercase tracking-wider ${passed ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {blue.verdict || 'NO VERDICT'}
+                          </span>
+                          <span className="text-[11px] font-mono text-slate-400">
+                            journey: <span className="text-slate-200">{blue.journey_verdict || '—'}</span>
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 font-mono text-[11px]">
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Driver</span>
+                          <span className="text-purple-400 font-bold truncate" title={gs.behavior_driver}>{gs.behavior_driver || '—'}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Duration</span>
+                          <span className="text-cyan-400 font-bold">{gs.duration_s ? `${gs.duration_s}s` : '—'}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Feed scans / steps</span>
+                          <span className="text-cyan-400 font-bold">{gs.feed_scan_bursts ?? 0} / {gs.markov_steps ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Profiles opened</span>
+                          <span className="text-cyan-400 font-bold">{gs.profiles_opened ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Notifications</span>
+                          <span className="text-cyan-400 font-bold">{gs.notifications_visited ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Searches</span>
+                          <span className="text-cyan-400 font-bold">{gs.searches ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Glances</span>
+                          <span className="text-cyan-400 font-bold">{gs.glances ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Likes</span>
+                          <span className="text-cyan-400 font-bold">{gs.likes ?? 0}</span>
+                        </div>
+                      </div>
+                      {interestTerms.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {interestTerms.map((t, i) => (
+                            <span key={i} className="rounded-full bg-sky-500/10 border border-sky-500/30 px-2 py-0.5 text-[10px] font-mono text-sky-300">{t}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* LinkedIn evidence + hybrid behavior */}
             {result && ((result.linkedin_posts?.length ?? 0) > 0 || result.status === 'scrape_failed') && (() => {
