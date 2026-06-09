@@ -26,6 +26,12 @@ class FakeMouse:
     def move(self, x: float, y: float) -> None:
         self.events.append(("mouse_move", {"x": round(x), "y": round(y)}))
 
+    def click(self, x: float, y: float) -> None:
+        # Real Playwright Mouse.click(x, y) presses at the cursor's current
+        # (realized) point; the humanized click uses this instead of
+        # locator.click() so Playwright never recenters to the element middle.
+        self.events.append(("mouse_click", {"x": round(x), "y": round(y)}))
+
 
 class FakeLocator:
     def __init__(self, events: list[tuple[str, Any]]) -> None:
@@ -149,9 +155,15 @@ def test_click_element_can_hover_first() -> None:
 
     result = click_element(page, "button", plan)
 
-    assert result == {"hovered": True, "move_style": "two_step"}
-    assert ("hover", None) in page.events
-    assert ("locator_click", None) in page.events
+    # Hover-before-click is now a human settle pause on the target plus a real
+    # cursor approach, then a click at the realized landing point — never a native
+    # locator.hover()/locator.click() center-snap.
+    assert result["hovered"] is True
+    assert result["move_style"] in {"ballistic", "ballistic_correct", "ballistic_overshoot_correct"}
+    assert any(e[0] == "mouse_move" for e in page.events)
+    assert any(e[0] == "mouse_click" for e in page.events)
+    assert ("hover", None) not in page.events
+    assert ("locator_click", None) not in page.events
 
 
 def test_hover_expand_and_mobile_primitives_record_metadata() -> None:
@@ -237,4 +249,8 @@ def test_click_and_hover_drive_pointer_moves() -> None:
     hover_element(page, "a.link", plan)
     moves = [e for e in page.events if e[0] == "mouse_move"]
     assert len(moves) >= 2
-    assert ("locator_click", None) in page.events
+    # The click lands at the cursor's realized point (mouse.click), and the hover
+    # relies on the approach move — neither re-snaps via a native locator call.
+    assert any(e[0] == "mouse_click" for e in page.events)
+    assert ("locator_click", None) not in page.events
+    assert ("hover", None) not in page.events

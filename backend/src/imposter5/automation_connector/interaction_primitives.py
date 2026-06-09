@@ -234,15 +234,7 @@ def scroll_page(
     recorder: SessionRecorder | None = None,
 ) -> int:
     """Scroll using a planned bounded delta, with mouse positioning over content first so the wheel is accompanied by realistic mouse events (for detectors and human twin traces). Returns the actual delta used."""
-    # Compute the planned delta BEFORE the naive_bot branch so naive_bot doesn't hit
-    # an UnboundLocalError referencing delta_y.
     delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
-
-    if plan and plan.get("persona", {}).get("name") == "naive_bot":
-        page.mouse.wheel(0, delta_y)
-        if recorder is not None:
-            recorder.record("scroll", metadata={"pass_index": pass_index, "delta_y": delta_y})
-        return delta_y
 
     rng = _session_rng(page, plan)
     update_status_ticker(page, "📜 SCROLLING", f"Delta: {delta_y}px (pass {pass_index})")
@@ -496,13 +488,6 @@ def type_text(
     label = selector if isinstance(selector, str) else "element_handle"
     locator = page.locator(selector) if isinstance(selector, str) else selector
 
-    if plan and plan.get("persona", {}).get("name") == "naive_bot":
-        locator.fill(text)
-        result = {"typed_chars": len(text), "typos": 0, "corrections": 0}
-        if recorder is not None:
-            recorder.record("type_text", metadata={"selector": label, **result})
-        return result
-
     update_status_ticker(page, "⌨️ TYPING", f"Input: {label} - '{text[:20]}...'")
     typing_plan = plan.get("typing") if isinstance(plan, dict) else {}
     typing_plan = typing_plan if isinstance(typing_plan, dict) else {}
@@ -586,22 +571,6 @@ def click_element(
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Click an element with optional pre-click hover."""
-    if plan and plan.get("persona", {}).get("name") == "naive_bot":
-        try:
-            if isinstance(selector, str):
-                page.locator(selector).click()
-            else:
-                selector.click()
-        except Exception:
-            pass
-        result = {
-            "hovered": False,
-            "move_style": "direct",
-        }
-        if recorder is not None:
-            recorder.record("click", metadata={"selector": str(selector), **result})
-        return result
-
     pointer = _pointer_plan(plan)
     rng = _session_rng(page, plan)
 
@@ -728,19 +697,34 @@ def click_element(
 
     hovered = False
     move_meta: dict[str, Any] | None = None
-    if rng.random() < float(pointer.get("hover_before_click_chance", 0.0)):
-        locator.hover()
-        hovered = True
+    click_xy: tuple[float, float] | None = None
+    try:
+        box = locator.bounding_box()
+        if box:
+            cx = box["x"] + box["width"] * rng.uniform(0.28, 0.72)
+            cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
+            move_meta = move_pointer(page, cx, cy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
+            # Press at the cursor's REALIZED landing point (move_pointer applies
+            # human endpoint imprecision). Letting Playwright's locator.click()
+            # run would silently recenter to the element middle, erasing that
+            # imprecision and producing a final teleport/snap right before click.
+            ex = float((move_meta or {}).get("x", cx))
+            ey = float((move_meta or {}).get("y", cy))
+            click_xy = (ex, ey)
+            # Sometimes settle on the target for a beat first (hover-before-click
+            # intent) — a human pause, not an instant native hover jump.
+            if rng.random() < float(pointer.get("hover_before_click_chance", 0.0)):
+                hovered = True
+                page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=320.0, cv=0.5, lo=140.0, hi=900.0)))
+    except Exception:
+        click_xy = None
+
+    if click_xy is not None:
+        page.mouse.click(click_xy[0], click_xy[1])
     else:
-        try:
-            box = locator.bounding_box()
-            if box:
-                cx = box["x"] + box["width"] * rng.uniform(0.28, 0.72)
-                cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
-                move_meta = move_pointer(page, cx, cy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
-        except Exception:
-            pass
-    locator.click()
+        # No bounding box (e.g. zero-size/odd element): fall back to the locator
+        # click so the action still lands.
+        locator.click()
     result = {
         "hovered": hovered,
         "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
@@ -760,21 +744,6 @@ def hover_element(
     recorder: SessionRecorder | None = None,
 ) -> dict[str, Any]:
     """Hover an element and dwell for a bounded interval."""
-    if plan and plan.get("persona", {}).get("name") == "naive_bot":
-        try:
-            if isinstance(selector, str):
-                page.locator(selector).hover()
-            else:
-                selector.hover()
-        except Exception:
-            pass
-        result = {
-            "hovered": True,
-        }
-        if recorder is not None:
-            recorder.record("hover", metadata={"selector": str(selector), **result})
-        return result
-
     hover = plan.get("hover") if isinstance(plan, dict) else {}
     hover = hover if isinstance(hover, dict) else {}
     dwell_ms = _bounded_int(hover.get("hover_dwell_ms"), lower=150, upper=1_500, default=450)
@@ -803,7 +772,9 @@ def hover_element(
             move_pointer(page, hx, hy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
     except Exception:
         pass
-    locator.hover()
+    # move_pointer's final page.mouse.move already dispatches the hover/mouseover
+    # over the element; a following locator.hover() would re-snap the cursor to the
+    # element center, undoing the human approach. Just dwell here.
     page.wait_for_timeout(dwell_ms)
     result = {"selector": str(selector), "hover_dwell_ms": dwell_ms}
     if recorder is not None:
@@ -833,7 +804,9 @@ def maybe_expand_comments(
         if rng.random() > chance:
             continue
         try:
-            page.locator(selector).click()
+            # Route through the humanized click so comment-expand lands via a
+            # real cursor approach, not an instant center-snap locator click.
+            click_element(page, selector, plan, recorder=recorder)
         except Exception:
             continue
         clicked += 1
@@ -1145,20 +1118,6 @@ def move_pointer(
 
     The cursor ends exactly on the (imprecision-jittered) target, recorded on the page.
     """
-    if plan and plan.get("persona", {}).get("name") == "naive_bot":
-        page.mouse.move(x, y)
-        _set_cursor(page, x, y)
-        res = {
-            "x": round(x),
-            "y": round(y),
-            "style": "direct",
-            "imprecision_px": 0,
-            "overshot": False,
-        }
-        if recorder is not None:
-            recorder.record("mouse_move", metadata=res)
-        return res
-
     pointer = _pointer_plan(plan)
     rng = _session_rng(page, plan)
     drift = _fatigue(page, plan)
@@ -1267,7 +1226,10 @@ def move_pointer(
                 break
             if rng.random() >= eff_corr_ch:
                 break
-            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=max(step_dt * 2.0, 18.0), cv=0.45, lo=8.0, hi=140.0)))
+            # Perceive-decide-act gap before a homing correction. Floor at a
+            # human reaction latency (~120ms); 8ms was physiologically impossible
+            # and a cheap tell for kinetics detectors.
+            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=max(step_dt * 2.0, 120.0), cv=0.45, lo=120.0, hi=260.0)))
             corr_steps = max(5, steps // 4)
             _emit(cur, target, corr_steps, mt_ms * 0.30)
             cur = target

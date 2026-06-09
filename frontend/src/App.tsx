@@ -28,6 +28,9 @@ import {
   Plus,
   Trash2,
   X,
+  BookOpen,
+  Timer,
+  Coffee,
 } from 'lucide-react';
 
 interface Persona {
@@ -50,6 +53,14 @@ interface EventMetadata {
   url?: string;
   text?: string;
   note?: string;
+  // Goal+Markov hybrid action metadata: interest_open carries the terms that
+  // matched and the post snippet; dwell carries how long and the dwell state;
+  // distraction carries the distract duration.
+  matched_terms?: string[];
+  snippet?: string;
+  dwell_ms?: number;
+  state?: string;
+  distract_ms?: number;
   [key: string]: unknown;
 }
 
@@ -163,9 +174,46 @@ interface RunOutcome {
   reason: string;
 }
 
+// One "found an interesting post and read it" record emitted by the hybrid
+// behavior driver. Fields are optional because the backend only fills what it
+// observed for a given open.
+interface OpenedInterestItem {
+  matched_terms?: string[];
+  score?: number;
+  snippet?: string;
+  actor_name?: string;
+  post_url?: string;
+}
+
+// Shared extraction metadata stamped onto every LinkedIn post dict by the
+// goal+Markov hybrid run. The same object is repeated across posts.
+interface LinkedInExtractionMeta {
+  behavior_driver?: string;
+  interest_terms?: string[];
+  opened_interest?: OpenedInterestItem[];
+  interest_opens?: number;
+  markov_failures?: number;
+  video_start_offset_ms?: number | null;
+  [key: string]: unknown;
+}
+
+// A single gathered LinkedIn post. extraction_meta is the same object on each.
+interface LinkedInPost {
+  actor_name?: string;
+  post_text?: string;
+  relative_time?: string;
+  post_url?: string;
+  extraction_meta?: LinkedInExtractionMeta;
+  [key: string]: unknown;
+}
+
 interface Imposter5Result {
   success: boolean;
   status?: string;
+  error?: string | null;
+  video_start_offset_ms?: number | null;
+  session_url?: string;
+  linkedin_posts?: Array<LinkedInPost> | null;
   feasibility?: FeasibilityReport | null;
   run_outcome?: RunOutcome | null;
   plan: BehaviorPlan;
@@ -655,7 +703,7 @@ export default function App() {
                           </option>
                         ))}
                       </select>
-                      {persona && !['focused_power_user', 'curious_reader', 'impatient_scanner', 'slow_reader', 'methodical_operator', 'mobile_checker', 'late_day_review', 'naive_bot'].includes(persona) && (
+                      {persona && !['focused_power_user', 'curious_reader', 'impatient_scanner', 'slow_reader', 'methodical_operator', 'mobile_checker', 'late_day_review'].includes(persona) && (
                         <button
                           type="button"
                           onClick={() => handleDeletePersona(persona)}
@@ -948,6 +996,7 @@ export default function App() {
                   movieUrl={result.movie_url}
                   movieFilename={result.movie_filename}
                   sessionRecording={result.session_recording}
+                  videoStartOffsetMs={result.video_start_offset_ms}
                 />
               ) : (
                 <div className="flex-1 flex flex-col items-center justify-center border border-slate-800/80 bg-slate-950 rounded-lg p-4 relative overflow-hidden">
@@ -1028,11 +1077,13 @@ export default function App() {
                           cx="32"
                           cy="32"
                           r="28"
-                          className={`fill-none transition-all duration-1000 ${
-                            result.bot_likeness_score !== null && result.bot_likeness_score < 0.55
+                        className={`fill-none transition-all duration-1000 ${
+                          result.bot_likeness_score === null
+                            ? 'stroke-slate-600'
+                            : result.bot_likeness_score < 0.55
                               ? 'stroke-emerald-500'
                               : 'stroke-rose-500'
-                          }`}
+                        }`}
                           strokeWidth="4"
                           strokeDasharray={175}
                           strokeDashoffset={175 - (175 * (result.bot_likeness_score ?? 0))}
@@ -1044,7 +1095,11 @@ export default function App() {
                     </div>
                     <div>
                       <div className="flex items-center gap-1.5">
-                        {result.bot_likeness_score !== null && result.bot_likeness_score < 0.55 ? (
+                        {result.bot_likeness_score === null ? (
+                          <div className="flex items-center gap-1 text-slate-400 text-sm font-black tracking-wide">
+                            <Shield className="h-4 w-4" /> NOT SCORED
+                          </div>
+                        ) : result.bot_likeness_score < 0.55 ? (
                           <div className="flex items-center gap-1 text-emerald-400 text-sm font-black tracking-wide">
                             <ShieldCheck className="h-4 w-4" /> EVADES DETECTOR
                           </div>
@@ -1055,9 +1110,11 @@ export default function App() {
                         )}
                       </div>
                       <p className="text-xs text-slate-400 mt-1">
-                        {result.bot_likeness_score !== null && result.bot_likeness_score < 0.55
-                          ? 'Low bot-likeness. Trajectories are curved, variable, and mimic human timing.'
-                          : 'High bot-likeness. Trajectories are too straight or timing is too regular.'}
+                        {result.bot_likeness_score === null
+                          ? 'FP-agent not run on this path, so no heuristic bot-likeness was computed for this session.'
+                          : result.bot_likeness_score < 0.55
+                            ? 'Low bot-likeness. Trajectories are curved, variable, and mimic human timing.'
+                            : 'High bot-likeness. Trajectories are too straight or timing is too regular.'}
                       </p>
                     </div>
                   </div>
@@ -1085,12 +1142,151 @@ export default function App() {
                   ) : (
                     <div className="flex flex-col items-center justify-center h-16 text-slate-500">
                       <Shield className="h-5 w-5 text-slate-700 mb-1" />
-                      <span className="text-xs font-mono">No model verdict returned</span>
+                      <span className="text-xs font-mono">
+                        {result.bot_likeness_score === null
+                          ? 'FP-agent not run on this path'
+                          : 'No model verdict returned'}
+                      </span>
                     </div>
                   )}
                 </div>
               </div>
             )}
+
+            {/* LinkedIn evidence + hybrid behavior */}
+            {result && ((result.linkedin_posts?.length ?? 0) > 0 || result.status === 'scrape_failed') && (() => {
+              const posts = result.linkedin_posts ?? [];
+              const meta = posts[0]?.extraction_meta ?? {};
+              const interestTerms = meta.interest_terms ?? [];
+              const openedInterest = meta.opened_interest ?? [];
+              const markovFailures = meta.markov_failures ?? 0;
+              const visiblePosts = posts.slice(0, 10);
+              const hiddenCount = posts.length - visiblePosts.length;
+              const truncate = (text: string | undefined, max: number) =>
+                !text ? '' : text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
+              return (
+                <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5 backdrop-blur-md shadow-[0_4px_20px_rgba(0,0,0,0.3)]">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-400 mb-3 flex items-center gap-1.5">
+                    <Globe className="h-4 w-4" /> LinkedIn Evidence (Goal + Markov hybrid)
+                  </h3>
+
+                  {result.status === 'scrape_failed' ? (
+                    <div className="rounded-lg border border-rose-500/40 bg-rose-950/20 p-3 text-xs font-mono text-rose-300">
+                      <span className="font-bold uppercase tracking-wider text-rose-400">Scrape failed</span>
+                      <p className="mt-1 text-rose-200/80">{result.error || 'No error message returned.'}</p>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-4">
+                      {/* Hybrid behavior summary */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 font-mono text-[11px]">
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Driver</span>
+                          <span className="text-purple-400 font-bold truncate" title={meta.behavior_driver}>
+                            {meta.behavior_driver || '—'}
+                          </span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Posts gathered</span>
+                          <span className="text-cyan-400 font-bold">{posts.length}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Interest opens</span>
+                          <span className="text-emerald-400 font-bold">{meta.interest_opens ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Markov failures</span>
+                          <span className={`font-bold ${markovFailures > 0 ? 'text-amber-400' : 'text-slate-300'}`}>
+                            {markovFailures}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Interest terms */}
+                      {interestTerms.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          <span className="text-slate-400 text-[10px] uppercase tracking-wider font-mono">Interest terms</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {interestTerms.map((term, idx) => (
+                              <span
+                                key={idx}
+                                className="px-2 py-0.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-[10px] font-mono"
+                              >
+                                {term}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Opened interest evidence */}
+                      {openedInterest.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          <span className="text-slate-400 text-[10px] uppercase tracking-wider font-mono flex items-center gap-1.5">
+                            <Eye className="h-3.5 w-3.5 text-emerald-400" /> Opened &amp; read
+                          </span>
+                          <div className="flex flex-col gap-2">
+                            {openedInterest.map((item, idx) => (
+                              <div key={idx} className="bg-slate-950 border border-emerald-500/20 rounded-lg p-3 flex flex-col gap-1.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-emerald-300 font-bold text-xs font-mono truncate">
+                                    {item.actor_name || 'Unknown author'}
+                                  </span>
+                                  {typeof item.score === 'number' && (
+                                    <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                                      score {item.score.toFixed(2)}
+                                    </span>
+                                  )}
+                                </div>
+                                {(item.matched_terms?.length ?? 0) > 0 && (
+                                  <div className="flex flex-wrap gap-1">
+                                    {item.matched_terms!.map((term, tIdx) => (
+                                      <span
+                                        key={tIdx}
+                                        className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[9px] font-mono"
+                                      >
+                                        {term}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                                {item.snippet && (
+                                  <p className="text-[11px] text-slate-400 italic leading-snug">
+                                    "{truncate(item.snippet, 160)}"
+                                  </p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Gathered posts list */}
+                      {posts.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          <span className="text-slate-400 text-[10px] uppercase tracking-wider font-mono">Gathered posts</span>
+                          <div className="max-h-56 overflow-y-auto bg-slate-950 border border-slate-800/80 rounded-lg p-3 flex flex-col gap-2">
+                            {visiblePosts.map((post, idx) => (
+                              <div key={idx} className="flex flex-col gap-0.5 text-[11px] border-b border-slate-900 pb-1.5 last:border-0 last:pb-0">
+                                <div className="flex items-center justify-between gap-2 font-mono">
+                                  <span className="text-purple-400 font-bold truncate">{post.actor_name || 'Unknown author'}</span>
+                                  <span className="text-slate-500 text-[10px] shrink-0">{post.relative_time || ''}</span>
+                                </div>
+                                {post.post_text && (
+                                  <p className="text-slate-400 leading-snug">{truncate(post.post_text, 140)}</p>
+                                )}
+                              </div>
+                            ))}
+                            {hiddenCount > 0 && (
+                              <span className="text-[10px] font-mono text-slate-500 italic">+{hiddenCount} more</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Interpreted Goal & Steps */}
             {result?.goal && (
@@ -1466,9 +1662,10 @@ interface LoomPlayerProps {
   movieUrl: string;
   movieFilename: string;
   sessionRecording?: SessionRecording | null;
+  videoStartOffsetMs?: number | null;
 }
 
-function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerProps) {
+function LoomPlayer({ movieUrl, movieFilename, sessionRecording, videoStartOffsetMs }: LoomPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const eventListRef = useRef<HTMLDivElement>(null);
@@ -1486,6 +1683,13 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
   // the [currentTime, events] effect below churn every tick. Memoize on the
   // recording reference so the effect only re-runs when time or events change.
   const events = useMemo(() => sessionRecording?.events ?? [], [sessionRecording]);
+
+  // Recorder timestamps (elapsed_ms) are relative to recorder start, but the
+  // captured video may begin earlier/later. video_start_offset_ms aligns the
+  // two clocks: videoTime = (elapsed_ms - offset) / 1000, clamped to 0. This
+  // mirrors backend/static/playback.html's eventVideoTime().
+  const offsetMs = videoStartOffsetMs ?? 0;
+  const eventVideoTime = (elapsedMs: number) => Math.max(0, (elapsedMs - offsetMs) / 1000);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1520,7 +1724,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
   useEffect(() => {
     if (events.length === 0) return;
     const activeIdx = events.reduce((acc, ev, idx) => {
-      const evTimeSec = ev.elapsed_ms / 1000;
+      const evTimeSec = eventVideoTime(ev.elapsed_ms);
       return evTimeSec <= currentTime ? idx : acc;
     }, -1);
 
@@ -1577,7 +1781,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
   const seekToEvent = (elapsedMs: number) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = elapsedMs / 1000;
+    video.currentTime = eventVideoTime(elapsedMs);
     if (!isPlaying) {
       video.play().catch(() => {});
     }
@@ -1592,6 +1796,9 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
 
   const getActionIcon = (action: string) => {
     const act = action.toLowerCase();
+    if (act.includes('interest_open')) return <BookOpen className="h-3.5 w-3.5 text-cyan-400" />;
+    if (act.includes('dwell')) return <Timer className="h-3.5 w-3.5 text-emerald-400" />;
+    if (act.includes('distraction')) return <Coffee className="h-3.5 w-3.5 text-amber-400" />;
     if (act.includes('click')) return <MousePointer className="h-3.5 w-3.5 text-rose-400" />;
     if (act.includes('scroll')) return <Compass className="h-3.5 w-3.5 text-purple-400" />;
     if (act.includes('hover')) return <Eye className="h-3.5 w-3.5 text-amber-400" />;
@@ -1602,6 +1809,9 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
 
   const getActionColorClass = (action: string) => {
     const act = action.toLowerCase();
+    if (act.includes('interest_open')) return 'bg-cyan-500 border-cyan-400 shadow-[0_0_8px_#06b6d4]';
+    if (act.includes('dwell')) return 'bg-emerald-500 border-emerald-400 shadow-[0_0_8px_#10b981]';
+    if (act.includes('distraction')) return 'bg-amber-500 border-amber-400 shadow-[0_0_8px_#f59e0b]';
     if (act.includes('click')) return 'bg-rose-500 border-rose-400 shadow-[0_0_8px_#f43f5e]';
     if (act.includes('scroll')) return 'bg-purple-500 border-purple-400 shadow-[0_0_8px_#a855f7]';
     if (act.includes('hover')) return 'bg-amber-500 border-amber-400 shadow-[0_0_8px_#f59e0b]';
@@ -1651,7 +1861,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                 >
                   <div className="flex justify-between items-center border-b border-slate-800 pb-1 mb-1">
                     <span className="text-cyan-400 font-bold">
-                      {formatTime(hoveredEvent.elapsed_ms / 1000)}
+                      {formatTime(eventVideoTime(hoveredEvent.elapsed_ms))}
                     </span>
                     <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400">
                       {hoveredEvent.action}
@@ -1659,10 +1869,24 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                   </div>
                   <p className="text-slate-300 font-bold truncate">{hoveredEvent.label}</p>
                   {hoveredEvent.metadata && (
-                    <div className="text-[10px] text-slate-500 mt-1 truncate">
-                      {hoveredEvent.metadata.selector && `Selector: ${hoveredEvent.metadata.selector}`}
-                      {hoveredEvent.metadata.wait_ms && `Wait: ${hoveredEvent.metadata.wait_ms}ms`}
-                      {hoveredEvent.metadata.delta_y && `Scroll: ${hoveredEvent.metadata.delta_y}px`}
+                    <div className="text-[10px] text-slate-500 mt-1">
+                      <div className="truncate">
+                        {hoveredEvent.metadata.selector && `Selector: ${hoveredEvent.metadata.selector}`}
+                        {hoveredEvent.metadata.wait_ms && `Wait: ${hoveredEvent.metadata.wait_ms}ms`}
+                        {hoveredEvent.metadata.delta_y && `Scroll: ${hoveredEvent.metadata.delta_y}px`}
+                      </div>
+                      {(hoveredEvent.metadata.matched_terms?.length ?? 0) > 0 && (
+                        <div className="text-cyan-400 truncate">terms: {hoveredEvent.metadata.matched_terms!.join(', ')}</div>
+                      )}
+                      {hoveredEvent.metadata.snippet && (
+                        <div className="text-slate-400 italic line-clamp-2">"{hoveredEvent.metadata.snippet}"</div>
+                      )}
+                      {typeof hoveredEvent.metadata.dwell_ms === 'number' && (
+                        <div className="text-emerald-400">dwell: {hoveredEvent.metadata.dwell_ms}ms{hoveredEvent.metadata.state ? ` (${hoveredEvent.metadata.state})` : ''}</div>
+                      )}
+                      {typeof hoveredEvent.metadata.distract_ms === 'number' && (
+                        <div className="text-amber-400">distract: {hoveredEvent.metadata.distract_ms}ms</div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1680,7 +1904,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
 
                 {duration > 0 &&
                   events.map((ev, idx) => {
-                    const posPct = ((ev.elapsed_ms / 1000) / duration) * 100;
+                    const posPct = (eventVideoTime(ev.elapsed_ms) / duration) * 100;
                     if (posPct > 100) return null;
                     const isActive = idx === activeEventIndex;
                     return (
@@ -1806,7 +2030,7 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                           {ev.action}
                         </span>
                         <span className="text-[10px] text-slate-500 font-bold">
-                          {formatTime(ev.elapsed_ms / 1000)}
+                          {formatTime(eventVideoTime(ev.elapsed_ms))}
                         </span>
                       </div>
                       <p className={`font-bold truncate ${isActive ? 'text-white' : 'text-slate-300'}`}>
@@ -1819,6 +2043,18 @@ function LoomPlayer({ movieUrl, movieFilename, sessionRecording }: LoomPlayerPro
                           )}
                           {ev.metadata.wait_ms && <span>wait: {ev.metadata.wait_ms}ms</span>}
                           {ev.metadata.delta_y && <span>scroll: {ev.metadata.delta_y}px</span>}
+                          {(ev.metadata.matched_terms?.length ?? 0) > 0 && (
+                            <span className="text-cyan-400 truncate max-w-[180px]">terms: {ev.metadata.matched_terms!.join(', ')}</span>
+                          )}
+                          {typeof ev.metadata.dwell_ms === 'number' && (
+                            <span className="text-emerald-400">dwell: {ev.metadata.dwell_ms}ms{ev.metadata.state ? ` (${ev.metadata.state})` : ''}</span>
+                          )}
+                          {typeof ev.metadata.distract_ms === 'number' && (
+                            <span className="text-amber-400">distract: {ev.metadata.distract_ms}ms</span>
+                          )}
+                          {ev.metadata.snippet && (
+                            <span className="basis-full truncate text-slate-400 italic">"{ev.metadata.snippet}"</span>
+                          )}
                         </div>
                       )}
                     </div>

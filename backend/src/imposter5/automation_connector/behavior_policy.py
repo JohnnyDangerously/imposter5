@@ -46,7 +46,6 @@ DEFAULT_PERSONAS = [
     {"name": "methodical_operator", "patience": "medium", "scroll_style": "section_scan", "dwell_multiplier": 1.05, "scroll_multiplier": 0.95, "interaction_style": "confirm_before_click"},
     {"name": "mobile_checker", "patience": "medium", "scroll_style": "short_swipes", "dwell_multiplier": 1.15, "scroll_multiplier": 0.70, "interaction_style": "touch_first"},
     {"name": "late_day_review", "patience": "high", "scroll_style": "pause_and_read", "dwell_multiplier": 1.35, "scroll_multiplier": 0.78, "interaction_style": "low_touch"},
-    {"name": "naive_bot", "patience": "low", "scroll_style": "instantaneous", "dwell_multiplier": 0.01, "scroll_multiplier": 2.0, "interaction_style": "robotic"}
 ]
 
 

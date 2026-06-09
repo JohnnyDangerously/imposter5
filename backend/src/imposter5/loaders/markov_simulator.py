@@ -283,14 +283,50 @@ def _pick_visible_locator(page: Any, rng: Any, selector: str, *, limit: int = 40
     return rng.choice(visible)
 
 
+def _content_move_target(page: Any, rng: Any, targets: tuple[str, ...] | None) -> tuple[int, int]:
+    """Pick a mouse-move destination over real content when ``targets`` is given.
+
+    Aiming ambient ``mousemove`` steps at an actual on-page element (e.g. a feed
+    post) keeps the random walk consistent with the goal layer's content-relative
+    moves instead of jumping to arbitrary viewport coordinates (a tell). Falls
+    back to a jittered viewport point when no visible target resolves.
+    """
+    if targets:
+        loc = _pick_visible_locator(page, rng, ", ".join(targets))
+        if loc is not None:
+            try:
+                box = loc.bounding_box()
+                if box and box.get("width") and box.get("height"):
+                    cx = int(box["x"] + box["width"] * rng.uniform(0.3, 0.7))
+                    cy = int(box["y"] + box["height"] * rng.uniform(0.25, 0.6))
+                    return cx, cy
+            except Exception:
+                pass
+    return rng.randint(200, 1000), rng.randint(150, 700)
+
+
 def run_markov_simulation(
     page: Any,
     behavior_plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
     max_steps: int = 25,
+    initial_state: str | None = None,
+    initial_intent: str | None = None,
+    intent_steps_left: int | None = None,
+    suppress_intro_wait: bool = False,
+    mousemove_targets: tuple[str, ...] | None = None,
+    hover_targets: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Execute a dynamic, semi-Markov-driven browsing session."""
+    """Execute a dynamic, semi-Markov-driven browsing session.
+
+    ``initial_state`` / ``initial_intent`` / ``intent_steps_left`` let a caller
+    CONTINUE a prior walk across multiple short bursts instead of restarting at
+    ``idle``/``reading`` each time (the return value carries the continuation
+    state). ``suppress_intro_wait`` skips the fixed ~1s settle so chained bursts
+    don't stamp a periodic preamble signature. ``mousemove_targets`` /
+    ``hover_targets`` aim the random walk's moves/hovers at real on-page content
+    (e.g. feed posts) instead of arbitrary viewport coordinates."""
     plan = behavior_plan or {}
     recorder = recorder or SessionRecorder(plan)
 
@@ -309,32 +345,40 @@ def run_markov_simulation(
     else:
         matrix = DEFAULT_HUMAN_MATRIX
 
-    update_status_ticker(page, "🎲 SEMI-MARKOV INITIALIZED", "Generating probabilistic pathing...")
-    wait_human(page, plan, 0, 1000, recorder=recorder)
+    if not suppress_intro_wait:
+        update_status_ticker(page, "🎲 SEMI-MARKOV INITIALIZED", "Generating probabilistic pathing...")
+        wait_human(page, plan, 0, 1000, recorder=recorder)
 
-    current_state = "idle"
+    # Continue a prior walk when a caller threads state across bursts, else start
+    # fresh at idle/reading.
+    current_state = initial_state if initial_state in matrix else "idle"
     steps_executed = 0
     history = [current_state]
 
     # Higher-level intent (goal) layer: a semi-Markov chain over intents, each with a
     # sampled sojourn in sub-steps. The active intent biases the low-level row.
-    intent = _choose_intent(rng, "reading")
+    if initial_intent and initial_intent in INTENT_TRANSITIONS:
+        intent = initial_intent
+    else:
+        intent = _choose_intent(rng, "reading")
     intent_history = [intent]
-    intent_steps_left = max(1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
-                                                cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12)))
+    remaining = intent_steps_left if (intent_steps_left and intent_steps_left > 0) else max(
+        1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
+                            cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12))
+    )
 
     while steps_executed < max_steps:
         steps_executed += 1
 
         # Higher-level transition: when the current intent's sojourn elapses, pick a
         # new intent (with stickiness) and resample its sub-step budget.
-        if intent_steps_left <= 0:
+        if remaining <= 0:
             intent = _choose_intent(rng, intent)
             intent_history.append(intent)
-            intent_steps_left = max(1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
-                                                        cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12)))
+            remaining = max(1, int(lognormal_ms(rng, mean_ms=INTENT_SOJOURN_STEPS[intent][0],
+                                                cv=INTENT_SOJOURN_STEPS[intent][1], lo=1, hi=12)))
             update_status_ticker(page, "🎯 INTENT", f"Switching focus -> {intent}")
-        intent_steps_left -= 1
+        remaining -= 1
 
         # 1. Choose next state from the intent-biased current transition row.
         probs = matrix.get(current_state, DEFAULT_HUMAN_MATRIX["idle"])
@@ -362,8 +406,7 @@ def run_markov_simulation(
                 update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")
 
             elif next_state == "mousemove":
-                cx = rng.randint(200, 1000)
-                cy = rng.randint(150, 700)
+                cx, cy = _content_move_target(page, rng, mousemove_targets)
                 update_status_ticker(page, "🖱️ MOVING", f"Moving mouse to ({cx}, {cy})...")
                 move_pointer(page, cx, cy, plan, recorder=recorder)
 
@@ -381,7 +424,8 @@ def run_markov_simulation(
 
             elif next_state == "hover":
                 update_status_ticker(page, "👁️ HOVERING", "Looking for hover target...")
-                target = _pick_visible_locator(page, rng, "a[href], button, input")
+                hover_sel = ", ".join(hover_targets) if hover_targets else "a[href], button, input"
+                target = _pick_visible_locator(page, rng, hover_sel)
                 if target is not None:
                     hover_element(page, target, plan, recorder=recorder)
                 else:
@@ -417,8 +461,7 @@ def run_markov_simulation(
                 else:
                     # No input present: a mouse move is the honest no-op for this
                     # state, not a fabricated typing success.
-                    cx = rng.randint(200, 1000)
-                    cy = rng.randint(150, 700)
+                    cx, cy = _content_move_target(page, rng, mousemove_targets)
                     move_pointer(page, cx, cy, plan, recorder=recorder)
 
         except Exception as e:
@@ -448,11 +491,13 @@ def run_markov_simulation(
             if recorder is not None:
                 recorder.record("distraction", metadata={"distract_ms": distract_ms})
 
-    update_status_ticker(page, "🏁 COMPLETED", "Semi-Markov simulation finished.")
+    if not suppress_intro_wait:
+        update_status_ticker(page, "🏁 COMPLETED", "Semi-Markov simulation finished.")
     return {
         "steps_executed": steps_executed,
         "state_history": history,
         "intent_history": intent_history,
         "final_state": current_state,
         "final_intent": intent,
+        "intent_steps_left": remaining,
     }

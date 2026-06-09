@@ -26,8 +26,8 @@ INTENT_RAW = {
 
 
 def _controlled_plan(seed: str):
-    # Force a non-naive persona so motion is the continuous analog path (never the
-    # naive_bot teleport), and pin the session seed for reproducibility.
+    # Pin a concrete human persona (continuous analog motion path) and the
+    # session seed for reproducibility.
     plan = build_behavior_plan(
         {"id": "story-test", "entity_type": "generic_web"},
         provider="generic", goal="story_task_intent", seed=seed,

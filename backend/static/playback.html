@@ -236,6 +236,16 @@ function describe(ev) {
   if (ev.action === "scroll") return m.delta_y != null ? `Δy ${m.delta_y}` : "scroll";
   if (ev.action === "wait") return m.wait_ms != null ? `${m.wait_ms}ms` : "wait";
   if (ev.action === "mouse_move") return (num(m.x) !== null) ? `→ ${Math.round(m.x)}, ${Math.round(m.y)}` : "";
+  if (ev.action === "interest_open") {
+    const terms = Array.isArray(m.matched_terms) && m.matched_terms.length ? m.matched_terms.join(", ") : "";
+    const snippet = m.snippet ? `"${m.snippet}"` : "";
+    return [terms, snippet].filter(Boolean).join(" — ") || "interest open";
+  }
+  if (ev.action === "dwell") {
+    const dwell = num(m.dwell_ms) !== null ? `${m.dwell_ms}ms` : "dwell";
+    return m.state ? `${dwell} (${m.state})` : dwell;
+  }
+  if (ev.action === "distraction") return num(m.distract_ms) !== null ? `${m.distract_ms}ms` : "distraction";
   return ev.label && ev.label !== ev.action ? ev.label : (m.selector || "");
 }
 
@@ -356,6 +366,11 @@ function updateTelemetry(t) {
     for (const k of ["selector", "delta_y", "wait_ms", "latency_ms", "url"]) {
       if (m[k] !== undefined && m[k] !== null && k !== "url") extra.push(`${k}=${m[k]}`);
     }
+    if (Array.isArray(m.matched_terms) && m.matched_terms.length) extra.push(`matched_terms=${m.matched_terms.join(", ")}`);
+    if (m.snippet) extra.push(`snippet="${m.snippet}"`);
+    if (num(m.dwell_ms) !== null) extra.push(`dwell_ms=${m.dwell_ms}`);
+    if (m.state) extra.push(`state=${m.state}`);
+    if (num(m.distract_ms) !== null) extra.push(`distract_ms=${m.distract_ms}`);
     document.getElementById("t-extra").textContent = extra.join("  ");
   }
 

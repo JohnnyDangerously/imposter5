@@ -54,13 +54,5 @@
     "dwell_multiplier": 1.35,
     "scroll_multiplier": 0.78,
     "interaction_style": "low_touch"
-  },
-  {
-    "name": "naive_bot",
-    "patience": "low",
-    "scroll_style": "instantaneous",
-    "dwell_multiplier": 0.01,
-    "scroll_multiplier": 2.0,
-    "interaction_style": "robotic"
   }
 ]

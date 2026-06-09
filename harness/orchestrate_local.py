@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5190)
     parser.add_argument("--engine", default="auto", choices=["auto", "cloak", "playwright"])
-    parser.add_argument("--personas", default="focused_power_user,naive_bot",
+    parser.add_argument("--personas", default="focused_power_user,curious_reader",
                         help="comma-separated persona names to run as separate matchups")
     args = parser.parse_args(argv)
 

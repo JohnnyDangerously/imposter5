@@ -32,9 +32,7 @@ from urllib.parse import urlparse, urlunparse
 
 from imposter5.automation_connector.behavior_policy import (
     behavior_summary,
-    planned_scroll_delta,
     planned_scroll_passes,
-    planned_wait_ms,
 )
 from imposter5.automation_connector.interaction_primitives import (
     maybe_expand_comments,
@@ -111,11 +109,6 @@ class LinkedInExtractionRules:
     )
     # Selectors for human-like variation actions (profile peeks, notifications, comment expands, hovers).
     # Keep centralized here so LinkedIn HTML drift repairs stay local.
-    actor_link_selector: str = (
-        ".update-components-actor__meta a, "
-        ".feed-shared-actor__container a, "
-        "a.update-components-actor__image"
-    )
     nav_notifications_selector: str = (
         "a[href*='/notifications/'], "
         "button[aria-label*='Notifications'], "
@@ -682,6 +675,10 @@ def _attach_extraction_meta(
     behavior_plan: dict[str, Any] | None = None,
     variation_actions: list[str] | None = None,
     session_recording: dict[str, Any] | None = None,
+    opened_interest: list[dict] | None = None,
+    interest_terms: list[str] | None = None,
+    markov_failures: int = 0,
+    video_start_offset_ms: int | None = None,
 ) -> list[dict]:
     behavior = behavior_summary(behavior_plan)
     meta = {
@@ -696,6 +693,12 @@ def _attach_extraction_meta(
         "browser_actions": page_loads + wheel_scrolls,
         "variation_actions": variation_actions or [],
         "sides_performed": len(variation_actions or []),
+        "behavior_driver": "markov_goal_hybrid",
+        "interest_terms": interest_terms or [],
+        "opened_interest": opened_interest or [],
+        "interest_opens": len(opened_interest or []),
+        "markov_failures": markov_failures,
+        "video_start_offset_ms": video_start_offset_ms,
     }
     if behavior:
         meta["behavior_policy"] = behavior
@@ -833,11 +836,20 @@ def _visible_targets(page: Any, selectors: tuple[str, ...], limit: int) -> list[
     return []
 
 
-def _move_to_target(page: Any, box: dict, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> None:
-    """Purposeful move to a real element's interior (slight natural offset)."""
+def _move_to_target(
+    page: Any, box: dict, plan: dict[str, Any] | None, recorder: SessionRecorder | None
+) -> tuple[float, float]:
+    """Purposeful move to a real element's interior (slight natural offset).
+
+    Returns the cursor's realized landing point so callers can click exactly
+    where the hand ended up instead of letting Playwright recenter to the
+    element middle (which would erase the human endpoint imprecision)."""
     cx = box["x"] + box["width"] * random.uniform(0.2, 0.5)
     cy = box["y"] + box["height"] * random.uniform(0.35, 0.6)
-    move_pointer(page, cx, cy, plan, recorder=recorder)
+    meta = move_pointer(page, cx, cy, plan, recorder=recorder)
+    ex = float((meta or {}).get("x", cx))
+    ey = float((meta or {}).get("y", cy))
+    return ex, ey
 
 
 def _bounded_nav(
@@ -863,9 +875,10 @@ def _bounded_nav(
             box = loc.bounding_box(timeout=1200)  # fast-fail; do not wait out 20s
             if not box:
                 continue
-            _move_to_target(page, box, plan, recorder)
+            ex, ey = _move_to_target(page, box, plan, recorder)
             wait_human(page, plan, 0, random.randint(160, 340), recorder=recorder)
-            loc.click(timeout=2500)
+            # Click where the cursor actually landed (no center re-snap).
+            page.mouse.click(ex, ey)
             return True
         except Exception:
             continue
@@ -1083,7 +1096,396 @@ def _peek_random_profile_variation(
         perceive_after_render(page, plan, recorder=recorder)
         return True
     except Exception:
+        # A peek can navigate to a profile and then fail mid-scroll; never strand
+        # the run off-feed (the next extract would read the wrong DOM).
+        if not _on_feed(page):
+            try:
+                _return_to_feed(page, plan, recorder)
+                perceive_after_render(page, plan, recorder=recorder)
+            except Exception:
+                logger.debug("[linkedin_feed_scraper] profile-peek recovery failed", exc_info=True)
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Goal + Markov hybrid: Markov drives the scan motion, the goal owns the clicks
+# --------------------------------------------------------------------------- #
+#
+# The feed run is a hybrid: a semi-Markov walk DRIVES the ambient scan (scroll /
+# hover / dwell down the feed) so the low-level motion differs every run and
+# looks like a person reading, while the GOAL layer (extract evidence, open a
+# genuinely interesting post) sits on top. Click/typing are intentionally absent
+# from the scan matrix below: on a live feed the only meaningful click is "open
+# that post I care about", and a human does that on purpose — not as a random
+# walk step. So the random walk never fires an arbitrary navigation; the goal
+# layer owns the single intentional click.
+FEED_SCAN_MATRIX: dict[str, dict[str, float]] = {
+    "idle":        {"idle": 0.15, "mousemove": 0.25, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.10},
+    "mousemove":   {"idle": 0.15, "mousemove": 0.15, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.20},
+    "scroll_down": {"idle": 0.25, "mousemove": 0.15, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.10},
+    "scroll_up":   {"idle": 0.20, "mousemove": 0.20, "scroll_down": 0.40, "scroll_up": 0.10, "hover": 0.10},
+    "hover":       {"idle": 0.25, "mousemove": 0.20, "scroll_down": 0.35, "scroll_up": 0.05, "hover": 0.15},
+}
+
+# Generic "worth stopping for" markers for a professional feed. When the run
+# carries explicit ICP/interest terms (from the plan or its variations) those
+# dominate; otherwise these catch role/opportunity-shaped posts. With no terms
+# at all we fall back to post SUBSTANCE (longer, meatier posts catch the eye) —
+# never a fabricated relevance signal.
+_DEFAULT_INTEREST_TERMS: tuple[str, ...] = (
+    "hiring", "we're hiring", "join our team", "open role", "new role",
+    "excited to announce", "looking for", "opportunity", "now hiring",
+)
+
+# Where the Markov scan is allowed to aim its hovers: feed posts and the people
+# inside them — never global nav chrome, Like/Comment controls, or sidebar ads.
+_FEED_HOVER_SELECTORS: tuple[str, ...] = (
+    "main a[href*='/feed/update/']",
+    "main a[href*='/in/']",
+)
+
+
+def _scroll_y(page: Any) -> int | None:
+    """Current vertical scroll offset, or None if it can't be read."""
+    try:
+        return int(page.evaluate("window.scrollY") or 0)
+    except Exception:
+        return None
+
+
+def _run_feed_ambient(
+    page: Any,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    *,
+    steps: int,
+    state: dict[str, Any] | None = None,
+    ensure_scroll: bool = True,
+) -> dict[str, Any]:
+    """Drive a short semi-Markov burst that scans the feed (Markov owns the
+    scroll/hover/dwell motion). Uses the click/typing-free ``FEED_SCAN_MATRIX``
+    so the goal layer stays the only thing that opens a post.
+
+    ``state`` threads the prior burst's walk forward (state/intent/sojourn) so
+    chained bursts read as one continuous scan instead of a repeating
+    "settle -> idle -> reading" preamble every few seconds. The returned dict is
+    fed back in as ``state`` next burst. When ``ensure_scroll`` is set and the
+    burst didn't actually advance the feed (a swallowed failure, or an
+    idle/hover-heavy walk), one deterministic human scroll is issued so evidence
+    gathering never silently stalls."""
+    cont = dict(state or {})
+    if steps <= 0:
+        return cont
+    from imposter5.loaders.markov_simulator import run_markov_simulation
+
+    burst_plan = dict(plan or {})
+    burst_plan["markov_matrix"] = FEED_SCAN_MATRIX
+    y_before = _scroll_y(page)
+    result: dict[str, Any] = {}
+    failed = False
+    try:
+        result = run_markov_simulation(
+            page,
+            burst_plan,
+            recorder=recorder,
+            max_steps=steps,
+            initial_state=cont.get("final_state"),
+            initial_intent=cont.get("final_intent"),
+            intent_steps_left=cont.get("intent_steps_left"),
+            suppress_intro_wait=bool(cont),
+            mousemove_targets=_RULES.post_container_selectors,
+            hover_targets=_FEED_HOVER_SELECTORS,
+        )
+    except Exception:
+        logger.debug("[linkedin_feed_scraper] feed ambient markov burst failed", exc_info=True)
+        failed = True
+
+    if ensure_scroll:
+        y_after = _scroll_y(page)
+        advanced = (
+            y_before is not None and y_after is not None and (y_after - y_before) >= 250
+        )
+        if failed or not advanced:
+            try:
+                scroll_page(
+                    page,
+                    plan,
+                    pass_index=0,
+                    fallback_delta_y=_jittered(720, 140),
+                    recorder=recorder,
+                )
+            except Exception:
+                logger.debug("[linkedin_feed_scraper] scroll fallback failed", exc_info=True)
+
+    result["markov_failed"] = failed
+    return result
+
+
+def _resolve_interest_terms(plan: dict[str, Any] | None) -> list[str]:
+    """Collect the run's ICP / interest terms from the plan (and its variations).
+
+    Falls back to a generic professional-interest vocabulary when nothing is
+    configured, so the human-interest behavior is alive on a default run rather
+    than depending solely on post length."""
+    terms: list[str] = []
+    if isinstance(plan, dict):
+        variations = plan.get("variations") if isinstance(plan.get("variations"), dict) else {}
+        target = plan.get("target") if isinstance(plan.get("target"), dict) else {}
+        sources = [
+            plan.get("interest_terms"), plan.get("icp_terms"),
+            variations.get("interest_terms"), variations.get("icp_terms"),
+            target.get("interest_terms"), target.get("icp_terms"),
+        ]
+        for src in sources:
+            if isinstance(src, str):
+                terms.extend(t.strip() for t in src.split(",") if t.strip())
+            elif isinstance(src, (list, tuple)):
+                terms.extend(str(t).strip() for t in src if str(t).strip())
+    if not terms:
+        terms = list(_DEFAULT_INTEREST_TERMS)
+    return [t.lower() for t in terms]
+
+
+def _score_post_interest(text: str, terms: list[str]) -> float:
+    """Score how much a human would want to stop on this post.
+
+    Explicit interest/ICP term hits dominate; post substance is a mild secondary
+    signal so that, absent terms, the meatiest visible post still wins."""
+    if not text:
+        return 0.0
+    low = text.lower()
+    score = 0.0
+    for term in terms:
+        if term and term in low:
+            score += 2.0
+    score += min(1.5, len(text) / 1000.0)
+    return score
+
+
+def _collect_visible_containers(page: Any) -> list[Any]:
+    """All post containers currently in/near the viewport, across every container
+    selector (mirrors extraction's multi-selector fallback so interest scoring
+    doesn't go blind when LinkedIn drops one class)."""
+    seen_ids: set[str] = set()
+    out: list[Any] = []
+    for selector in _RULES.post_container_selectors:
+        try:
+            found = page.query_selector_all(selector) or []
+        except Exception:
+            continue
+        for c in found[:20]:
+            try:
+                urn = c.get_attribute("data-urn") or c.get_attribute("data-id") or ""
+            except Exception:
+                urn = ""
+            key = urn or f"{id(c)}"
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            out.append(c)
+    return out
+
+
+def _container_identity(container: Any, text: str) -> str:
+    """Stable-ish identity for de-duping interest opens within a session."""
+    try:
+        link = container.query_selector(_RULES.permalink_selector)
+        href = link.get_attribute("href") if link else None
+        if href:
+            return href.split("?")[0]
+    except Exception:
+        pass
+    try:
+        urn = container.get_attribute("data-urn")
+        if urn:
+            return urn
+    except Exception:
+        pass
+    return _collapse_text(text)[:120]
+
+
+def _open_interesting_post(
+    page: Any,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    interest_terms: list[str],
+    actions_log: list[str],
+    *,
+    opened_identities: set[str] | None = None,
+) -> dict | None:
+    """The "oh, that one's interesting" behavior: scan the visible posts, and if
+    one genuinely clears the bar (matches the run's ICP/interest terms, or is the
+    most substantive in view), move to it, open it, read it (Markov-driven), then
+    return to the feed. Returns a small descriptor, or None if nothing in view
+    was worth stopping for."""
+    from imposter5.automation_connector.interaction_primitives import click_element, update_status_ticker
+
+    opened_identities = opened_identities if opened_identities is not None else set()
+    scored: list[tuple[float, Any, dict, str, str]] = []
+    for c in _collect_visible_containers(page):
+        try:
+            box = c.bounding_box()
+        except Exception:
+            box = None
+        # Only react to posts actually in / near the viewport (a person responds
+        # to what they can see, not off-screen DOM).
+        if not box or box["height"] < 80 or box["y"] < -200 or box["y"] > 1200:
+            continue
+        try:
+            txt = _collapse_text(_text(c))
+        except Exception:
+            txt = ""
+        if not txt:
+            continue
+        identity = _container_identity(c, txt)
+        if identity in opened_identities:
+            continue  # don't re-open the same post we already read this session
+        scored.append((_score_post_interest(txt, interest_terms), c, box, txt, identity))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best_score, container, box, text, identity = scored[0]
+    matched = [term for term in interest_terms if term and term in text.lower()]
+    # Bar: a real ICP/interest term match dominates; otherwise only stop on a
+    # clearly substantive post (never a fabricated relevance signal).
+    bar = 2.0 if matched else 1.1
+    if best_score < bar:
+        return None
+
+    update_status_ticker(page, "✨ INTERESTING POST", "Found a post worth reading; opening it...")
+    _move_to_target(page, box, plan, recorder)
+    wait_human(page, plan, 0, random.randint(220, 520), recorder=recorder)
+
+    # Open via the post's own permalink (timestamp link) when present, else the
+    # post text body — never the bare container, whose center can land on the
+    # Like/Comment/Send action bar instead of opening the post.
+    target = None
+    actor_name = ""
+    post_url = ""
+    try:
+        link = container.query_selector(_RULES.permalink_selector)
+        if link:
+            target = link
+            post_url = (link.get_attribute("href") or "").split("?")[0]
+    except Exception:
+        target = None
+    if target is None:
+        try:
+            target = container.query_selector(_RULES.post_text_selector)
+        except Exception:
+            target = None
+    if target is None:
+        target = container
+    try:
+        actor_el = container.query_selector(_RULES.actor_name_selector)
+        actor_name = _collapse_text(_text(actor_el)) if actor_el else ""
+    except Exception:
+        actor_name = ""
+
+    try:
+        url_before = page.url
+    except Exception:
+        url_before = None
+    try:
+        click_element(page, target, plan, recorder=recorder)
+    except Exception:
+        return None
+    opened_identities.add(identity)
+
+    # The post view just rendered — perceive it before reading.
+    perceive_after_render(page, plan, recorder=recorder)
+    # Read it: a short Markov burst drives the in-post scroll/dwell.
+    _run_feed_ambient(page, plan, recorder, steps=random.randint(3, 6))
+    # A curious reader sometimes opens the comments.
+    try:
+        if random.random() < 0.5:
+            sels = getattr(_RULES, "comment_expand_selectors", ("button[aria-label*='comment' i]",))
+            maybe_expand_comments(page, sels, plan, recorder=recorder)
+    except Exception:
+        pass
+
+    _ensure_back_on_feed(page, plan, recorder, url_before)
+
+    snippet = text[:160]
+    actions_log.append("interest_open")
+    descriptor = {
+        "matched_terms": matched,
+        "score": round(best_score, 2),
+        "snippet": snippet,
+        "actor_name": actor_name,
+        "post_url": post_url,
+    }
+    if recorder is not None:
+        try:
+            recorder.record("interest_open", metadata=descriptor)
+        except Exception:
+            pass
+    return descriptor
+
+
+def _on_feed(page: Any) -> bool:
+    """True when the current view is the main feed (URL or feed container)."""
+    try:
+        if "/feed" in (page.url or ""):
+            return True
+    except Exception:
+        pass
+    for selector in _RULES.feed_container_selectors:
+        try:
+            if page.query_selector(selector) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _ensure_back_on_feed(
+    page: Any,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    url_before: str | None,
+) -> None:
+    """Guarantee we end up back on the feed after reading a post, whether opening
+    it caused a full navigation OR a modal overlay. A single un-verified Escape
+    was the prior strand bug (the run could sit on a post/modal and then extract
+    the wrong DOM)."""
+    from imposter5.automation_connector.interaction_primitives import update_status_ticker
+
+    try:
+        navigated = url_before is not None and page.url != url_before
+    except Exception:
+        navigated = False
+
+    if navigated:
+        update_status_ticker(page, "🧭 BACKTRACKING", "Returning to Feed...")
+        try:
+            page.go_back(wait_until="domcontentloaded")
+        except Exception:
+            pass
+    else:
+        # Dismiss a post/detail modal; retry once before falling back.
+        for _ in range(2):
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                break
+            try:
+                page.wait_for_timeout(random.randint(180, 360))
+            except Exception:
+                pass
+            if _on_feed(page):
+                break
+
+    # Verified fallback: if we're still not on the feed, navigate home explicitly.
+    if not _on_feed(page):
+        try:
+            _return_to_feed(page, plan, recorder)
+        except Exception:
+            logger.debug("[linkedin_feed_scraper] _return_to_feed fallback failed", exc_info=True)
+    try:
+        perceive_after_render(page, plan, recorder=recorder)
+    except Exception:
+        pass
 
 
 def scrape_feed(
@@ -1094,6 +1496,7 @@ def scrape_feed(
     headless: bool = True,
     visible: bool = False,
     record_video_dir: str | None = None,
+    run_fp_agent: bool = False,
 ) -> list[dict]:
     """Open a CloakBrowser session and return up to 10 LinkedIn feed posts.
 
@@ -1125,6 +1528,9 @@ def scrape_feed(
         with LinkedInBrowserSession(
             user_id=user_id, headless=headless, record_video_dir=record_video_dir
         ) as page:
+            # Video capture begins when the persistent context opens (here);
+            # mark it now so we can align the event clock to the video clock.
+            video_capture_start_monotonic = time.monotonic()
             if visible:
                 try:
                     # Enable console logging for debugging
@@ -1177,19 +1583,42 @@ def scrape_feed(
             # (from behavior_policy + primitives) as the generic/agent paths, without adopting full prompt
             # interpretation or goal_runner (per the "everything but the prompt action stuff" boundary).
             recorder = SessionRecorder(behavior_plan)
+            video_offset_ms: int | None = None
+            try:
+                video_offset_ms = round(
+                    (video_capture_start_monotonic - recorder.started_monotonic) * 1000
+                )
+            except Exception:
+                video_offset_ms = None
+
+            # Arm the FP-agent (mus.js) behavioral recorder on this authenticated
+            # page so the canned LinkedIn gold run produces a real bot-likeness
+            # verdict, not a null one.
+            if run_fp_agent:
+                try:
+                    from imposter5.fp_agent.fp_agent_local_redteam_detector_test import ensure_mus_recording
+                    ensure_mus_recording(page)
+                except Exception:
+                    logger.debug("[linkedin_feed_scraper] could not start mus recording", exc_info=True)
+
             posts: list[dict] = []
             latest_report: dict[str, Any] = {"strategy": "none", "attempts": [], "agent_model_calls": 0}
-            scroll_passes = 0
-            wheel_scrolls = 0  # counts scroll_page invocations
-            wait_ms: list[int] = []
-            scroll_deltas: list[int] = []
             variation_actions: list[str] = []
+            opened_interest: list[dict] = []
             behavior_active = bool(behavior_summary(behavior_plan))
-            max_scroll_passes = planned_scroll_passes(behavior_plan, _MAX_SCROLL_PASSES)
+            max_bursts = planned_scroll_passes(behavior_plan, _MAX_SCROLL_PASSES)
             variations = (behavior_plan or {}).get("variations") or {}
             chances = (behavior_plan or {}).get("variation_chances") or {}
             max_sides = int(variations.get("max_side_actions", 2 if behavior_active else 0))
             sides_done = 0
+            interest_terms = _resolve_interest_terms(behavior_plan)
+            max_interest = int(variations.get("max_interest_opens", 2))
+            interest_chance = float(chances.get("interest_open", 0.55 if interest_terms else 0.35))
+            opened_count = 0
+            opened_identities: set[str] = set()
+            markov_steps_total = 0
+            markov_failures = 0
+            markov_state: dict[str, Any] = {}
 
             # The feed view just rendered: pay a floored human perceive-decide
             # latency before the first behavioral action (no instant reaction).
@@ -1198,88 +1627,125 @@ def scrape_feed(
             except Exception:
                 pass
 
-            # Initial settle with mouse move for realistic entry (mouse scroll / reading position).
+            # Initial settle + a rough move into the feed (entry reading position).
             try:
                 wait_human(page, behavior_plan, 0, 900, recorder=recorder)
-                # Rough move into feed area (will be refined by scroll_page etc).
                 move_pointer(page, _jittered(380, 30), _jittered(420, 40), behavior_plan, recorder=recorder)
             except Exception:
                 pass
 
-            for pass_index in range(max_scroll_passes):
-                scroll_passes = pass_index + 1
-                pause_fallback = _SCROLL_PAUSE_MS if behavior_active else _scroll_pause_ms()
-                pause_ms = planned_wait_ms(behavior_plan, pass_index, pause_fallback)
-                wait_ms.append(pause_ms)
-                page.wait_for_timeout(pause_ms)
+            for burst_index in range(max_bursts):
+                # GOAL: gather evidence from whatever is currently in view.
                 new_posts, latest_report = _extract_posts_with_report(page)
                 posts = _merge_unique_posts(posts, new_posts)
 
-                # Human reading behaviors on the current view: mouse moves + hovers over posts + expands.
-                _simulate_feed_reading_behaviors(page, behavior_plan, recorder, variations, chances, variation_actions)
+                # GOAL: human interest — if a genuinely compelling post is in view,
+                # stop and read it (the "oh, that one's interesting" behavior).
+                if opened_count < max_interest and _seeded_chance(
+                    interest_chance, behavior_plan, f"interest:{burst_index}"
+                ):
+                    opened = _open_interesting_post(
+                        page, behavior_plan, recorder, interest_terms, variation_actions,
+                        opened_identities=opened_identities,
+                    )
+                    if opened:
+                        opened_count += 1
+                        opened_interest.append(opened)
+                        new_posts, _r = _extract_posts_with_report(page)
+                        posts = _merge_unique_posts(posts, new_posts)
 
                 if len(posts) >= _MAX_POSTS:
                     break
-                if pass_index == max_scroll_passes - 1:
-                    break
 
-                # Optional side variations (profile peek, notifications) before next scroll.
+                # Micro-reading: plan-driven hover-over-posts + comment expands on the
+                # current view (honors bidirectional_scroll / hover_and_read /
+                # expand_comments variation flags so they aren't inert on this path).
+                if behavior_active and variations:
+                    try:
+                        variation_actions.extend(
+                            run_feed_reading_variations(
+                                page, behavior_plan, recorder,
+                                variations=variations, chances=chances,
+                            )
+                        )
+                    except Exception:
+                        logger.debug("[linkedin_feed_scraper] micro-reading variation failed", exc_info=True)
+
+                # Occasional bounded side trips (notifications / profile peek).
                 if sides_done < max_sides:
                     did_side = False
-                    if variations.get("notifications_check") and _seeded_chance(chances.get("notifications", 0.12), behavior_plan, f"notif:{pass_index}"):
+                    if variations.get("notifications_check") and _seeded_chance(chances.get("notifications", 0.12), behavior_plan, f"notif:{burst_index}"):
                         if _visit_notifications_variation(page, behavior_plan, recorder, variation_actions):
                             sides_done += 1
                             did_side = True
-                            # Re-extract after returning to feed (may have new visible posts from scroll state).
                             new_posts, _r = _extract_posts_with_report(page)
                             posts = _merge_unique_posts(posts, new_posts)
-                    if not did_side and variations.get("profile_peeks") and _seeded_chance(chances.get("profile_peek", 0.18), behavior_plan, f"peek:{pass_index}"):
+                    if not did_side and variations.get("profile_peeks") and _seeded_chance(chances.get("profile_peek", 0.18), behavior_plan, f"peek:{burst_index}"):
                         if _peek_random_profile_variation(page, behavior_plan, recorder, variation_actions):
                             sides_done += 1
                             new_posts, _r = _extract_posts_with_report(page)
                             posts = _merge_unique_posts(posts, new_posts)
 
-                delta_fallback = _SCROLL_DELTA_Y if behavior_active else _scroll_delta_y()
-                delta_y = planned_scroll_delta(behavior_plan, pass_index, delta_fallback)
-
-                # Bidirectional / eye-like: sometimes small up or mixed before/after the main delta.
-                if variations.get("bidirectional_scroll") and _seeded_chance(chances.get("bidir_scroll", 0.25), behavior_plan, f"bidir:{pass_index}"):
-                    up_delta = -abs(delta_y) // 3 or -120
-                    scroll_page(page, behavior_plan, pass_index, up_delta, recorder=recorder)
-                    wait_human(page, behavior_plan, pass_index, 180, recorder=recorder)
-                    wheel_scrolls += 1
-                    # small corrective down or hover
-                    scroll_page(page, behavior_plan, pass_index, abs(delta_y) // 4 or 90, recorder=recorder)
-                    wheel_scrolls += 1
-
-                scroll_deltas.append(delta_y)
-                # Use the enhanced scroll_page (positions mouse over content for "mouse scroll event",
-                # then wheel). This + the reading behaviors above give the varied mouse trajectories.
-                used = scroll_page(page, behavior_plan, pass_index, delta_y, recorder=recorder)
-                scroll_deltas[-1] = used  # in case plan adjusted
-                wheel_scrolls += 1
-                logger.info(
-                    "[linkedin_feed_scraper] scroll pass %d/%d collected %d posts (sides:%d)",
-                    pass_index + 1,
-                    max_scroll_passes,
-                    len(posts),
-                    sides_done,
+                # MARKOV drives the scan: a short semi-Markov burst scrolls / hovers
+                # / dwells down the feed. This IS the scrolling — goal-free motion
+                # that differs every run instead of a fixed scroll cadence. The walk
+                # state threads forward so the whole session is one continuous scan.
+                steps = random.randint(4, 7) if behavior_active else random.randint(3, 5)
+                markov_state = _run_feed_ambient(
+                    page, behavior_plan, recorder, steps=steps, state=markov_state
                 )
+                if markov_state.get("markov_failed"):
+                    markov_failures += 1
+                markov_steps_total += steps
+                logger.info(
+                    "[linkedin_feed_scraper] burst %d/%d collected %d posts (sides:%d, interest:%d)",
+                    burst_index + 1, max_bursts, len(posts), sides_done, opened_count,
+                )
+
+            # Final harvest: capture whatever the last scan burst scrolled into view
+            # (extraction runs at the TOP of each burst, so without this the posts
+            # revealed by the final scroll would be dropped).
+            final_posts, final_report = _extract_posts_with_report(page)
+            posts = _merge_unique_posts(posts, final_posts)
+            if final_report.get("attempts"):
+                latest_report = final_report
+
             posts = posts[:_MAX_POSTS]
             if not posts and raise_on_error:
                 raise RuntimeError("LinkedIn feed loaded but no parseable posts were found.")
-            return _attach_extraction_meta(
+
+            fp_frames = None
+            if run_fp_agent:
+                try:
+                    from imposter5.fp_agent.fp_agent_local_redteam_detector_test import stop_and_get_mus_frames
+                    fp_frames = stop_and_get_mus_frames(page)
+                except Exception:
+                    logger.debug("[linkedin_feed_scraper] could not stop mus recording", exc_info=True)
+
+            annotated = _attach_extraction_meta(
                 posts,
                 latest_report,
                 page_loads=1,
-                scroll_passes=scroll_passes,
-                wheel_scrolls=wheel_scrolls,
-                wait_ms=wait_ms,
-                scroll_deltas=scroll_deltas,
+                scroll_passes=max_bursts,
+                wheel_scrolls=markov_steps_total,
+                wait_ms=[],
+                scroll_deltas=[],
                 behavior_plan=behavior_plan,
                 variation_actions=variation_actions,
                 session_recording=recorder.payload() if recorder else None,
+                opened_interest=opened_interest,
+                interest_terms=interest_terms,
+                markov_failures=markov_failures,
+                video_start_offset_ms=video_offset_ms,
             )
+            # Carry the (potentially large) FP-agent frames on the FIRST post only
+            # so the caller can compute a verdict without duplicating the payload
+            # across every post's extraction_meta.
+            if annotated and fp_frames is not None:
+                first_meta = dict(annotated[0].get("extraction_meta") or {})
+                first_meta["fp_frames"] = fp_frames
+                annotated[0] = {**annotated[0], "extraction_meta": first_meta}
+            return annotated
     except Exception as exc:
         logger.error("[linkedin_feed_scraper] failed for user_hash %s: %s", user_hash, exc)
         if raise_on_error:

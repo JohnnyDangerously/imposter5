@@ -403,6 +403,9 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     posts = []
     feasibility_result = None
     linkedin_posts_result = None
+    # Distinguishes a genuinely failed canned LinkedIn scrape from a clean run so
+    # the response can report honestly instead of always claiming success.
+    linkedin_scrape_error = None
     # Offset (ms) between the event-log clock (SessionRecorder.elapsed_ms, which
     # starts when the recorder is constructed) and the video clock (which starts
     # when Playwright begins capturing the page). The player maps event time to
@@ -442,7 +445,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         })
 
     def run_simulation_thread():
-        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result, video_start_offset_ms
+        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result, video_start_offset_ms, linkedin_scrape_error
         import asyncio
         # Initialize up front so the error path can never NameError / leak a handle.
         browser = None
@@ -476,9 +479,28 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                         headless=False,
                         visible=True,
                         record_video_dir=video_dir,
+                        run_fp_agent=body.run_fp_agent,
                     )
                     logs.append(f"[{datetime.now().isoformat()}] LinkedIn feed scrape completed, found {len(posts)} posts")
+                    # Surface the scraped posts + hybrid run metadata to the product.
+                    linkedin_posts_result = posts or None
+                    first_meta = (posts[0].get("extraction_meta") if posts else {}) or {}
+                    if first_meta.get("video_start_offset_ms") is not None:
+                        video_start_offset_ms = first_meta.get("video_start_offset_ms")
+                    # FP-agent frames captured inside the scrape session → verdict.
+                    if body.run_fp_agent:
+                        frames = first_meta.get("fp_frames")
+                        if frames:
+                            all_captured_frames = frames
+                            logs.append(f"[{datetime.now().isoformat()}] Captured {len(frames)} mus.js frames on the scrape path")
+                    # Drop the heavy frames from the payload sent to the client.
+                    if posts and "fp_frames" in first_meta:
+                        trimmed = dict(first_meta)
+                        trimmed.pop("fp_frames", None)
+                        posts[0] = {**posts[0], "extraction_meta": trimmed}
+                        linkedin_posts_result = posts
                 except Exception as exc:
+                    linkedin_scrape_error = str(exc)
                     logs.append(f"[{datetime.now().isoformat()}] LinkedIn scrape raised: {exc}")
             elif "wikipedia.org" in body.url.lower() and not body.prompt:
                 logs.append(f"[{datetime.now().isoformat()}] Executing advanced Wikipedia simulation")
@@ -495,11 +517,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 ctx_kwargs["record_video_size"] = {"width": 1440, "height": 900}
                 
                 context = browser.new_context(**ctx_kwargs)
-                if plan.get("persona", {}).get("name") != "naive_bot":
-                    try:
-                        apply_anti_fingerprint_init_script(context)
-                    except Exception:
-                        pass
+                try:
+                    apply_anti_fingerprint_init_script(context)
+                except Exception:
+                    pass
                 context.set_default_timeout(25_000)
                 page = context.new_page()
                 # Video capture begins at page creation; mark it for clock alignment.
@@ -582,11 +603,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                     runner = get_browser_runner()
                     browser = runner.launch_browser(headless=False)
                     context = browser.new_context(**ctx_kwargs)
-                    if plan.get("persona", {}).get("name") != "naive_bot":
-                        try:
-                            apply_anti_fingerprint_init_script(context)
-                        except Exception:
-                            pass
+                    try:
+                        apply_anti_fingerprint_init_script(context)
+                    except Exception:
+                        pass
                     context.set_default_timeout(25_000)
                     page = context.new_page()
                     # Video capture begins at page creation; mark it for clock alignment.
@@ -837,13 +857,20 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     if session_filename:
         logs.append(f"[{datetime.now().isoformat()}] Wrote session sidecar {session_filename}")
 
+    # Honest outcome: a canned LinkedIn scrape that raised or returned no posts is
+    # a failure, not a silent success.
+    scrape_path = body.provider == "linkedin" and not body.prompt
+    scrape_failed = scrape_path and (linkedin_scrape_error is not None or not linkedin_posts_result)
+    run_success = not scrape_failed
+    run_status = "scrape_failed" if scrape_failed else "ran"
+
     # Pipeline seam 3 — first-run verdict + optional scheduling (workstream D).
     from imposter5.automation_connector.scheduler import finalize_run
     run_outcome = finalize_run(
         provider=body.provider,
         url=body.url,
         prompt=body.prompt,
-        result={"success": True, "goal": goal_payload, "session_recording": session_rec},
+        result={"success": run_success, "goal": goal_payload, "session_recording": session_rec},
         schedule=(
             {"interval_minutes": body.schedule_interval_minutes}
             if body.schedule_interval_minutes
@@ -852,8 +879,9 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     )
 
     return success_response({
-        "success": True,
-        "status": "ran",
+        "success": run_success,
+        "status": run_status,
+        "error": linkedin_scrape_error,
         "plan": plan,
         "goal": goal_payload,
         "auth": auth_decision.to_payload(),
