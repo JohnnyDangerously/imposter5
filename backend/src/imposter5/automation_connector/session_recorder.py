@@ -68,6 +68,17 @@ class SessionRecorder:
         self._started = time.monotonic()
         self._events: list[SessionEvent] = []
 
+    @property
+    def started_monotonic(self) -> float:
+        """``time.monotonic()`` value captured when this recorder was created.
+
+        ``elapsed_ms`` on every event is measured relative to this instant. The
+        playback player needs it to align event time against the video clock,
+        which starts at a different moment (page/context creation), so callers
+        can compute the offset between the two timelines.
+        """
+        return self._started
+
     def record(
         self,
         action: str,

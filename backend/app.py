@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import time
 import shutil
 import tempfile
 import logging
@@ -113,6 +114,54 @@ DEFAULT_WEBSITES = [
     {"name": "Yahoo News", "url": "https://news.yahoo.com", "description": "Dynamic news portal. Good for testing feed scans, comments, and fast-paced browsing."},
     {"name": "Hacker News", "url": "https://news.ycombinator.com", "description": "Text-heavy tech feed. Ideal for testing precise, low-touch link clicks and methodic scanner pacing."}
 ]
+
+
+CODEX_OUTPUTS_DIR = Path(backend_dir) / ".codex-outputs"
+
+
+def _write_session_sidecar(
+    *,
+    movie_filename: str,
+    session_rec: dict[str, Any] | None,
+    video_start_offset_ms: int | None,
+    run_metadata: dict[str, Any],
+) -> str:
+    """Persist a run's session recording next to its video as a sidecar JSON.
+
+    For a video ``imposter5-<ts>.webm`` this writes ``imposter5-<ts>.session.json``
+    into the same ``.codex-outputs/`` directory so the playback player can replay
+    past runs (the event log is otherwise only returned in the HTTP response).
+    Returns the sidecar filename, or "" if nothing was written.
+    """
+    if not movie_filename or not movie_filename.lower().endswith(".webm"):
+        return ""
+    events = []
+    event_count = 0
+    if isinstance(session_rec, dict):
+        events = session_rec.get("events") or []
+        event_count = int(session_rec.get("event_count") or len(events))
+
+    session_filename = movie_filename[: -len(".webm")] + ".session.json"
+    payload = {
+        "video_filename": movie_filename,
+        "events": events,
+        "event_count": event_count,
+        "run_metadata": run_metadata,
+        "created_at": datetime.now().isoformat(),
+        # See video_start_offset_ms note in imposter5_run. May be None when the
+        # offset could not be measured (e.g. the canned LinkedIn scraper path,
+        # whose recorder is created internally); the player then falls back to
+        # treating elapsed_ms as video time, which is approximate.
+        "video_start_offset_ms": video_start_offset_ms,
+    }
+    try:
+        CODEX_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CODEX_OUTPUTS_DIR / session_filename, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.error(f"[imposter5] could not write session sidecar: {e}")
+        return ""
+    return session_filename
 
 
 def load_websites() -> list[dict[str, Any]]:
@@ -354,6 +403,13 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     posts = []
     feasibility_result = None
     linkedin_posts_result = None
+    # Offset (ms) between the event-log clock (SessionRecorder.elapsed_ms, which
+    # starts when the recorder is constructed) and the video clock (which starts
+    # when Playwright begins capturing the page). The player maps event time to
+    # video time via: videoTime = (event.elapsed_ms - video_start_offset_ms)/1000.
+    # It is normally negative because the video begins capturing several seconds
+    # before the recorder is created (browser launch + initial nav + settle wait).
+    video_start_offset_ms = None
 
     # Compile the prompt into a goal up-front so the pre-run pipeline (auth gate,
     # feasibility review) can reason about the actual requested steps. When there
@@ -386,10 +442,14 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         })
 
     def run_simulation_thread():
-        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result
+        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result, linkedin_posts_result, video_start_offset_ms
         import asyncio
         # Initialize up front so the error path can never NameError / leak a handle.
         browser = None
+        # Monotonic timestamp captured at page creation, i.e. when Playwright
+        # starts writing the video. Compared against the recorder's start to
+        # derive video_start_offset_ms once the recorder exists.
+        video_capture_start_monotonic = None
         try:
             loop = asyncio.get_running_loop()
             logs.append(f"[{datetime.now().isoformat()}] Thread running loop detected: {loop}")
@@ -442,6 +502,8 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                         pass
                 context.set_default_timeout(25_000)
                 page = context.new_page()
+                # Video capture begins at page creation; mark it for clock alignment.
+                video_capture_start_monotonic = time.monotonic()
 
                 # Enable console logging for debugging
                 page.on("console", lambda msg: print(f"[BROWSER CONSOLE] {msg.text}", flush=True))
@@ -462,6 +524,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
 
                 recorder = SessionRecorder(plan)
                 session_recorder_instance = recorder
+                if video_capture_start_monotonic is not None:
+                    video_start_offset_ms = round(
+                        (video_capture_start_monotonic - recorder.started_monotonic) * 1000
+                    )
                 from imposter5.loaders.wikipedia_simulator import run_wikipedia_simulation
                 run_wikipedia_simulation(page, plan, recorder=recorder)
                 logs.append(f"[{datetime.now().isoformat()}] Wikipedia simulation completed.")
@@ -510,6 +576,8 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                             logs.append(f"[{datetime.now().isoformat()}] Warning: could not restore LinkedIn cookies: {e}")
                     pages = getattr(context, "pages", None) or []
                     page = pages[0] if pages else context.new_page()
+                    # Video capture begins at page creation; mark it for clock alignment.
+                    video_capture_start_monotonic = time.monotonic()
                 else:
                     runner = get_browser_runner()
                     browser = runner.launch_browser(headless=False)
@@ -521,6 +589,8 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                             pass
                     context.set_default_timeout(25_000)
                     page = context.new_page()
+                    # Video capture begins at page creation; mark it for clock alignment.
+                    video_capture_start_monotonic = time.monotonic()
 
                 # Enable console logging for debugging
                 page.on("console", lambda msg: print(f"[BROWSER CONSOLE] {msg.text}", flush=True))
@@ -560,6 +630,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
 
                 recorder = SessionRecorder(plan)
                 session_recorder_instance = recorder
+                if video_capture_start_monotonic is not None:
+                    video_start_offset_ms = round(
+                        (video_capture_start_monotonic - recorder.started_monotonic) * 1000
+                    )
                 if body.prompt:
                     # Reuse the goal compiled up-front for the pre-run pipeline so
                     # the feasibility review and the executor act on the same steps.
@@ -747,6 +821,22 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         except Exception:
             pass
 
+    # Persist the run's session recording to disk as a sidecar JSON next to the
+    # video so the /playback player can replay this run later, not just in-process.
+    session_filename = _write_session_sidecar(
+        movie_filename=movie_filename,
+        session_rec=session_rec,
+        video_start_offset_ms=video_start_offset_ms,
+        run_metadata={
+            "prompt": body.prompt,
+            "provider": body.provider,
+            "url": body.url,
+            "persona": plan.get("persona", {}).get("name"),
+        },
+    )
+    if session_filename:
+        logs.append(f"[{datetime.now().isoformat()}] Wrote session sidecar {session_filename}")
+
     # Pipeline seam 3 — first-run verdict + optional scheduling (workstream D).
     from imposter5.automation_connector.scheduler import finalize_run
     run_outcome = finalize_run(
@@ -772,6 +862,8 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         "linkedin_posts": linkedin_posts_result,
         "movie_filename": movie_filename,
         "movie_url": f"/static/.codex-outputs/{movie_filename}" if movie_filename else "",
+        "session_url": f"/static/.codex-outputs/{session_filename}" if session_filename else "",
+        "video_start_offset_ms": video_start_offset_ms,
         "stamped_codex_path": stamped_codex_path,
         "latest_codex_path": latest_codex_path,
         "bot_likeness_score": bot_likeness_score,
@@ -892,7 +984,97 @@ def _stop_scheduler_worker() -> None:
         _scheduler_handle = None
 
 
-# Serve static recorded movies
+# --------------------------------------------------------------------------- #
+# Loom-style session playback
+# --------------------------------------------------------------------------- #
+PLAYBACK_PLAYER_PATH = Path(backend_dir) / "static" / "playback.html"
+
+
+def _summarize_events(events: list[dict[str, Any]]) -> str:
+    """Build a short human summary of a run from its event log."""
+    if not events:
+        return "No recorded events"
+    actions = [str(e.get("action") or "") for e in events]
+    first_goto = next(
+        (e.get("metadata", {}).get("url") for e in events if e.get("action") == "goto"),
+        None,
+    )
+    distinct = []
+    for a in actions:
+        if a and a not in distinct:
+            distinct.append(a)
+    head = first_goto or (distinct[0] if distinct else "session")
+    return f"{head} — {len(events)} events ({', '.join(distinct[:4])})"
+
+
+def _safe_run_id(run_id: str) -> bool:
+    return bool(run_id) and all(c.isalnum() or c in "-_" for c in run_id)
+
+
+def _list_playback_runs() -> list[dict[str, Any]]:
+    """Scan .codex-outputs/ for *.session.json with a matching *.webm, newest first."""
+    runs: list[dict[str, Any]] = []
+    if not CODEX_OUTPUTS_DIR.is_dir():
+        return runs
+    for session_path in CODEX_OUTPUTS_DIR.glob("*.session.json"):
+        run_id = session_path.name[: -len(".session.json")]
+        try:
+            data = json.loads(session_path.read_text())
+        except Exception:
+            continue
+        video_filename = data.get("video_filename") or f"{run_id}.webm"
+        if not (CODEX_OUTPUTS_DIR / video_filename).is_file():
+            continue
+        events = data.get("events") or []
+        runs.append({
+            "id": run_id,
+            "video_url": f"/static/.codex-outputs/{video_filename}",
+            "session_url": f"/static/.codex-outputs/{session_path.name}",
+            "created_at": data.get("created_at"),
+            "event_count": int(data.get("event_count") or len(events)),
+            "run_metadata": data.get("run_metadata") or {},
+            "summary": _summarize_events(events),
+        })
+    runs.sort(
+        key=lambda r: (r.get("created_at") or "", r.get("id") or ""),
+        reverse=True,
+    )
+    return runs
+
+
+@app.get("/playback")
+async def playback_page():
+    """Serve the Loom-style session playback player."""
+    if PLAYBACK_PLAYER_PATH.is_file():
+        return FileResponse(PLAYBACK_PLAYER_PATH)
+    return HTMLResponse("Playback player asset missing", status_code=500)
+
+
+@app.get("/api/playback/runs")
+async def playback_runs():
+    """List available recorded runs (newest first)."""
+    return success_response({"runs": _list_playback_runs()})
+
+
+@app.get("/api/playback/runs/{run_id}")
+async def playback_run(run_id: str):
+    """Return a single run's persisted session JSON."""
+    if not _safe_run_id(run_id):
+        return error_response("invalid_run_id", "Run id contains illegal characters")
+    session_path = CODEX_OUTPUTS_DIR / f"{run_id}.session.json"
+    if not session_path.is_file():
+        return error_response("run_not_found", f"No session recording for '{run_id}'")
+    try:
+        data = json.loads(session_path.read_text())
+    except Exception as e:
+        return error_response("run_read_error", str(e))
+    video_filename = data.get("video_filename") or f"{run_id}.webm"
+    data["id"] = run_id
+    data["video_url"] = f"/static/.codex-outputs/{video_filename}"
+    return success_response(data)
+
+
+# Serve static recorded movies (and their *.session.json sidecars)
 @app.get("/static/.codex-outputs/{filename}")
 async def get_recorded_movie(filename: str):
     path = Path(backend_dir) / ".codex-outputs" / filename

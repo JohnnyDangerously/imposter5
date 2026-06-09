@@ -1355,28 +1355,14 @@ def inject_synthetic_cursor(page: Any) -> None:
                     #__human_cursor__ {
                         position: fixed !important;
                         left: 0; top: 0;
-                        width: 56px; height: 56px;
+                        width: 22px; height: 22px;
                         pointer-events: none !important;
                         z-index: 2147483647 !important;
-                        transform: translate(-50%, -50%);
-                        filter: drop-shadow(0 2px 4px rgba(0,0,0,0.6));
+                        /* Align the SVG arrow tip (4,2) to the real point. */
+                        transform: translate(-4px, -2px);
+                        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
                     }
-                    #__human_cursor__ .arrow {
-                        position: absolute;
-                        left: 8px; top: 8px;
-                        width: 0; height: 0;
-                        border-left: 18px solid transparent;
-                        border-right: 18px solid transparent;
-                        border-bottom: 28px solid #ff1a1a;
-                    }
-                    #__human_cursor__ .dot {
-                        position: absolute;
-                        left: 22px; top: 22px;
-                        width: 12px; height: 12px;
-                        background: #fff;
-                        border: 3px solid #ff1a1a;
-                        border-radius: 999px;
-                    }
+                    #__human_cursor__ svg { display: block; }
                     #__human_cursor__ .label {
                         position: absolute;
                         left: 52px; top: 4px;
@@ -1507,7 +1493,13 @@ def inject_synthetic_cursor(page: Any) -> None:
             }
             
             let canvas = document.getElementById('__human_cursor_canvas__');
-            if (!canvas) {
+            // Info overlays (velocity/accel trail, telemetry panel, status ticker)
+            // are intentionally NOT baked into the movie. Their data lives in the
+            // SessionRecorder event log for a post-hoc playback tool. Only the red
+            // mouse cursor is rendered (the one thing we verify for accuracy).
+            // Escape hatch: set window.__imposter5_info_overlays = true before
+            // injection to bring them back.
+            if (!canvas && window.__imposter5_info_overlays) {
                 canvas = document.createElement('canvas');
                 canvas.id = '__human_cursor_canvas__';
                 canvas.style.cssText = `
@@ -1591,14 +1583,14 @@ def inject_synthetic_cursor(page: Any) -> None:
                 cursor = document.createElement('div');
                 cursor.id = '__human_cursor__';
                 cursor.setAttribute('aria-hidden', 'true');
-                cursor.innerHTML = '<div class="arrow"></div><div class="dot"></div><div class="label">HUMAN MOUSE</div>';
+                cursor.innerHTML = '<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 2 L4 18 L8.5 14 L11.4 20.4 L13.8 19.3 L10.9 13 L16.6 13 Z" fill="#ff2d2d" stroke="#ffffff" stroke-width="1.3" stroke-linejoin="round"/></svg>';
                 document.documentElement.appendChild(cursor);
                 cursor.style.left = (state.lastX | 0) + 'px';
                 cursor.style.top = (state.lastY | 0) + 'px';
             }
             
             let tel = document.getElementById('__human_cursor_telemetry__');
-            if (!tel) {
+            if (!tel && window.__imposter5_info_overlays) {
                 tel = document.createElement('div');
                 tel.id = '__human_cursor_telemetry__';
                 tel.setAttribute('aria-hidden', 'true');
@@ -1613,7 +1605,7 @@ def inject_synthetic_cursor(page: Any) -> None:
             }
             
             let ticker = document.getElementById('__imposter5_ticker__');
-            if (!ticker) {
+            if (!ticker && window.__imposter5_info_overlays) {
                 ticker = document.createElement('div');
                 ticker.id = '__imposter5_ticker__';
                 ticker.setAttribute('aria-hidden', 'true');
@@ -1667,13 +1659,10 @@ def inject_synthetic_cursor(page: Any) -> None:
             
             state.stepCount++;
             
-            state.points.push({
-                x: x,
-                y: y,
-                timestamp: now,
-                vel: vel,
-                acc: acc
-            });
+            // Trail is not rendered into the movie anymore; keep only a tiny
+            // bounded buffer so long scheduled sessions never grow it unbounded.
+            state.points.push({ x: x, y: y, timestamp: now, vel: vel, acc: acc });
+            if (state.points.length > 200) { state.points.shift(); }
             
             const tPos = document.getElementById('__tel_pos__');
             const tVel = document.getElementById('__tel_vel__');
@@ -1718,38 +1707,15 @@ def _safe_evaluate(page: Any, expression: str, *args: Any) -> Any:
 
 
 def update_status_ticker(page: Any, action: str, details: str) -> None:
-    """Update the futuristic bottom status ticker with the current active behavior."""
-    try:
-        _safe_evaluate(
-            page,
-            "([action, details]) => { "
-            "  if (window.__human_cursor_state) { "
-            "    window.__human_cursor_state.currentAction = action; "
-            "    window.__human_cursor_state.currentDetails = details; "
-            "    const timeStr = new Date().toTimeString().split(' ')[0]; "
-            "    window.__human_cursor_state.timelineEvents.push({ time: timeStr, action: action, details: details }); "
-            "    while (window.__human_cursor_state.timelineEvents.length > 5) { "
-            "      window.__human_cursor_state.timelineEvents.shift(); "
-            "    } "
-            "  } "
-            "  const actEl = document.getElementById('__ticker_current_action__'); "
-            "  const detEl = document.getElementById('__ticker_details__'); "
-            "  const tlEl = document.getElementById('__ticker_timeline__'); "
-            "  if (actEl) actEl.textContent = action; "
-            "  if (detEl) detEl.textContent = details; "
-            "  if (tlEl) { "
-            "    const timeStr = new Date().toTimeString().split(' ')[0]; "
-            "    const item = document.createElement('div'); "
-            "    item.style.cssText = 'color: #cbd5e1 !important; font-size: 10px !important; display: flex !important; gap: 6px !important;'; "
-            "    item.innerHTML = `<span style=\"color: #64748b !important;\">[${timeStr}]</span> <span style=\"color: #f43f5e !important; font-weight: bold !important;\">${action}</span> <span>${details}</span>`; "
-            "    tlEl.appendChild(item); "
-            "    while (tlEl.children.length > 5) { tlEl.removeChild(tlEl.firstChild); } "
-            "  } "
-            "}",
-            [action, details]
-        )
-    except Exception:
-        pass
+    """No-op: the in-movie status ticker/timeline was removed (see
+    ``inject_synthetic_cursor``).
+
+    The action/details are already captured in the SessionRecorder event log,
+    which is the intended feed for a post-hoc Loom-style playback tool. Kept as a
+    stable no-op so the many call sites (scraper/goal-runner side-trips) need no
+    changes, and so it can be re-pointed at the player later.
+    """
+    return
 
 
 def enable_visible_mouse_tracking(page: Any) -> None:

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Imposter5 — Session Playback</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --panel-2: #1b212d;
+    --border: #262e3d;
+    --text: #e6eaf2;
+    --muted: #8b94a7;
+    --accent: #ff4d4f;
+    --accent-2: #4d8bff;
+    --ok: #36d399;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .app { display: grid; grid-template-columns: 280px 1fr 340px; height: 100vh; }
+  .col { overflow-y: auto; min-width: 0; }
+  .runs { border-right: 1px solid var(--border); background: var(--panel); }
+  .main { display: flex; flex-direction: column; padding: 18px 20px; gap: 14px; }
+  .chapters { border-left: 1px solid var(--border); background: var(--panel); }
+
+  h1 { font-size: 15px; margin: 0; letter-spacing: .2px; }
+  .brand { display: flex; align-items: center; gap: 8px; padding: 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); z-index: 2; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .section-label { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); padding: 12px 16px 6px; }
+
+  .run { padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .12s; }
+  .run:hover { background: var(--panel-2); }
+  .run.active { background: var(--panel-2); border-left: 3px solid var(--accent); padding-left: 13px; }
+  .run .rid { font-weight: 600; font-size: 13px; }
+  .run .rmeta { color: var(--muted); font-size: 12px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .stage { position: relative; width: 100%; background: #000; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+  video { display: block; width: 100%; height: auto; background: #000; }
+  canvas.overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+  .telemetry {
+    position: absolute; top: 12px; left: 12px; pointer-events: none;
+    background: rgba(8,10,15,.72); backdrop-filter: blur(6px);
+    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;
+    padding: 10px 12px; min-width: 210px; max-width: 360px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text); box-shadow: 0 6px 24px rgba(0,0,0,.45);
+  }
+  .telemetry .t-action { color: var(--accent); font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }
+  .telemetry .t-row { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); }
+  .telemetry .t-row b { color: var(--text); font-weight: 600; }
+  .telemetry .t-detail { color: var(--muted); margin-top: 4px; word-break: break-all; }
+
+  .meta-bar { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  .meta-bar b { color: var(--text); }
+  .offset-note { font-size: 11px; color: var(--muted); }
+
+  .chapter { padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer; display: grid; grid-template-columns: 54px 1fr; gap: 10px; align-items: baseline; transition: background .1s; }
+  .chapter:hover { background: var(--panel-2); }
+  .chapter.active { background: rgba(255,77,79,.12); }
+  .chapter.active .c-action { color: var(--accent); }
+  .chapter .c-time { color: var(--muted); font: 11px ui-monospace, monospace; }
+  .chapter .c-action { font-weight: 600; font-size: 12px; text-transform: capitalize; }
+  .chapter .c-label { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; background: var(--ok); vertical-align: middle; }
+  .status-dot.err { background: var(--accent); }
+
+  .empty { padding: 40px 20px; color: var(--muted); text-align: center; }
+  .hint { color: var(--muted); font-size: 12px; }
+  ::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: #2a3142; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="col runs">
+    <div class="brand"><span class="dot"></span><h1>Imposter5 Playback</h1></div>
+    <div class="section-label">Runs</div>
+    <div id="run-list"><div class="empty">Loading runs…</div></div>
+  </div>
+
+  <div class="col main">
+    <div class="stage" id="stage">
+      <video id="video" controls preload="metadata" playsinline></video>
+      <canvas class="overlay" id="overlay"></canvas>
+      <div class="telemetry" id="telemetry" style="display:none">
+        <div class="t-action" id="t-action">—</div>
+        <div class="t-detail" id="t-label"></div>
+        <div class="t-row"><span>mouse</span><b id="t-mouse">—</b></div>
+        <div class="t-row"><span>velocity</span><b id="t-vel">—</b></div>
+        <div class="t-row"><span>t</span><b id="t-time">—</b></div>
+        <div class="t-detail" id="t-extra"></div>
+      </div>
+    </div>
+    <div class="meta-bar" id="meta-bar"></div>
+    <div class="offset-note" id="offset-note"></div>
+    <div class="hint">Click a chapter on the right to jump the video to that moment. The overlay is reconstructed live from the event log.</div>
+  </div>
+
+  <div class="col chapters">
+    <div class="section-label" style="position:sticky;top:0;background:var(--panel);z-index:2;">Actions / Chapters</div>
+    <div id="chapter-list"><div class="empty">Select a run</div></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const ctx = overlay.getContext("2d");
+const telemetry = document.getElementById("telemetry");
+
+let runs = [];
+let currentRunId = null;
+let events = [];          // raw events, each annotated with .videoTime (seconds)
+let mouseMoves = [];      // subset with x/y, sorted by videoTime
+let offsetMs = 0;         // video_start_offset_ms (may be null -> 0)
+let chapterEls = [];
+
+const TRAIL_WINDOW_S = 1.4; // how far back the fading mouse trail reaches
+
+// ---- helpers ---------------------------------------------------------------
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${String(sec).padStart(2, "0")}`;
+}
+function num(v) { return (typeof v === "number" && isFinite(v)) ? v : null; }
+
+function eventVideoTime(ev) {
+  // videoTime = (elapsed_ms - video_start_offset_ms) / 1000
+  return (Number(ev.elapsed_ms || 0) - offsetMs) / 1000;
+}
+
+// ---- run list --------------------------------------------------------------
+async function loadRuns() {
+  const list = document.getElementById("run-list");
+  try {
+    const res = await fetch("/api/playback/runs");
+    const data = await res.json();
+    runs = (data && data.runs) || [];
+  } catch (e) {
+    list.innerHTML = `<div class="empty">Failed to load runs<br><small>${e}</small></div>`;
+    return;
+  }
+  if (!runs.length) {
+    list.innerHTML = `<div class="empty">No recorded runs yet.<br><small>Run a simulation to create one.</small></div>`;
+    return;
+  }
+  list.innerHTML = "";
+  runs.forEach((r) => {
+    const el = document.createElement("div");
+    el.className = "run";
+    el.dataset.id = r.id;
+    const when = r.created_at ? new Date(r.created_at).toLocaleString() : r.id;
+    const meta = (r.run_metadata && (r.run_metadata.prompt || r.run_metadata.url)) || r.summary || "";
+    el.innerHTML = `<div class="rid">${r.id}</div>
+      <div class="rmeta">${when}</div>
+      <div class="rmeta">${r.event_count} events · ${escapeHtml(String(meta))}</div>`;
+    el.addEventListener("click", () => selectRun(r.id));
+    list.appendChild(el);
+  });
+
+  // auto-select from ?run= or newest
+  const params = new URLSearchParams(location.search);
+  const wanted = params.get("run");
+  selectRun(wanted && runs.some(r => r.id === wanted) ? wanted : runs[0].id);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---- run selection ---------------------------------------------------------
+async function selectRun(id) {
+  currentRunId = id;
+  document.querySelectorAll(".run").forEach(el =>
+    el.classList.toggle("active", el.dataset.id === id));
+
+  let data;
+  try {
+    const res = await fetch(`/api/playback/runs/${encodeURIComponent(id)}`);
+    data = await res.json();
+  } catch (e) {
+    document.getElementById("chapter-list").innerHTML = `<div class="empty">Failed to load run: ${e}</div>`;
+    return;
+  }
+  if (!data || data.ok === false) {
+    document.getElementById("chapter-list").innerHTML = `<div class="empty">${(data && data.message) || "Run not found"}</div>`;
+    return;
+  }
+
+  offsetMs = num(data.video_start_offset_ms) === null ? 0 : Number(data.video_start_offset_ms);
+  events = (data.events || []).map(ev => ({ ...ev, videoTime: eventVideoTime(ev) }));
+  mouseMoves = events
+    .filter(ev => ev.action === "mouse_move" && ev.metadata &&
+                  num(ev.metadata.x) !== null && num(ev.metadata.y) !== null)
+    .sort((a, b) => a.videoTime - b.videoTime);
+
+  video.src = data.video_url;
+  video.load();
+
+  renderMeta(data);
+  renderChapters();
+  telemetry.style.display = events.length ? "block" : "none";
+}
+
+function renderMeta(data) {
+  const m = data.run_metadata || {};
+  const bits = [];
+  if (m.provider) bits.push(`<span>provider <b>${escapeHtml(m.provider)}</b></span>`);
+  if (m.url) bits.push(`<span>url <b>${escapeHtml(m.url)}</b></span>`);
+  if (m.prompt) bits.push(`<span>prompt <b>${escapeHtml(m.prompt)}</b></span>`);
+  if (m.persona) bits.push(`<span>persona <b>${escapeHtml(m.persona)}</b></span>`);
+  bits.push(`<span>events <b>${data.event_count || events.length}</b></span>`);
+  document.getElementById("meta-bar").innerHTML = bits.join("");
+
+  const note = document.getElementById("offset-note");
+  if (num(data.video_start_offset_ms) === null) {
+    note.textContent = "⚠ No clock offset recorded for this run — event times are aligned approximately (offset assumed 0).";
+  } else {
+    note.textContent = `Clock aligned: the recorder timeline starts ${(-offsetMs / 1000).toFixed(2)}s into the video (video_start_offset_ms = ${offsetMs}).`;
+  }
+}
+
+// ---- chapters --------------------------------------------------------------
+function describe(ev) {
+  const m = ev.metadata || {};
+  if (ev.action === "goto") return m.url || "navigate";
+  if (ev.action === "scroll") return m.delta_y != null ? `Δy ${m.delta_y}` : "scroll";
+  if (ev.action === "wait") return m.wait_ms != null ? `${m.wait_ms}ms` : "wait";
+  if (ev.action === "mouse_move") return (num(m.x) !== null) ? `→ ${Math.round(m.x)}, ${Math.round(m.y)}` : "";
+  return ev.label && ev.label !== ev.action ? ev.label : (m.selector || "");
+}
+
+function renderChapters() {
+  const list = document.getElementById("chapter-list");
+  if (!events.length) { list.innerHTML = `<div class="empty">No events recorded for this run.</div>`; chapterEls = []; return; }
+  list.innerHTML = "";
+  chapterEls = events.map((ev) => {
+    const el = document.createElement("div");
+    el.className = "chapter";
+    const t = Math.max(0, ev.videoTime);
+    const status = ev.status && ev.status !== "ok" ? `<span class="status-dot err"></span>` : `<span class="status-dot"></span>`;
+    el.innerHTML = `<div class="c-time">${fmtTime(t)}</div>
+      <div><div class="c-action">${status}${escapeHtml(ev.action || "event")}</div>
+      <div class="c-label">${escapeHtml(String(describe(ev)))}</div></div>`;
+    el.addEventListener("click", () => {
+      video.currentTime = Math.max(0, ev.videoTime + 0.001);
+      if (video.paused) video.play().catch(() => {});
+    });
+    list.appendChild(el);
+    return el;
+  });
+}
+
+// ---- overlay sizing --------------------------------------------------------
+function syncOverlaySize() {
+  const w = video.videoWidth || 1440;
+  const h = video.videoHeight || 900;
+  if (overlay.width !== w) overlay.width = w;
+  if (overlay.height !== h) overlay.height = h;
+  overlay.style.width = video.clientWidth + "px";
+  overlay.style.height = video.clientHeight + "px";
+}
+video.addEventListener("loadedmetadata", syncOverlaySize);
+window.addEventListener("resize", syncOverlaySize);
+new ResizeObserver(syncOverlaySize).observe(video);
+
+// ---- live reconstruction ---------------------------------------------------
+function activeEventIndex(t) {
+  // last event whose videoTime <= t
+  let lo = 0, hi = events.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (events[mid].videoTime <= t) { ans = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return ans;
+}
+
+function recentMouse(t) {
+  // mouse_move events within the trail window, oldest -> newest
+  const out = [];
+  for (const ev of mouseMoves) {
+    if (ev.videoTime > t) break;
+    if (ev.videoTime >= t - TRAIL_WINDOW_S) out.push(ev);
+  }
+  return out;
+}
+
+function computeVelocity(pts) {
+  if (pts.length < 2) return 0;
+  const a = pts[pts.length - 2], b = pts[pts.length - 1];
+  const dt = b.videoTime - a.videoTime;
+  if (dt <= 0) return 0;
+  const dx = b.metadata.x - a.metadata.x;
+  const dy = b.metadata.y - a.metadata.y;
+  return Math.hypot(dx, dy) / dt; // px/s
+}
+
+function drawTrail(pts, t) {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (pts.length < 2) return;
+  // fading polyline: older segments more transparent
+  for (let i = 1; i < pts.length; i++) {
+    const p0 = pts[i - 1], p1 = pts[i];
+    const age = (t - p1.videoTime) / TRAIL_WINDOW_S; // 0 newest -> 1 oldest
+    const alpha = Math.max(0, 1 - age);
+    ctx.strokeStyle = `rgba(255,77,79,${(alpha * 0.85).toFixed(3)})`;
+    ctx.lineWidth = 2 + 6 * alpha;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(p0.metadata.x, p0.metadata.y);
+    ctx.lineTo(p1.metadata.x, p1.metadata.y);
+    ctx.stroke();
+  }
+  // leading glow ring around the most recent point (cursor itself is baked in)
+  const head = pts[pts.length - 1];
+  ctx.strokeStyle = "rgba(255,77,79,0.9)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(head.metadata.x, head.metadata.y, 16, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+function updateTelemetry(t) {
+  const idx = activeEventIndex(t);
+  const trail = recentMouse(t);
+  drawTrail(trail, t);
+
+  if (idx < 0) {
+    document.getElementById("t-action").textContent = "—";
+    document.getElementById("t-label").textContent = "";
+    document.getElementById("t-mouse").textContent = "—";
+    document.getElementById("t-vel").textContent = "—";
+    document.getElementById("t-time").textContent = fmtTime(t);
+    document.getElementById("t-extra").textContent = "";
+  } else {
+    const ev = events[idx];
+    const m = ev.metadata || {};
+    document.getElementById("t-action").textContent = ev.action || "event";
+    document.getElementById("t-label").textContent = (ev.label && ev.label !== ev.action) ? ev.label : "";
+    const last = trail.length ? trail[trail.length - 1].metadata : (num(m.x) !== null ? m : null);
+    document.getElementById("t-mouse").textContent = last ? `${Math.round(last.x)}, ${Math.round(last.y)}` : "—";
+    const vel = computeVelocity(trail);
+    document.getElementById("t-vel").textContent = vel ? `${Math.round(vel)} px/s` : "—";
+    document.getElementById("t-time").textContent = fmtTime(t);
+    const extra = [];
+    for (const k of ["selector", "delta_y", "wait_ms", "latency_ms", "url"]) {
+      if (m[k] !== undefined && m[k] !== null && k !== "url") extra.push(`${k}=${m[k]}`);
+    }
+    document.getElementById("t-extra").textContent = extra.join("  ");
+  }
+
+  // highlight active chapter
+  chapterEls.forEach((el, i) => el.classList.toggle("active", i === idx));
+  const activeEl = chapterEls[idx];
+  if (activeEl) {
+    const rect = activeEl.getBoundingClientRect();
+    const parent = activeEl.parentElement.getBoundingClientRect();
+    if (rect.top < parent.top || rect.bottom > parent.bottom) {
+      activeEl.scrollIntoView({ block: "nearest" });
+    }
+  }
+}
+
+video.addEventListener("timeupdate", () => updateTelemetry(video.currentTime));
+video.addEventListener("seeked", () => updateTelemetry(video.currentTime));
+
+// rAF keeps the overlay smooth during normal playback (timeupdate fires ~4Hz)
+function rafLoop() {
+  if (!video.paused && !video.seeking) updateTelemetry(video.currentTime);
+  requestAnimationFrame(rafLoop);
+}
+requestAnimationFrame(rafLoop);
+
+loadRuns();
+</script>
+</body>
+</html>
