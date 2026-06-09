@@ -352,9 +352,40 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     goal_payload = None
     session_recorder_instance = None
     posts = []
+    feasibility_result = None
+
+    # Compile the prompt into a goal up-front so the pre-run pipeline (auth gate,
+    # feasibility review) can reason about the actual requested steps. When there
+    # is no prompt, each provider's default goal is resolved inside the run.
+    precompiled_goal = None
+    if body.prompt:
+        from imposter5.automation_connector.goals import goal_spec_from_natural_prompt
+        precompiled_goal = goal_spec_from_natural_prompt(
+            body.prompt, start_url=body.url, provider_hint=body.provider
+        )
+
+    # Pipeline seam 1 — credential gate (workstream B). Runs before any browser is
+    # opened: if the task needs credentials that are not ready, stop and tell the UI
+    # to collect them rather than launching a doomed run.
+    from imposter5.automation_connector.auth_gate import evaluate_auth
+    auth_decision = evaluate_auth(
+        provider=body.provider, url=body.url, prompt=body.prompt, goal=precompiled_goal
+    )
+    if auth_decision.blocks_run:
+        logs.append(
+            f"[{datetime.now().isoformat()}] Run needs credentials ({auth_decision.reason}); "
+            "prompting user before execution."
+        )
+        return success_response({
+            "success": False,
+            "status": "needs_auth",
+            "auth": auth_decision.to_payload(),
+            "plan": plan,
+            "logs": logs,
+        })
 
     def run_simulation_thread():
-        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts
+        nonlocal all_captured_frames, movie_filename, stamped_codex_path, latest_codex_path, goal_payload, session_recorder_instance, posts, feasibility_result
         import asyncio
         # Initialize up front so the error path can never NameError / leak a handle.
         browser = None
@@ -369,8 +400,11 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         except RuntimeError as e:
             logs.append(f"[{datetime.now().isoformat()}] Thread event loop error: {e}")
         try:
-            # Run the actual goal
-            if body.provider == "linkedin":
+            # Run the actual goal. A user prompt is honored on EVERY provider: it
+            # falls through to the prompt-driven goal runner below. The canned
+            # provider paths (LinkedIn feed scrape, Wikipedia sim) are only the
+            # no-prompt defaults.
+            if body.provider == "linkedin" and not body.prompt:
                 logs.append(f"[{datetime.now().isoformat()}] Executing LinkedIn feed scrape")
                 from imposter5.loaders.linkedin_feed_scraper import scrape_feed
                 try:
@@ -385,7 +419,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                     logs.append(f"[{datetime.now().isoformat()}] LinkedIn feed scrape completed, found {len(posts)} posts")
                 except Exception as exc:
                     logs.append(f"[{datetime.now().isoformat()}] LinkedIn scrape raised: {exc}")
-            elif "wikipedia.org" in body.url.lower():
+            elif "wikipedia.org" in body.url.lower() and not body.prompt:
                 logs.append(f"[{datetime.now().isoformat()}] Executing advanced Wikipedia simulation")
                 runner = get_browser_runner()
                 browser = runner.launch_browser(headless=False)
@@ -487,9 +521,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 recorder = SessionRecorder(plan)
                 session_recorder_instance = recorder
                 if body.prompt:
-                    from imposter5.automation_connector.goals import goal_spec_from_natural_prompt
+                    # Reuse the goal compiled up-front for the pre-run pipeline so
+                    # the feasibility review and the executor act on the same steps.
+                    goal = precompiled_goal
                     logs.append(f"[{datetime.now().isoformat()}] Interpreting natural-language prompt: {body.prompt}")
-                    goal = goal_spec_from_natural_prompt(body.prompt, start_url=body.url)
                     logs.append(f"[{datetime.now().isoformat()}] Compiled prompt into goal: {goal.name} with {len(goal.steps)} steps")
                 else:
                     goal = goal_spec_from_payload(
@@ -497,6 +532,22 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                         fallback_start_url=body.url,
                     )
                     logs.append(f"[{datetime.now().isoformat()}] Running generic skim goal actions")
+
+                # Pipeline seam 2 — feasibility / action review (workstream C). The
+                # page is open, so we can confirm each required step is doable before
+                # executing; an infeasible required step stops the run with reasons.
+                from imposter5.automation_connector.feasibility import review_feasibility
+                feasibility_result = review_feasibility(page, goal, plan)
+                if feasibility_result.blocks_run:
+                    logs.append(
+                        f"[{datetime.now().isoformat()}] Task not possible on this page: "
+                        f"{feasibility_result.summary}"
+                    )
+                    from imposter5.automation_connector.goals import goal_spec_to_payload
+                    goal_payload = goal_spec_to_payload(goal)
+                    context.close()
+                    browser.close()
+                    return
 
                 if plan.get("use_markov_pathing") or (body.prompt and "markov" in body.prompt.lower()):
                     logs.append(f"[{datetime.now().isoformat()}] Running dynamic Markov Chain Pathing Simulator")
@@ -579,6 +630,19 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     thread.start()
     thread.join()
 
+    # Feasibility short-circuit: a required step was not possible on the page, so the
+    # run stopped before execution. Report the per-step verdicts to the UI.
+    if feasibility_result is not None and feasibility_result.blocks_run:
+        return success_response({
+            "success": False,
+            "status": "infeasible",
+            "feasibility": feasibility_result.to_payload(),
+            "auth": auth_decision.to_payload(),
+            "plan": plan,
+            "goal": goal_payload,
+            "logs": logs,
+        })
+
     # Run fp-agent verdict if requested
     real_verdict = None
     bot_likeness_score = None
@@ -627,10 +691,23 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         except Exception:
             pass
 
+    # Pipeline seam 3 — first-run verdict + optional scheduling (workstream D).
+    from imposter5.automation_connector.scheduler import finalize_run
+    run_outcome = finalize_run(
+        provider=body.provider,
+        url=body.url,
+        prompt=body.prompt,
+        result={"success": True, "goal": goal_payload, "session_recording": session_rec},
+    )
+
     return success_response({
         "success": True,
+        "status": "ran",
         "plan": plan,
         "goal": goal_payload,
+        "auth": auth_decision.to_payload(),
+        "feasibility": feasibility_result.to_payload() if feasibility_result is not None else None,
+        "run_outcome": run_outcome.to_payload(),
         "movie_filename": movie_filename,
         "movie_url": f"/static/.codex-outputs/{movie_filename}" if movie_filename else "",
         "stamped_codex_path": stamped_codex_path,
