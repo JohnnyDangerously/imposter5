@@ -39,6 +39,7 @@ from imposter5.automation_connector.behavior_policy import (
 from imposter5.automation_connector.interaction_primitives import (
     maybe_expand_comments,
     move_pointer,
+    perceive_after_render,
     scroll_page,
     wait_human,
 )
@@ -800,7 +801,8 @@ def _visit_notifications_variation(
             return False
         update_status_ticker(page, "🔔 NOTIFICATIONS CHECK", "Navigating to Notifications tab...")
         click_element(page, icon, plan, recorder=recorder)
-        wait_human(page, plan, 0, 600, recorder=recorder)
+        # Notifications view just rendered: perceive it before acting (no instant reaction).
+        perceive_after_render(page, plan, recorder=recorder)
         # Small varied scroll + mouse in the notifs area.
         for i in range(2):
             scroll_page(page, plan, i, 280 + random.randint(-40, 60), recorder=recorder)
@@ -817,7 +819,8 @@ def _visit_notifications_variation(
                 page.goto(_FEED_URL, wait_until="domcontentloaded")
         except Exception:
             page.goto(_FEED_URL, wait_until="domcontentloaded")
-        wait_human(page, plan, 0, 500, recorder=recorder)
+        # Feed re-rendered after returning: perceive before resuming the feed run.
+        perceive_after_render(page, plan, recorder=recorder)
         return True
     except Exception:
         # Best effort; if nav fails just continue the feed run.
@@ -843,7 +846,8 @@ def _peek_random_profile_variation(
         
         update_status_ticker(page, "👤 PROFILE PEEK", "Peeking actor profile...")
         click_element(page, link, plan, recorder=recorder)
-        wait_human(page, plan, 0, 700, recorder=recorder)
+        # Profile view just rendered: perceive it before scrolling their history.
+        perceive_after_render(page, plan, recorder=recorder)
 
         # "scroll down to their work history" + reading moves (like a person would).
         for j in range(random.randint(1, 3)):
@@ -861,7 +865,8 @@ def _peek_random_profile_variation(
         # Back to feed (human backtrack).
         update_status_ticker(page, "🧭 BACKTRACKING", "Returning to Feed...")
         page.go_back(wait_until="domcontentloaded")
-        wait_human(page, plan, 0, 550, recorder=recorder)
+        # Back-navigation re-renders the prior feed view: perceive before acting.
+        perceive_after_render(page, plan, recorder=recorder)
         return True
     except Exception:
         return False
@@ -971,6 +976,13 @@ def scrape_feed(
             chances = (behavior_plan or {}).get("variation_chances") or {}
             max_sides = int(variations.get("max_side_actions", 2 if behavior_active else 0))
             sides_done = 0
+
+            # The feed view just rendered: pay a floored human perceive-decide
+            # latency before the first behavioral action (no instant reaction).
+            try:
+                perceive_after_render(page, behavior_plan, recorder=recorder)
+            except Exception:
+                pass
 
             # Initial settle with mouse move for realistic entry (mouse scroll / reading position).
             try:
