@@ -278,33 +278,49 @@ def scroll_page(
 
 
 def _position_mouse_over_content(page: Any, plan: dict[str, Any] | None, rng: random.Random, recorder: SessionRecorder | None = None) -> None:
-    """Best-effort move mouse to a plausible reading/viewport content spot before scroll or interaction."""
+    """Best-effort move mouse to a plausible reading/viewport content spot before scroll.
+
+    Uses ``query_selector`` (returns immediately, ``None`` when absent) + the
+    ElementHandle's non-blocking ``bounding_box`` so a missing/drifted selector
+    fails fast. Previously this used ``locator(sel).first.bounding_box()`` which
+    AUTO-WAITS up to the page default timeout (~20s) per missing selector — on
+    LinkedIn (drifted feed classes) that stacked into ~40s of dead air before
+    each scroll. If no real content target resolves we leave the cursor where it
+    is rather than drifting to a fixed coordinate (which reads as aimless).
+    """
     try:
-        for sel in ("main", "article", ".feed-shared-update-v2", "section[aria-label*='feed' i]", "[role='main']", "body"):
-            loc = page.locator(sel).first
-            b = loc.bounding_box() if loc else None
-            if b and b.get("width", 0) > 80:
+        for sel in ("main", "article", "[role='main']", "section[aria-label*='feed' i]"):
+            try:
+                el = page.query_selector(sel)
+            except Exception:
+                el = None
+            if el is None:
+                continue
+            try:
+                b = el.bounding_box()
+            except Exception:
+                b = None
+            if b and b.get("width", 0) > 80 and b.get("height", 0) > 80:
                 x = b["x"] + b["width"] * rng.uniform(0.28, 0.62)
                 y = b["y"] + b["height"] * rng.uniform(0.32, 0.72)
                 _safe_mouse_move(page, x, y, plan, rng, recorder=recorder)
                 return
     except Exception:
         pass
-    # Fallback rough content area move (still better than no mouse move). Uses _safe so we
-    # get plan styles + recording even on partial failures (preserves movement quality).
-    try:
-        _safe_mouse_move(page, 320 + rng.uniform(-40, 40), 380 + rng.uniform(-60, 60), plan, rng, recorder=recorder)
-    except Exception:
-        pass
+    # No resolvable content target: do not drift to a fixed point.
 
 
 def _micro_mouse_adjust(page: Any, plan: dict[str, Any] | None, rng: random.Random, recorder: SessionRecorder | None = None) -> None:
-    """Tiny mouse move to simulate following content after a scroll or during reading.
-    Uses _safe_mouse_move so even in exception paths we prefer styled plan-driven moves (and record them)
-    for consistent human-like mouse events.
+    """Tiny RELATIVE settle nudge after a scroll (eyes/hand follow the content).
+
+    Nudges a few pixels from wherever the cursor already is — never a jump to a
+    fixed coordinate, which looked like the cursor teleporting then creeping.
     """
     try:
-        _safe_mouse_move(page, 340 + rng.uniform(-12, 12), 420 + rng.uniform(-18, 18), plan, rng, recorder=recorder)
+        cx, cy = _get_cursor(page)
+        nx = cx + rng.uniform(-7, 7)
+        ny = cy + rng.uniform(-7, 7)
+        _safe_mouse_move(page, nx, ny, plan, rng, recorder=recorder)
     except Exception:
         pass
 
@@ -1060,10 +1076,21 @@ def _emit_bezier(
     phase = rng.uniform(0.0, 2.0 * math.pi)
     phase2 = rng.uniform(0.0, 2.0 * math.pi)
 
+    # Tremor is MOMENTARY, not continuous. A real hand's jitter is swamped by the
+    # ballistic sweep and only becomes visible as it decelerates and settles on
+    # the target (low-velocity homing). Applying it across the whole path makes a
+    # slow move look like a constant unnatural wobble. Gate the amplitude to the
+    # final stretch with a smooth ramp so the reach is clean and only the settle
+    # carries sub-pixel jitter.
+    n_raw = len(raw)
+    tremor_onset = 0.78  # no tremor until the last ~22% of the movement
     last = p3
-    for i in range(len(raw)):
+    for i in range(n_raw):
         px, py = raw[i]
-        if amp > 0.0 and i < len(raw) - 1:
+        frac = (i / (n_raw - 1)) if n_raw > 1 else 1.0
+        env = 0.0 if frac < tremor_onset else ((frac - tremor_onset) / (1.0 - tremor_onset))
+        eff_amp = amp * env
+        if eff_amp > 0.0 and i < n_raw - 1:
             # Perpendicular tremor using the local travel tangent.
             nx, ny = raw[i + 1]
             tx, ty = (nx - px), (ny - py)
@@ -1075,14 +1102,14 @@ def _emit_bezier(
                 0.7 * math.sin(2.0 * math.pi * hz * t_s + phase)
                 + 0.3 * math.sin(2.0 * math.pi * (hz * 1.27) * t_s + phase2)
             )
-            jx = perp_x * amp * osc
-            jy = perp_y * amp * osc
+            jx = perp_x * eff_amp * osc
+            jy = perp_y * eff_amp * osc
             page.mouse.move(px + jx, py + jy)
         else:
             page.mouse.move(px, py)
         last = (px, py)
         clock[0] += dwell_ms[i]
-        if i < len(raw) - 1:
+        if i < n_raw - 1:
             page.wait_for_timeout(int(round(dwell_ms[i])))
     return last
 
@@ -1292,6 +1319,11 @@ def inject_synthetic_cursor(page: Any) -> None:
     """
     js = """
     (function(){
+        // Only the top document renders the overlay. add_init_script runs in
+        // EVERY frame (LinkedIn embeds ad/util iframes), so without this guard
+        // each iframe spawns its own cursor + telemetry + ticker, which shows
+        // up as duplicated "HUMAN MOUSE" markers / panels.
+        if (window.top !== window.self) { return; }
         // Store state persistently on window so it survives re-injection
         if (!window.__human_cursor_state) {
             window.__human_cursor_state = {

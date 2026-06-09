@@ -48,6 +48,7 @@ from imposter5.automation_connector.session_recorder import SessionRecorder
 logger = logging.getLogger(__name__)
 
 _FEED_URL = "https://www.linkedin.com/feed/"
+_NOTIFICATIONS_URL = "https://www.linkedin.com/notifications/"
 _MAX_POSTS = 25
 _MAX_SCROLL_PASSES = 4
 _SCROLL_DELTA_Y = 900
@@ -790,40 +791,250 @@ def _simulate_feed_reading_behaviors(
         pass
 
 
+# Resilient candidates for a "notification row" (LinkedIn rotates hashed
+# classes, so prefer role/href anchors that survive cosmetic DOM churn).
+# Verified against the live notifications page (DOM discovery 2026-06): each of
+# these yields ~24 rows / ~10 visible with real text. ``main article`` is the
+# cleanest, the data-attr / nt-card are resilient fallbacks. The old
+# role='listitem' / li / componentkey selectors matched 0 rows here.
+_NOTIFICATION_ITEM_SELECTORS: tuple[str, ...] = (
+    "main article",
+    "main [data-finite-scroll-hotkey-item]",
+    "main .nt-card",
+)
+
+
+def _visible_targets(page: Any, selectors: tuple[str, ...], limit: int) -> list[tuple[Any, dict]]:
+    """Return up to ``limit`` (element, bounding_box) pairs for REAL, on-screen
+    elements matching the first selector that yields any. Used so the cursor
+    only ever moves to something a human could actually be looking at — never to
+    arbitrary fixed coordinates (which reads as aimless, robotic drift)."""
+    for sel in selectors:
+        out: list[tuple[Any, dict]] = []
+        try:
+            els = page.query_selector_all(sel) or []
+        except Exception:
+            continue
+        for el in els:
+            try:
+                b = el.bounding_box()
+            except Exception:
+                b = None
+            # Must be a sensible, visible, in-viewport block to be a real target.
+            if not b or b["width"] < 60 or b["height"] < 24:
+                continue
+            if b["y"] < 40 or b["y"] > 1200:
+                continue
+            out.append((el, b))
+            if len(out) >= limit:
+                break
+        if out:
+            return out
+    return []
+
+
+def _move_to_target(page: Any, box: dict, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> None:
+    """Purposeful move to a real element's interior (slight natural offset)."""
+    cx = box["x"] + box["width"] * random.uniform(0.2, 0.5)
+    cy = box["y"] + box["height"] * random.uniform(0.35, 0.6)
+    move_pointer(page, cx, cy, plan, recorder=recorder)
+
+
+def _bounded_nav(
+    page: Any,
+    selectors: tuple[str, ...],
+    fallback_url: str,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    *,
+    label: str,
+    detail: str,
+) -> bool:
+    """Navigate via a purposeful, SHORT-timeout click on the first resolvable
+    real nav link, falling back to a direct goto. Never blocks on a
+    non-actionable match (the old path clicked ``.first`` of dozens of matches
+    and could hang ~25s waiting out the default actionability timeout)."""
+    from imposter5.automation_connector.interaction_primitives import update_status_ticker
+
+    update_status_ticker(page, label, detail)
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            box = loc.bounding_box(timeout=1200)  # fast-fail; do not wait out 20s
+            if not box:
+                continue
+            _move_to_target(page, box, plan, recorder)
+            wait_human(page, plan, 0, random.randint(160, 340), recorder=recorder)
+            loc.click(timeout=2500)
+            return True
+        except Exception:
+            continue
+    try:
+        page.goto(fallback_url, wait_until="domcontentloaded")
+        return True
+    except Exception:
+        return False
+
+
+def _return_to_feed(page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> None:
+    """Return to the feed reliably and a little slowly (purposeful Home click)."""
+    _bounded_nav(
+        page,
+        ("a[href='/feed/']", "a[href*='/feed/'][aria-label*='Home' i]"),
+        _FEED_URL,
+        plan,
+        recorder,
+        label="🧭 NAVIGATING",
+        detail="Returning to Feed...",
+    )
+
+
+# Stable action phrasings LinkedIn renders inside every notification row. These
+# play the same role the "Feed post N" ARIA prefix plays for the feed scraper's
+# text_fallback: they survive class/structure churn because they are the
+# human-readable content, letting us recover items when row selectors drift.
+_NOTIFICATION_VERB_MARKERS: tuple[str, ...] = (
+    "commented on",
+    "reacted to",
+    "liked your",
+    "likes your",
+    "mentioned you",
+    "started following",
+    "viewed your profile",
+    "celebrates",
+    "endorsed",
+    "sent you",
+    "invited you",
+    "accepted your",
+    "your post",
+    "shared a post",
+)
+
+
+def _notification_text_fallback(page: Any, limit: int) -> list[str]:
+    """Layer-3 capture: parse the notifications column's rendered innerText into
+    items by stable action phrasing.
+
+    Mirrors the feed scraper's ``_extract_posts_from_text`` fallback so that a
+    total drift of the row selectors (``main article`` etc.) still recovers
+    items instead of returning zero — the same resilience that keeps feed
+    capture working through LinkedIn DOM churn."""
+    try:
+        blob = _collapse_text(page.inner_text("main") or "")
+    except Exception:
+        return []
+    if not blob:
+        return []
+    pattern = "|".join(re.escape(v) for v in _NOTIFICATION_VERB_MARKERS)
+    items: list[str] = []
+    for m in re.finditer(pattern, blob, flags=re.IGNORECASE):
+        # Include the actor name immediately preceding the verb + a little after.
+        start = max(0, m.start() - 48)
+        chunk = _collapse_text(blob[start : m.start() + 110]).strip()
+        if not chunk:
+            continue
+        if any(chunk in seen or seen in chunk for seen in items):
+            continue
+        items.append(chunk[:160])
+        if len(items) >= limit:
+            break
+    return items
+
+
 def _visit_notifications_variation(
     page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None, actions_log: list[str]
 ) -> bool:
-    """Click notifications nav (mouse positioned), do a little scroll/reading there, return to feed."""
+    """Check notifications like a human: open the tab, read the top couple of
+    items (cursor moves only to the real rows), then come back to the feed.
+
+    Hard time-budgeted so it can never sit on the notifications page, and the
+    cursor never drifts to meaningless coordinates."""
     try:
-        from imposter5.automation_connector.interaction_primitives import click_element, update_status_ticker
-        icon = page.locator(_RULES.nav_notifications_selector).first
-        if not icon:
-            return False
-        update_status_ticker(page, "🔔 NOTIFICATIONS CHECK", "Navigating to Notifications tab...")
-        click_element(page, icon, plan, recorder=recorder)
-        # Notifications view just rendered: perceive it before acting (no instant reaction).
+        # Open notifications via a bounded, purposeful click (move to the real
+        # nav link, short-timeout click) with a direct-nav fallback — never the
+        # old ~25s actionability hang on a hidden duplicate `.first` match.
+        _bounded_nav(
+            page,
+            ("a[href*='/notifications/']", "button[aria-label*='Notifications' i]"),
+            _NOTIFICATIONS_URL,
+            plan,
+            recorder,
+            label="🔔 NOTIFICATIONS CHECK",
+            detail="Navigating to Notifications tab...",
+        )
+        # Notifications view just rendered: perceive it before acting.
         perceive_after_render(page, plan, recorder=recorder)
-        # Small varied scroll + mouse in the notifs area.
-        for i in range(2):
-            scroll_page(page, plan, i, 280 + random.randint(-40, 60), recorder=recorder)
-            wait_human(page, plan, i, 200, recorder=recorder)
-            move_pointer(page, 300 + random.uniform(-10, 10), 300 + i * 80 + random.uniform(-15, 15), plan, recorder=recorder)
+        # Let the notification list paint before reading. The human-like nav-icon
+        # click changes the URL via the SPA router, but LinkedIn's client-side
+        # route to notifications frequently leaves the list UN-hydrated (measured:
+        # 0 rows for 7s+), whereas a full document load renders the rows at once.
+        # So: poll briefly for rows; if none appear, force a full goto reload
+        # (invisible in a movie beyond a flicker) which reliably renders content.
+        def _rows_present() -> bool:
+            return bool(_visible_targets(page, _NOTIFICATION_ITEM_SELECTORS, limit=1))
+
+        settle_deadline = time.time() + 1.5
+        while time.time() < settle_deadline and not _rows_present():
+            page.wait_for_timeout(300)
+        if not _rows_present():
+            try:
+                page.goto(_NOTIFICATIONS_URL, wait_until="domcontentloaded")
+                perceive_after_render(page, plan, recorder=recorder)
+            except Exception:
+                pass
+            reload_deadline = time.time() + 4.0
+            while time.time() < reload_deadline and not _rows_present():
+                page.wait_for_timeout(400)
+
+        deadline = time.time() + 9.0  # never sit on notifications longer than this
+        captured: list[str] = []
+
+        # Read the top couple of real notification rows (purposeful moves only).
+        for el, box in _visible_targets(page, _NOTIFICATION_ITEM_SELECTORS, limit=2):
+            if time.time() > deadline:
+                break
+            _move_to_target(page, box, plan, recorder)
+            wait_human(page, plan, 0, random.randint(300, 700), recorder=recorder)
+            txt = _collapse_text(_text(el))[:160]
+            if txt and txt not in captured:
+                captured.append(txt)
+
+        # One small scroll to bring the next row into view, then read it too.
+        if time.time() < deadline:
+            scroll_page(page, plan, 0, 260 + random.randint(-40, 60), recorder=recorder)
+            wait_human(page, plan, 0, random.randint(250, 500), recorder=recorder)
+            for el, box in _visible_targets(page, _NOTIFICATION_ITEM_SELECTORS, limit=1):
+                _move_to_target(page, box, plan, recorder)
+                wait_human(page, plan, 0, random.randint(250, 500), recorder=recorder)
+                txt = _collapse_text(_text(el))[:160]
+                if txt and txt not in captured:
+                    captured.append(txt)
+
+        # Layer-3 resilience: if the structured rows yielded nothing (selector
+        # drift), recover items from the rendered text the same way the feed
+        # scraper's text_fallback does.
+        if not captured:
+            captured = _notification_text_fallback(page, limit=3)
+
         actions_log.append("notifications_check")
-        # Return to feed (prefer nav link, fallback to url).
-        try:
-            feed = page.locator(_RULES.feed_nav_selector).first
-            if feed:
-                update_status_ticker(page, "🧭 NAVIGATING", "Returning to Feed...")
-                click_element(page, feed, plan, recorder=recorder)
-            else:
-                page.goto(_FEED_URL, wait_until="domcontentloaded")
-        except Exception:
-            page.goto(_FEED_URL, wait_until="domcontentloaded")
-        # Feed re-rendered after returning: perceive before resuming the feed run.
+        if captured:
+            actions_log.append(f"notifications_read:{len(captured)}")
+            if recorder is not None:
+                try:
+                    recorder.record("notifications_read", metadata={"count": len(captured), "items": captured})
+                except Exception:
+                    pass
+
+        # Come back to the feed (reliably, a little slowly), then perceive it.
+        _return_to_feed(page, plan, recorder)
         perceive_after_render(page, plan, recorder=recorder)
         return True
     except Exception:
-        # Best effort; if nav fails just continue the feed run.
+        # Best effort: make sure we don't strand the run on notifications.
+        try:
+            _return_to_feed(page, plan, recorder)
+        except Exception:
+            pass
         return False
 
 
@@ -850,12 +1061,15 @@ def _peek_random_profile_variation(
         perceive_after_render(page, plan, recorder=recorder)
 
         # "scroll down to their work history" + reading moves (like a person would).
+        profile_content_selectors = ("main section", "main article", "main [role='listitem']")
         for j in range(random.randint(1, 3)):
             d = 450 + random.randint(-80, 120)
             scroll_page(page, plan, j, d, recorder=recorder)
             wait_human(page, plan, j, random.randint(250, 650), recorder=recorder)
-            # Wiggle mouse over the main profile content area (work history region).
-            move_pointer(page, 420 + random.uniform(-30, 30), 520 + j * 70 + random.uniform(-25, 25), plan, recorder=recorder)
+            # Purposeful: move over a real content block (work/experience region),
+            # never to a fixed/arbitrary point (that reads as aimless drift).
+            for el, box in _visible_targets(page, profile_content_selectors, limit=1):
+                _move_to_target(page, box, plan, recorder)
             # occasional small up like re-reading
             if random.random() < 0.35:
                 scroll_page(page, plan, j, -90, recorder=recorder)

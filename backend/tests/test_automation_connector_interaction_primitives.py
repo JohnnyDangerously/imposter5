@@ -58,6 +58,17 @@ class FakeLocator:
         self.events.append(("type", {"text": text, "delay": delay}))
 
 
+class FakeElementHandle:
+    """Stand-in for an ElementHandle returned by ``page.query_selector`` — its
+    ``bounding_box`` returns immediately (no auto-wait), mirroring the fast-fail
+    content probe used before scrolling."""
+
+    def bounding_box(self) -> dict[str, float]:
+        # Content-area sized box (a real ``main`` is tall), so the pre-scroll
+        # mouse positioning resolves a real target.
+        return {"x": 200.0, "y": 120.0, "width": 700.0, "height": 600.0}
+
+
 class FakePage:
     # Humanized aimed movement (Fitts/min-jerk) reads viewport_size to seed the
     # initial cursor position; provide it so the double matches Playwright.
@@ -74,6 +85,11 @@ class FakePage:
         self.events.append(("locator", selector))
         return FakeLocator(self.events)
 
+    def query_selector(self, selector: str) -> "FakeElementHandle | None":
+        # Fast-fail content probe (no auto-wait). First content selector resolves.
+        self.events.append(("query_selector", selector))
+        return FakeElementHandle()
+
     def go_back(self, *, wait_until: str) -> None:
         self.events.append(("go_back", wait_until))
 
@@ -85,10 +101,11 @@ def test_wait_and_scroll_use_planned_values() -> None:
     assert wait_human(page, plan, 0, 800) == 321
     assert scroll_page(page, plan, 0, 900) == 654
 
-    # Positioning for realistic mouse+wheel (the quality improvement) now emits locator (content probe)
-    # + mouse_move (via move_pointer or safe) before the wheel. We assert the planned values are honored
-    # and that the human-like mouse events for scroll happen (instead of exact old sequence, which
-    # would have regressed the "mouse scroll event" feature).
+    # Positioning for realistic mouse+wheel (the quality improvement) now probes
+    # for the content area via a fast-fail query_selector (NOT locator.bounding_box,
+    # which auto-waits ~20s per missing selector) + mouse_move (via move_pointer)
+    # before the wheel. We assert the planned values are honored and that the
+    # human-like mouse events for scroll happen.
     evs = page.events
     assert ("wait", 321) in evs
     # Scroll now models momentum bleed-off: a decaying burst of wheel events whose
@@ -97,7 +114,7 @@ def test_wait_and_scroll_use_planned_values() -> None:
     assert len(wheels) >= 2, "scroll should emit a multi-step decaying wheel burst"
     assert all(d > 0 for d in wheels), "downward scroll => all-positive wheel deltas"
     assert abs(sum(wheels) - 654) <= 2, "decaying burst should sum to the planned delta"
-    assert any(e[0] == "locator" for e in evs), "scroll should probe for content area to position mouse"
+    assert any(e[0] == "query_selector" for e in evs), "scroll should fast-fail probe for content area to position mouse"
     assert any(e[0] == "mouse_move" for e in evs), "scroll should produce mouse moves for realistic scroll events"
 
 

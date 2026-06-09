@@ -28,8 +28,23 @@ def _env_bool(name: str, *, default: bool) -> bool:
 
 
 def automation_connector_humanize_enabled() -> bool:
-    """Whether Cloak humanize layer (and styled mouse moves) are active for automation runs."""
-    return _env_bool("AUTOMATION_CONNECTOR_HUMANIZE", default=True)
+    """Whether Cloak's built-in humanize layer is active for automation runs.
+
+    DEFAULT IS NOW FALSE. Measured: with cloak humanize ON, every native
+    ``page.mouse.move`` costs ~315-360ms (vs ~9ms with it off) because cloak
+    intercepts each dispatch and applies its OWN behavioral delay. Our
+    ``interaction_primitives`` motor model already emits a full human-realistic
+    trajectory as ~30 discrete sub-moves (Fitts duration, min-jerk velocity,
+    2/3 power-law curvature timing, settle tremor, corrective submovements) and
+    is the layer the Blue detector is tuned against. Stacking cloak's per-move
+    delay on top turned a ~0.8s reach into a 10-16s choppy creep (a frame every
+    ~330ms) — the "slow, deliberate, jittery" motion that reads as obviously
+    non-human. The two layers are redundant and conflicting; ours wins. This
+    only disables cloak's BEHAVIORAL interception — the patched-Chromium
+    fingerprint stealth is independent and stays on. Set
+    ``AUTOMATION_CONNECTOR_HUMANIZE=true`` to opt back into cloak's layer.
+    """
+    return _env_bool("AUTOMATION_CONNECTOR_HUMANIZE", default=False)
 
 
 def automation_connector_locale() -> str:
