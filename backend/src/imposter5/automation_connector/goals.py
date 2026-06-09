@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 
@@ -31,6 +32,17 @@ class GoalSpec:
     desired_outcome: str
     steps: tuple[GoalStep, ...]
     prompt: str = ""  # original user/agent natural language intent (for context + interp)
+    # Topical interest/ICP terms parsed from the prompt (e.g. "read anything about
+    # hiring" -> ("hiring",)). These feed the goal+Markov LinkedIn hybrid's
+    # interest scoring (``linkedin_feed_scraper._resolve_interest_terms``) so the
+    # session stops on what the user actually cares about instead of a generic
+    # default vocabulary.
+    interest_terms: tuple[str, ...] = ()
+    # True when the prompt implies AMBIENT browsing ("browse like a casual user for
+    # a few minutes", "scroll around", "wander", or an explicit "markov" request).
+    # An ambient goal engages the semi-Markov pathing simulator instead of the
+    # fixed observe/skim runner, so the scan motion differs every run.
+    use_markov: bool = False
 
 
 DEFAULT_STEPS: tuple[GoalStep, ...] = (
@@ -60,9 +72,112 @@ def _step_from_raw(raw: Any) -> GoalStep | None:
     return GoalStep(name=name, action=action, required=bool(raw.get("required", True)), params=params)
 
 
+# --- Prompt -> interest / ambient signal extraction --------------------------
+#
+# These pure helpers turn ordinary language into the two structured signals the
+# downstream goal+Markov hybrid needs: WHAT the operator cares about
+# (``interest_terms``) and WHETHER the session is ambient enough to be driven by
+# the semi-Markov pathing simulator (``use_markov``). They never touch a browser.
+
+# Leading filler dropped from a captured interest phrase so "anything about
+# hiring" yields "hiring", not "anything hiring".
+_INTEREST_FILLER = frozenset(
+    {
+        "anything", "something", "any", "some", "posts", "post", "stuff",
+        "things", "thing", "content", "updates", "update", "news", "more",
+        "topics", "topic", "the", "a", "an", "",
+    }
+)
+
+# Phrases that introduce a topic of interest. Multi-word triggers come first so
+# "related to" wins over a bare "to".
+_INTEREST_TRIGGERS: tuple[str, ...] = (
+    "on the topic of", "related to", "to do with", "that mention",
+    "interested in", "regarding", "concerning", "mentioning", "about",
+)
+
+# Markers that end the interest clause (the user moved on to another action).
+_INTEREST_STOP_MARKERS: tuple[str, ...] = (
+    " and then ", " then ", ", then", " after ", " before ", " so that ",
+    " so i ", " and check", " and look", " and open", " and read",
+)
+
+# Signals that the session is ambient/aimless rather than a directed task. An
+# ambient session is the natural home of the semi-Markov walk.
+_AMBIENT_MARKERS: tuple[str, ...] = (
+    "casual", "casually", "browse around", "browse like", "just browse",
+    "just scroll", "scroll around", "poke around", "mess around", "look around",
+    "wander", "aimless", "kill time", "killing time", "for a few minutes",
+    "for a bit", "for a while", "like a user", "like a real user",
+    "like a person", "like a human", "ambient", "leisurely", "random walk",
+    "markov",
+)
+
+
+def _normalize_interest_terms(value: Any) -> tuple[str, ...]:
+    """Coerce a stored ``interest_terms`` payload (list/tuple/comma string) into a
+    clean tuple of lowercased terms."""
+    if value is None:
+        return ()
+    parts: list[str] = []
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        return ()
+    out: list[str] = []
+    for part in parts:
+        term = " ".join(str(part).strip().lower().split())
+        if term and term not in _INTEREST_FILLER and term not in out:
+            out.append(term)
+    return tuple(out)
+
+
+def _extract_interest_terms(prompt: str) -> tuple[str, ...]:
+    """Parse topical interest terms from a natural-language prompt.
+
+    ``"scan my feed and read anything about hiring"`` -> ``("hiring",)``;
+    ``"anything related to fundraising or new rounds"`` ->
+    ``("fundraising", "new rounds")``. Returns ``()`` when the prompt declares no
+    topic (an honest "no interest signal", not a fabricated default)."""
+    low = _safe_text(prompt).lower()
+    if not low:
+        return ()
+    tail = ""
+    for trigger in _INTEREST_TRIGGERS:
+        match = re.search(r"\b" + re.escape(trigger) + r"\s+(.+)$", low)
+        if match:
+            tail = match.group(1)
+            break
+    if not tail:
+        return ()
+    for marker in _INTEREST_STOP_MARKERS:
+        idx = tail.find(marker)
+        if idx != -1:
+            tail = tail[:idx]
+    raw_terms = re.split(r"\s+and\s+|\s+or\s+|,|/", tail)
+    terms: list[str] = []
+    for raw in raw_terms:
+        words = [w for w in re.sub(r"[^a-z0-9\s\-]", " ", raw).split() if w]
+        while words and words[0] in _INTEREST_FILLER:
+            words.pop(0)
+        while words and words[-1] in _INTEREST_FILLER:
+            words.pop()
+        term = " ".join(words[:5]).strip()
+        if term and term not in _INTEREST_FILLER and term not in terms:
+            terms.append(term)
+    return tuple(terms)
+
+
+def _implies_ambient_browsing(prompt_lower: str) -> bool:
+    """True when the prompt reads as ambient/aimless browsing (Markov-appropriate)."""
+    return any(marker in prompt_lower for marker in _AMBIENT_MARKERS)
+
+
 def goal_spec_to_payload(goal: GoalSpec) -> dict[str, Any]:
     """Serialize a goal spec into a JSON-safe payload."""
-    return {
+    payload: dict[str, Any] = {
         "name": goal.name,
         "start_url": goal.start_url,
         "desired_outcome": goal.desired_outcome,
@@ -77,6 +192,11 @@ def goal_spec_to_payload(goal: GoalSpec) -> dict[str, Any]:
             for step in goal.steps
         ],
     }
+    if goal.interest_terms:
+        payload["interest_terms"] = list(goal.interest_terms)
+    if goal.use_markov:
+        payload["use_markov"] = True
+    return payload
 
 
 def goal_spec_from_payload(raw_goal: Any, *, fallback_start_url: str = "") -> GoalSpec:
@@ -95,6 +215,8 @@ def goal_spec_from_payload(raw_goal: Any, *, fallback_start_url: str = "") -> Go
         desired_outcome=_safe_text(raw_goal.get("desired_outcome") or DEFAULT_OUTCOME),
         steps=steps or DEFAULT_STEPS,
         prompt=_safe_text(raw_goal.get("prompt")),
+        interest_terms=_normalize_interest_terms(raw_goal.get("interest_terms")),
+        use_markov=bool(raw_goal.get("use_markov", False)),
     )
 
 
@@ -135,9 +257,13 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
     name = _safe_text(prompt)[:80] or "user_prompted_task"
     url = _safe_text(start_url)
 
-    steps: list[GoalStep] = [GoalStep("visit_start_url", "visit")]
+    # Structured signals parsed from the prompt and carried on every GoalSpec
+    # branch below: WHAT the operator cares about (interest_terms) and WHETHER the
+    # session is ambient enough to be driven by the semi-Markov walk (use_markov).
+    interest_terms = _extract_interest_terms(prompt)
+    ambient = _implies_ambient_browsing(p)
 
-    import re
+    steps: list[GoalStep] = [GoalStep("visit_start_url", "visit")]
 
     # --- LinkedIn site literacy ---------------------------------------------
     # When the target is LinkedIn, map common intents (feed, notifications,
@@ -154,6 +280,11 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
         li_search_button = "button.search-global-typeahead__button, button[aria-label*='Search' i]"
         li_notifications = "a[href*='/notifications/']"
         li_messaging = "a[href*='/messaging/']"
+
+        # Directed LinkedIn actions (notifications/messaging/search) run their
+        # concrete steps; only the open-ended FEED scan engages the semi-Markov
+        # walk (and only when the prompt reads as ambient browsing).
+        li_use_markov = False
 
         if "notification" in p:
             steps.extend([
@@ -196,6 +327,10 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
                 GoalStep("record_visible_state", "record"),
             ])
             outcome = DEFAULT_OUTCOME
+            # An ambient feed-browse prompt drives the scan with the semi-Markov
+            # walk; a directed "gather posts" feed prompt stays on the extraction
+            # runner (no regression to the proven structured-extraction path).
+            li_use_markov = ambient
 
         return GoalSpec(
             name=name,
@@ -203,10 +338,24 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
             desired_outcome=outcome,
             steps=tuple(steps),
             prompt=prompt,
+            interest_terms=interest_terms,
+            use_markov=li_use_markov,
         )
 
-    # Check for click links pattern (e.g., "click 5 links", "click three random links", "click links")
-    click_links_match = re.search(r"click\s+(\d+|five|four|three|two|one)?\s*links?", p)
+    # Check for click links pattern. Allow a leading "on" and common filler words
+    # between the count and "links" so natural phrasings like "click 3 random
+    # links", "click on three links", or "click a few different links" are honored
+    # instead of degrading to a generic skim.
+    click_links_match = re.search(
+        r"click\s+(?:on\s+)?(\d+|five|four|three|two|one|a few|some|several)?\s*"
+        r"(?:random|different|various|interesting)?\s*links?",
+        p,
+    )
+
+    # Directed web flows (click N links / sandbox audit / search) execute their
+    # concrete steps; only an OPEN-ENDED browse/observe session is eligible for
+    # the semi-Markov walk, and only when the prompt reads as ambient.
+    web_use_markov = False
 
     if click_links_match:
         num_str = click_links_match.group(1)
@@ -260,6 +409,7 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
         steps.append(GoalStep("scroll_to_see", "scroll", required=False))
         steps.append(GoalStep("inspect_content", "read"))
         steps.append(GoalStep("record_extracted", "record"))
+        web_use_markov = ambient
     else:
         # Generic observation-with-intent (current default behavior, now explicitly carrying the prompt for agent context)
         steps.extend([
@@ -268,6 +418,7 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
             GoalStep("scroll_page", "scroll", required=False),
             GoalStep("record_visible_state", "record"),
         ])
+        web_use_markov = ambient
 
     return GoalSpec(
         name=name,
@@ -275,4 +426,40 @@ def goal_spec_from_natural_prompt(prompt: str, start_url: str = "", *, provider_
         desired_outcome="prompt_executed" if any(k in p for k in ("search", "click", "type", "browse", "extract", "link")) else DEFAULT_OUTCOME,
         steps=tuple(steps),
         prompt=prompt,
+        interest_terms=interest_terms,
+        use_markov=web_use_markov,
     )
+
+
+def derive_plan_overrides(goal: GoalSpec) -> dict[str, Any]:
+    """Translate a compiled prompt goal into behavior-plan overrides.
+
+    This is the bridge that makes the prompt path actually USE the semi-Markov
+    machinery instead of always falling through to the fixed observe/skim runner:
+
+    - ``interest_terms`` are surfaced onto the plan so the LinkedIn goal+Markov
+      hybrid's interest scoring (``linkedin_feed_scraper._resolve_interest_terms``)
+      stops on what the user asked for rather than a generic default vocabulary.
+    - ``use_markov`` flips ``use_markov_pathing`` so an ambient browsing prompt
+      engages the dynamic semi-Markov walk (the same switch a literal "markov"
+      prompt or an uploaded matrix already used) without the user naming the
+      algorithm.
+    - On a LinkedIn target the ambient walk is given the click/typing-free
+      ``FEED_SCAN_MATRIX`` so the random walk only scans (scroll/hover/dwell) and
+      never fires an arbitrary navigation — the goal layer still owns any opens.
+
+    Pure: returns a dict of plan keys for the caller to merge; it never mutates a
+    plan or touches a browser, so it is fully unit-testable.
+    """
+    overrides: dict[str, Any] = {}
+    if goal.interest_terms:
+        overrides["interest_terms"] = list(goal.interest_terms)
+    if goal.use_markov:
+        overrides["use_markov_pathing"] = True
+        if "linkedin.com" in _safe_text(goal.start_url).lower():
+            # Lazy import keeps this provider-neutral module free of a hard
+            # dependency on the LinkedIn loader at import time.
+            from imposter5.loaders.linkedin_feed_scraper import FEED_SCAN_MATRIX
+
+            overrides["markov_matrix"] = FEED_SCAN_MATRIX
+    return overrides
