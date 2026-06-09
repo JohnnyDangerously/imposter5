@@ -101,6 +101,44 @@ interface BehaviorPlan {
   [key: string]: unknown;
 }
 
+// One step of the existing /api/imposter5/login/* flow, described by the backend
+// auth gate's login_hint so the modal stays in sync with the real endpoints.
+interface AuthLoginFlowStep {
+  step: string;
+  endpoint: string;
+  method: string;
+  body: Record<string, unknown>;
+  description?: string;
+}
+
+interface AuthLoginHint {
+  provider: string;
+  user_id: string;
+  login_url: string;
+  cookie_name?: string | null;
+  cookie_key?: string;
+  flow: AuthLoginFlowStep[];
+}
+
+// Pre-run credential gate decision (auth_gate.AuthDecision.to_payload()).
+interface AuthDecision {
+  required: boolean;
+  ready: boolean;
+  provider: string;
+  reason: string;
+  blocks_run: boolean;
+  login_hint: AuthLoginHint | null;
+}
+
+// Shape of a /api/imposter5/run response when the credential gate short-circuits.
+interface NeedsAuthResponse {
+  ok: boolean;
+  success: boolean;
+  status: 'needs_auth';
+  auth: AuthDecision;
+  logs?: string[];
+}
+
 interface Imposter5Result {
   success: boolean;
   plan: BehaviorPlan;
@@ -176,6 +214,11 @@ export default function App() {
   const [simLogs, setSimLogs] = useState<string[]>([]);
   const [result, setResult] = useState<Imposter5Result | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Pre-run credential gate: populated when /api/imposter5/run returns needs_auth.
+  const [authGate, setAuthGate] = useState<AuthDecision | null>(null);
+  const [authBusyStep, setAuthBusyStep] = useState<string | null>(null);
+  const [authStatusMsg, setAuthStatusMsg] = useState<string | null>(null);
 
   interface Website {
     name: string;
@@ -359,7 +402,13 @@ export default function App() {
       }
 
       const data = await response.json();
-      if (data.ok) {
+      if (data.ok && data.status === 'needs_auth') {
+        // Credential gate short-circuited the run before opening a browser.
+        const needsAuth = data as NeedsAuthResponse;
+        setAuthGate(needsAuth.auth);
+        setAuthStatusMsg(null);
+        setSimLogs(needsAuth.logs || []);
+      } else if (data.ok) {
         setResult(data);
         setSimLogs(data.logs || []);
       } else {
@@ -372,6 +421,57 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Drive one step of the EXISTING /api/imposter5/login/* flow described by the
+  // auth gate's login_hint (start opens a backend login window, verify persists
+  // cookies once the user has signed in).
+  const runLoginStep = async (step: AuthLoginFlowStep) => {
+    setAuthBusyStep(step.step);
+    setAuthStatusMsg(null);
+    try {
+      const res = await fetch(step.endpoint, {
+        method: step.method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(step.body),
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || data.message || `Login step "${step.step}" failed.`);
+      }
+      if (step.step === 'start') {
+        setAuthStatusMsg(
+          data.message ||
+            'Login window opened. Sign in there, then click "Verify & Save" below.',
+        );
+      } else if (step.step === 'verify') {
+        if (data.verified) {
+          setAuthStatusMsg(data.message || 'Credentials verified and saved. You can re-run now.');
+        } else {
+          setAuthStatusMsg(
+            data.message || 'Not signed in yet — finish login in the browser window, then verify again.',
+          );
+        }
+      } else {
+        setAuthStatusMsg(data.message || `Step "${step.step}" complete.`);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Login step failed.';
+      setAuthStatusMsg(`❌ ${message}`);
+    } finally {
+      setAuthBusyStep(null);
+    }
+  };
+
+  const closeAuthGate = () => {
+    setAuthGate(null);
+    setAuthStatusMsg(null);
+    setAuthBusyStep(null);
+  };
+
+  const rerunAfterLogin = () => {
+    closeAuthGate();
+    void runSimulation();
   };
 
   return (
@@ -954,6 +1054,118 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* Credential Gate (needs_auth) Modal */}
+        {authGate && authGate.login_hint && (
+          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+            <div className="bg-slate-900 border border-amber-500/40 rounded-xl p-6 max-w-md w-full shadow-[0_0_30px_rgba(245,158,11,0.2)]">
+              <div className="flex justify-between items-center border-b border-slate-800 pb-3 mb-4">
+                <h3 className="text-sm font-bold uppercase tracking-wider text-amber-400 flex items-center gap-2">
+                  <ShieldAlert className="h-4 w-4" /> Credentials Required
+                </h3>
+                <button
+                  type="button"
+                  onClick={closeAuthGate}
+                  className="p-1 rounded text-slate-400 hover:text-amber-400 hover:bg-slate-800 transition-all"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="flex flex-col gap-4 text-xs font-mono">
+                <p className="text-slate-300 leading-relaxed">
+                  {authGate.reason ||
+                    `This run targets ${authGate.provider}, which needs you to sign in first.`}
+                </p>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 flex flex-col gap-1.5">
+                  <div className="flex justify-between text-[10px] uppercase tracking-wider">
+                    <span className="text-slate-500">Provider</span>
+                    <span className="text-amber-400 font-bold">{authGate.login_hint.provider}</span>
+                  </div>
+                  <div className="flex justify-between text-[10px] uppercase tracking-wider gap-2">
+                    <span className="text-slate-500 shrink-0">Login URL</span>
+                    <a
+                      href={authGate.login_hint.login_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-cyan-400 hover:text-cyan-300 truncate flex items-center gap-1"
+                    >
+                      <span className="truncate">{authGate.login_hint.login_url}</span>
+                      <ExternalLink className="h-3 w-3 shrink-0" />
+                    </a>
+                  </div>
+                  {authGate.login_hint.cookie_name && (
+                    <div className="flex justify-between text-[10px] uppercase tracking-wider">
+                      <span className="text-slate-500">Session Cookie</span>
+                      <span className="text-slate-300">{authGate.login_hint.cookie_name}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  {authGate.login_hint.flow.map((step, idx) => (
+                    <div
+                      key={step.step}
+                      className="rounded-lg border border-slate-800 bg-slate-950/40 p-3 flex flex-col gap-2"
+                    >
+                      <div className="flex items-start gap-2">
+                        <span className="h-5 w-5 shrink-0 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-400 flex items-center justify-center text-[10px] font-bold">
+                          {idx + 1}
+                        </span>
+                        <div className="flex flex-col">
+                          <span className="text-slate-200 font-bold uppercase tracking-wider text-[10px]">
+                            {step.step}
+                          </span>
+                          {step.description && (
+                            <span className="text-slate-500 text-[11px] leading-snug">{step.description}</span>
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => runLoginStep(step)}
+                        disabled={authBusyStep !== null}
+                        className="self-start py-1.5 px-3 rounded-lg bg-amber-500/10 border border-amber-500/40 text-amber-300 hover:bg-amber-500/20 transition-all uppercase tracking-wider text-[10px] font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {authBusyStep === step.step
+                          ? 'Working…'
+                          : step.step === 'start'
+                            ? 'Open Login Window'
+                            : step.step === 'verify'
+                              ? 'Verify & Save'
+                              : `Run ${step.step}`}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {authStatusMsg && (
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-[11px] text-slate-300 leading-relaxed">
+                    {authStatusMsg}
+                  </div>
+                )}
+
+                <div className="flex gap-2 mt-1">
+                  <button
+                    type="button"
+                    onClick={rerunAfterLogin}
+                    disabled={authBusyStep !== null}
+                    className="flex-1 py-2 px-4 rounded-lg bg-emerald-500 text-white font-bold hover:bg-emerald-600 shadow-[0_0_15px_rgba(16,185,129,0.3)] transition-all uppercase tracking-wider text-[11px] flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" /> Re-run Simulation
+                  </button>
+                  <button
+                    type="button"
+                    onClick={closeAuthGate}
+                    className="py-2 px-4 rounded-lg bg-slate-950 border border-slate-800 text-slate-400 hover:border-slate-700 transition-all uppercase tracking-wider text-[11px]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Save Website Modal */}
         {showWebsiteModal && (
