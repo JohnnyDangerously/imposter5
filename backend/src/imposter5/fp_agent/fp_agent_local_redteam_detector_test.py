@@ -76,6 +76,76 @@ MUS_JS = os.path.join(
     HONEY_DIR, "static_sites", "honey_site", "js", "mus.js"
 )
 
+# --- Self-contained behavior recorder (live-site path) -----------------------
+# The vendor mus.js recorder only ships with the honey-site bundle and is absent
+# on arbitrary live targets (e.g. real LinkedIn). This recorder produces the
+# exact frame schema the featurizer + heuristics consume — move frames
+# ["m", x, y, t_ms], a ["s", ...] start marker, plus click markers — using only
+# addEventListener + array push + sessionStorage. It touches no DOM sinks
+# (innerHTML/script.src), so strict CSP / Trusted Types pages (LinkedIn) cannot
+# block it, and it runs in the CDP execution world via Playwright, which is not
+# subject to page CSP.
+#
+# Cross-navigation aggregation: a multi-page journey (feed -> notifications ->
+# back, etc. on linkedin.com) is same-origin, so the recorder durably buffers
+# frames in sessionStorage. On every document it restores the prior buffer, and
+# on pagehide/visibilitychange it persists synchronously (reliable across a
+# navigation tear-down, unlike an async binding). Timestamps use Date.now() so
+# frames from different documents remain monotonically ordered.
+_LIVE_RECORDER_STORAGE_KEY = "__fp_frames_v1"
+_LIVE_RECORDER_JS = r"""
+(() => {
+  var KEY = "__fp_frames_v1";
+  if (window.__fp_detector_mus && window.__fp_detector_mus.__installed) {
+    window.__fp_detector_mus.record();
+    return true;
+  }
+  var frames = [];
+  try {
+    var prior = window.sessionStorage.getItem(KEY);
+    if (prior) { frames = JSON.parse(prior) || []; }
+  } catch (e) {}
+  var recording = false;
+  var now = function () { return Date.now(); };
+  var persist = function () {
+    try { window.sessionStorage.setItem(KEY, JSON.stringify(frames)); } catch (e) {}
+  };
+  var push = function (t, e) {
+    if (recording) { frames.push([t, e.clientX, e.clientY, now()]); }
+  };
+  window.addEventListener("mousemove", function (e) { push("m", e); }, true);
+  window.addEventListener("mousedown", function (e) { push("md", e); }, true);
+  window.addEventListener("mouseup", function (e) { push("mu", e); }, true);
+  window.addEventListener("pagehide", persist, true);
+  window.addEventListener("beforeunload", persist, true);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") { persist(); }
+  }, true);
+  window.__fp_detector_mus = {
+    __installed: true,
+    record: function () { recording = true; frames.push(["s", 0, 0, now()]); },
+    stop: function () { recording = false; persist(); },
+    persist: persist,
+    getData: function () { return { frames: frames.slice() }; },
+  };
+  window.__fp_detector_mus.record();
+  return true;
+})();
+"""
+
+
+def install_live_behavior_recorder(page: Any) -> None:
+    """Install the CSP-safe recorder so it auto-starts on every document and
+    durably buffers frames across (same-origin) navigations. Safe to call once
+    per run; the on-document guard makes re-entry idempotent."""
+    # Re-install + (re)start on every future document...
+    page.add_init_script(_LIVE_RECORDER_JS)
+    # ...and on the current document, which already exists.
+    try:
+        page.evaluate(_LIVE_RECORDER_JS)
+    except Exception:
+        pass
+
 # Our production evasion setup (the "stuff we think cannot be detected")
 # This uses the landed changes + humanize tuning.
 DEFAULT_EVASION_HUMAN_CONFIG = {
@@ -180,39 +250,63 @@ def launch_cloak(evasion: bool = True, headless: bool = True) -> Any:
 
 
 def ensure_mus_recording(page: Any) -> None:
-    if not os.path.exists(MUS_JS):
-        raise RuntimeError(f"mus.js not found at {MUS_JS}")
-    with open(MUS_JS) as f:
-        mus_src = f.read()
+    """Start behavioral recording on ``page``.
 
-    page.evaluate(
-        f"""
-        (function() {{
-            if (!window.__fp_detector_mus) {{
-                {mus_src}
-                window.__fp_detector_mus = new Mus();
-                window.__fp_detector_mus.setTimePoint(true);
-            }}
-            window.__fp_detector_mus.record();
-            console.log("fp_detector_mus recording (re)started");
-            return true;
-        }})();
-        """
-    )
+    Prefers the vendor ``mus.js`` recorder when its honey-site bundle is present
+    (so honey-page runs are byte-identical to the original harness). On any
+    other target — including live sites like LinkedIn where the bundle is absent
+    — it falls back to the self-contained, navigation-surviving recorder.
+    """
+    if os.path.exists(MUS_JS):
+        with open(MUS_JS) as f:
+            mus_src = f.read()
+        page.evaluate(
+            f"""
+            (function() {{
+                if (!window.__fp_detector_mus) {{
+                    {mus_src}
+                    window.__fp_detector_mus = new Mus();
+                    window.__fp_detector_mus.setTimePoint(true);
+                }}
+                window.__fp_detector_mus.record();
+                console.log("fp_detector_mus recording (re)started");
+                return true;
+            }})();
+            """
+        )
+        return
+
+    install_live_behavior_recorder(page)
 
 
 def stop_and_get_mus_frames(page: Any) -> list:
-    frames = page.evaluate(
-        """
-        (function() {
-            var m = window.__fp_detector_mus;
-            if (!m) return [];
-            m.stop();
-            var d = m.getData();
-            return d.frames || [];
-        })();
-        """
+    """Stop recording and return all frames, merged across navigations.
+
+    Combines frames flushed from prior documents (via the exposed binding) with
+    whatever remains buffered in the current document, in time order.
+    """
+    # Stop recording (which persists the current document), then read the
+    # durable sessionStorage buffer that aggregated frames across same-origin
+    # navigations. Fall back to the in-memory buffer for the vendor recorder,
+    # which has no sessionStorage buffer.
+    frames = (
+        page.evaluate(
+            """
+            (function() {
+                var m = window.__fp_detector_mus;
+                if (m) { try { m.stop(); } catch (e) {} }
+                try {
+                    var raw = window.sessionStorage.getItem("__fp_frames_v1");
+                    if (raw) { return JSON.parse(raw) || []; }
+                } catch (e) {}
+                if (m) { var d = m.getData(); return d.frames || []; }
+                return [];
+            })();
+            """
+        )
+        or []
     )
+    frames.sort(key=lambda fr: fr[3] if isinstance(fr, list) and len(fr) > 3 else 0)
     return frames
 
 
