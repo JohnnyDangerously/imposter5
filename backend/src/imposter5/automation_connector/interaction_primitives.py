@@ -1190,6 +1190,13 @@ def move_pointer(
     # correction is needed (harder acquisitions => more corrective submovements).
     idx_diff = math.log2(dist / eff_w + 1.0) if dist > 0 else 0.0
     mt_ms = fitts_movement_time_ms(dist, eff_w, a_ms=fitts_a, b_ms=fitts_b) * drift["slowdown"]
+    # Per-move speed variability. The Fitts time above is identity-stable, so
+    # similar-distance moves would otherwise take near-identical time — a "too
+    # consistent / slightly slow" feel and a low speed-variance signal. Draw a
+    # multiplicative factor from the session RNG each move (log-normal, symmetric
+    # in log space, clamped) so some moves are snappy and some are unhurried,
+    # which is how a real hand behaves and what kinetics detectors expect.
+    mt_ms *= max(0.6, min(1.7, math.exp(rng.gauss(0.0, 0.22))))
     # Step count is the movement time divided by the per-sample cadence, bounded.
     steps = max(8, min(max_steps, int(round(mt_ms / max(1.0, step_dt)))))
 
@@ -1305,12 +1312,36 @@ def inject_synthetic_cursor(page: Any) -> None:
         // each iframe spawns its own cursor + telemetry + ticker, which shows
         // up as duplicated "HUMAN MOUSE" markers / panels.
         if (window.top !== window.self) { return; }
-        // Store state persistently on window so it survives re-injection
+        // Store state persistently on window so it survives re-injection.
+        // Seed the start position from sessionStorage so the cursor RESUMES where
+        // it was before a navigation instead of snapping back to a fixed point on
+        // the left edge on every page load (a human's pointer does not teleport
+        // when a page changes). sessionStorage survives same-origin navigations.
         if (!window.__human_cursor_state) {
+            // Spawn from a RANDOM edge (not always the same top-left spot, which
+            // is a cheap tell). The cursor enters just off one of the four edges
+            // and the first ballistic move brings it on-screen from there.
+            const __vw = window.innerWidth || 1280, __vh = window.innerHeight || 800;
+            let __sx, __sy;
+            const __edge = Math.floor(Math.random() * 4);
+            if (__edge === 0)      { __sx = Math.random() * __vw; __sy = -12; }            // top
+            else if (__edge === 1) { __sx = __vw + 12; __sy = Math.random() * __vh; }      // right
+            else if (__edge === 2) { __sx = Math.random() * __vw; __sy = __vh + 12; }      // bottom
+            else                   { __sx = -12; __sy = Math.random() * __vh; }            // left
+            __sx = Math.round(__sx); __sy = Math.round(__sy);
+            try {
+                const __saved = sessionStorage.getItem('__human_cursor_pos__');
+                if (__saved) {
+                    const __p = JSON.parse(__saved);
+                    if (__p && typeof __p.x === 'number' && typeof __p.y === 'number') {
+                        __sx = __p.x; __sy = __p.y;
+                    }
+                }
+            } catch (e) {}
             window.__human_cursor_state = {
                 points: [],
-                lastX: 220,
-                lastY: 220,
+                lastX: __sx,
+                lastY: __sy,
                 lastTime: performance.now(),
                 lastVel: 0,
                 stepCount: 0,
@@ -1658,6 +1689,9 @@ def inject_synthetic_cursor(page: Any) -> None:
             state.lastY = y;
             state.lastTime = now;
             state.lastVel = vel;
+            // Persist so the cursor resumes here after a same-origin navigation
+            // instead of snapping back to the default start position.
+            try { sessionStorage.setItem('__human_cursor_pos__', JSON.stringify({ x: x, y: y })); } catch (e) {}
         };
         
         injectElements();
@@ -1670,6 +1704,17 @@ def inject_synthetic_cursor(page: Any) -> None:
         page.evaluate(js)  # immediate for current document
     except Exception as e:
         logger.exception("[interaction_primitives] failed to inject synthetic cursor: %s", e)
+    # Sync the Python-side cursor tracker to the JS spawn point so the first
+    # ballistic move STARTS from the random edge the cursor entered at (otherwise
+    # the trajectory would begin at viewport-center and visibly teleport).
+    try:
+        pos = page.evaluate(
+            "() => { const s = window.__human_cursor_state; return s ? {x: s.lastX, y: s.lastY} : null; }"
+        )
+        if isinstance(pos, dict) and "x" in pos and "y" in pos:
+            _set_cursor(page, float(pos["x"]), float(pos["y"]))
+    except Exception:
+        pass
 
 
 def _safe_evaluate(page: Any, expression: str, *args: Any) -> Any:
@@ -1778,6 +1823,26 @@ def move_pointer(
     target_w: float | None = None,
     target_h: float | None = None,
 ) -> dict[str, Any]:
+    # Global safety net: a synthetic cursor must never leave the visible viewport.
+    # A human cannot move the pointer into rendered-but-unscrolled territory, so an
+    # off-screen target (e.g. an element below the fold reported at y > viewport
+    # height) is both unnatural and an easy detection signal. We do NOT pin the
+    # cursor to the exact viewport rectangle, though: a human's pointer routinely
+    # drifts a little past a screen edge (or parks just off-screen and comes
+    # back). So we clamp to the viewport EXPANDED by a margin — enough to allow
+    # natural edge overflow, but far from the deep rendered-but-unscrolled
+    # territory (e.g. y≈2532) that target selection already rules out.
+    try:
+        vp = page.viewport_size or {}
+        vw = int(vp.get("width") or 0)
+        vh = int(vp.get("height") or 0)
+        if vw > 0 and vh > 0:
+            mx = max(40, int(vw * 0.06))
+            my = max(40, int(vh * 0.06))
+            x = max(-mx, min(vw + mx, x))
+            y = max(-my, min(vh + my, y))
+    except Exception:
+        pass
     res = _orig_move_pointer(page, x, y, plan, recorder=recorder, target_w=target_w, target_h=target_h)
     # Drive the QA synthetic cursor if present (harness / visible Watch / movie).
     # The evaluate is a no-op if the fn is not on window (normal invisible runs).
@@ -1792,3 +1857,104 @@ def move_pointer(
     except Exception:
         pass
     return res
+
+
+def _drive_visible_cursor(page: Any, x: float, y: float) -> None:
+    """Move the visible (baked) synthetic cursor without a full ballistic move.
+
+    Used for drag traces where we want the red cursor to follow a raw mouse path
+    point-by-point instead of jumping. No-op when the overlay isn't injected.
+    """
+    try:
+        _safe_evaluate(
+            page,
+            "([x,y]) => { const m = window.__human_cursor_move; if (m) m(x,y); }",
+            [int(x), int(y)],
+        )
+    except Exception:
+        pass
+
+
+def trace_text_selection(
+    page: Any,
+    plan: dict[str, Any] | None = None,
+    *,
+    recorder: SessionRecorder | None = None,
+) -> bool:
+    """Trace/underline 1-3 sentences of a visible paragraph, as a reader does.
+
+    Picks a visible, in-viewport text block, aims the cursor at the start of a
+    line, then presses and drags along the text (highlighting it) for one to
+    three lines before releasing. The drag is emitted point-by-point so the
+    baked cursor visibly traces the sentence, and intermediate dwells vary. This
+    is a genuine selection gesture (real ``mousedown``→``mousemove``→``mouseup``
+    over text), which reads as engaged reading rather than aimless cursoring.
+
+    Returns True if a trace was performed, False if no suitable text was found.
+    """
+    rng = _session_rng(page, plan)
+    try:
+        spot = _safe_evaluate(
+            page,
+            """() => {
+                const vw = innerWidth, vh = innerHeight, HEADER = 64;
+                const sels = "article p, article span, main p, [role='article'] p, p, li, .g-feed-post, [class*='text']";
+                const els = document.querySelectorAll(sels);
+                const cand = [];
+                for (let i = 0; i < Math.min(els.length, 100); i++) {
+                    const e = els[i];
+                    const t = (e.innerText || '').trim();
+                    if (t.length < 45) continue;
+                    const r = e.getBoundingClientRect();
+                    if (r.top < HEADER || r.bottom > vh - 8) continue;
+                    if (r.height < 16 || r.width < 140) continue;
+                    if (r.left < 6 || r.right > vw - 6) continue;
+                    cand.push({left: r.left, top: r.top, w: r.width, h: r.height});
+                }
+                if (!cand.length) return null;
+                return cand[Math.floor(Math.random() * cand.length)];
+            }""",
+        )
+    except Exception:
+        spot = None
+    if not isinstance(spot, dict):
+        return False
+
+    try:
+        line_h = 22.0
+        max_lines = max(1, int(spot["h"] // line_h))
+        n_lines = min(rng.randint(1, 3), max_lines)
+        # Start near the left of a line inside the block (not always the top line).
+        top_pad = rng.uniform(0.0, max(0.0, spot["h"] - line_h * n_lines))
+        start_x = spot["left"] + 3 + rng.uniform(0.0, spot["w"] * 0.08)
+        start_y = spot["top"] + top_pad + line_h * 0.6
+        end_x = spot["left"] + spot["w"] * rng.uniform(0.45, 0.96)
+        end_y = start_y + line_h * (n_lines - 1)
+
+        # Aim the cursor at the sentence start with a normal ballistic move.
+        move_pointer(page, start_x, start_y, plan, recorder=recorder)
+        page.mouse.down()
+        steps = rng.randint(4, 7)
+        for i in range(1, steps + 1):
+            f = i / steps
+            ix = start_x + (end_x - start_x) * f
+            # Drop to the next line in discrete jumps (text wraps line by line).
+            iy = start_y + (end_y - start_y) * round(f * (n_lines - 1)) / max(1, n_lines - 1) if n_lines > 1 else start_y
+            page.mouse.move(ix, iy)
+            _drive_visible_cursor(page, ix, iy)
+            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=34.0, cv=0.4, lo=14.0, hi=90.0)))
+        page.mouse.up()
+        _set_cursor(page, end_x, end_y)
+        if recorder is not None:
+            recorder.record(
+                "highlight",
+                metadata={"sentences": n_lines, "x": round(end_x), "y": round(end_y)},
+            )
+        return True
+    except Exception:
+        logger.debug("[interaction_primitives] text-selection trace failed", exc_info=True)
+        try:
+            page.mouse.up()
+        except Exception:
+            pass
+        return False

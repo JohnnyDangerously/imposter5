@@ -1119,12 +1119,18 @@ def _peek_random_profile_variation(
 # that post I care about", and a human does that on purpose — not as a random
 # walk step. So the random walk never fires an arbitrary navigation; the goal
 # layer owns the single intentional click.
+# Feed-scan transition matrix. A human cruising a feed mostly keeps scrolling
+# DOWN with brief glances; they rarely scroll back up and rarely sit idle. So
+# scroll_down dominates and is "sticky" (high self-transition), scroll_up is
+# minimal, and idle is small — otherwise the walk reads as a hesitant
+# scroll-a-little / scroll-back / pause loop, which both looks wrong on video
+# and trips the journey scorer's "aimless" check.
 FEED_SCAN_MATRIX: dict[str, dict[str, float]] = {
-    "idle":        {"idle": 0.15, "mousemove": 0.25, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.10},
-    "mousemove":   {"idle": 0.15, "mousemove": 0.15, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.20},
-    "scroll_down": {"idle": 0.25, "mousemove": 0.15, "scroll_down": 0.45, "scroll_up": 0.05, "hover": 0.10},
-    "scroll_up":   {"idle": 0.20, "mousemove": 0.20, "scroll_down": 0.40, "scroll_up": 0.10, "hover": 0.10},
-    "hover":       {"idle": 0.25, "mousemove": 0.20, "scroll_down": 0.35, "scroll_up": 0.05, "hover": 0.15},
+    "idle":        {"idle": 0.06, "mousemove": 0.18, "scroll_down": 0.66, "scroll_up": 0.03, "hover": 0.07},
+    "mousemove":   {"idle": 0.06, "mousemove": 0.12, "scroll_down": 0.64, "scroll_up": 0.03, "hover": 0.15},
+    "scroll_down": {"idle": 0.12, "mousemove": 0.13, "scroll_down": 0.66, "scroll_up": 0.03, "hover": 0.06},
+    "scroll_up":   {"idle": 0.10, "mousemove": 0.16, "scroll_down": 0.66, "scroll_up": 0.04, "hover": 0.04},
+    "hover":       {"idle": 0.12, "mousemove": 0.16, "scroll_down": 0.60, "scroll_up": 0.03, "hover": 0.09},
 }
 
 # Generic "worth stopping for" markers for a professional feed. When the run

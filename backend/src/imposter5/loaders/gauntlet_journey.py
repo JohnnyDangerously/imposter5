@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 FEED_POST_SELECTOR = "article.g-feed-post, .g-feed-post"
 FEED_LIKE_SELECTOR = ".g-feed-like"
 FEED_TEXT_SELECTOR = ".text"
+FEED_ACTIONS_SELECTOR = ".actions"
+FEED_NAME_SELECTOR = ".name"
 NAV = {
     "home": "#g-nav-home",
     "notifications": "#g-nav-notifications",
@@ -151,6 +153,107 @@ def _scan_feed_burst(
         except Exception:
             pass
         return state
+
+
+def _capture_visible_posts(
+    page: Any, recorder: SessionRecorder | None, captured: set[str]
+) -> int:
+    """Capture every feed post currently on screen — the actual data-gathering job.
+
+    A scraping human's whole point is to harvest content as it scrolls past; doing
+    this in a single ``page.evaluate`` over the visible posts means capture keeps
+    pace with the scroll (every post that enters the viewport is recorded once)
+    instead of trickling out behind sparse goal steps. This is a pure DOM read —
+    it dispatches no input events, so it adds rich evidence without changing the
+    behavioral surface the Blue detector sees.
+    """
+    try:
+        posts = page.evaluate(
+            """() => {
+                const vh = innerHeight || 800;
+                const out = [];
+                document.querySelectorAll('.g-feed-post').forEach(p => {
+                    const r = p.getBoundingClientRect();
+                    // Capture posts on screen OR ones that just scrolled past (up to
+                    // ~700px above the fold) — a fast scroll sweeps several posts
+                    // between bursts and a reader still "sees" them go by, so a
+                    // capture window wider than the literal viewport keeps harvest
+                    // rate matched to scroll speed. Below the fold is skipped.
+                    if (r.bottom < -700 || r.top > vh - 40) return;
+                    const pick = (s) => { const e = p.querySelector(s); return e ? (e.innerText || '').trim() : ''; };
+                    out.push({
+                        id: p.getAttribute('data-post-id'),
+                        author: pick('.name'),
+                        headline: pick('.meta'),
+                        text: pick('.text').slice(0, 200),
+                    });
+                });
+                return out;
+            }"""
+        )
+    except Exception:
+        return 0
+    n = 0
+    for p in posts or []:
+        pid = p.get("id") if isinstance(p, dict) else None
+        if not pid or pid in captured:
+            continue
+        captured.add(pid)
+        n += 1
+        if recorder is not None:
+            try:
+                recorder.record(
+                    "feed_capture",
+                    metadata={
+                        "post_id": pid,
+                        "author": p.get("author", ""),
+                        "headline": p.get("headline", ""),
+                        "snippet": (p.get("text") or "")[:120],
+                    },
+                )
+            except Exception:
+                pass
+    return n
+
+
+def _peek_post_engagement(
+    page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None
+) -> bool:
+    """Glance at a post's comments / reactions: hover the action row (or author)
+    and dwell briefly, the way a reader peeks at engagement before moving on.
+
+    This is the ambient "looking at comments" micro-behavior that breaks up a
+    pure scroll, aiming the cursor at real in-post controls rather than empty
+    viewport space."""
+    posts = _visible_handles(page, FEED_POST_SELECTOR, limit=8)
+    if not posts:
+        return False
+    post, _box = random.choice(posts)
+    target = None
+    # Prefer the comment/reaction row; fall back to author, then body text.
+    for sel in (FEED_ACTIONS_SELECTOR, FEED_NAME_SELECTOR, FEED_TEXT_SELECTOR):
+        try:
+            t = post.query_selector(sel)
+        except Exception:
+            t = None
+        if t is not None:
+            target = t
+            break
+    if target is None:
+        return False
+    try:
+        update_status_ticker(page, "💬 PEEKING", "Glancing at comments / reactions...")
+        hover_element(page, target, plan, recorder=recorder)
+        wait_human(page, plan, 0, random.randint(220, 620), recorder=recorder)
+        if recorder is not None:
+            try:
+                recorder.record("post_peek", metadata={})
+            except Exception:
+                pass
+        return True
+    except Exception:
+        logger.debug("[gauntlet_journey] post-engagement peek failed", exc_info=True)
+        return False
 
 
 def _return_home(page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None) -> None:
@@ -326,6 +429,8 @@ def run_gauntlet_journey(
     summary = {
         "feed_scan_bursts": 0,
         "markov_steps": 0,
+        "posts_captured": 0,
+        "peeks": 0,
         "notifications_visited": 0,
         "profiles_opened": 0,
         "searches": 0,
@@ -336,6 +441,7 @@ def run_gauntlet_journey(
         "interest_terms": interest_terms,
         "behavior_driver": "markov_goal_hybrid",
     }
+    captured_post_ids: set[str] = set()
 
     # The feed view just rendered: pay a floored human perceive latency first
     # (the gauntlet flags sub-90ms reactions as a tell).
@@ -345,34 +451,47 @@ def run_gauntlet_journey(
     except Exception:
         pass
 
-    # A loose, varied goal sequence; gaps between goals are filled with ambient
-    # feed scanning so the journey is continuous, not a stutter of discrete tasks.
+    # A loose, varied goal sequence. Every loop already does an ambient scan
+    # burst before pulling the next goal, so we do NOT pad this with standalone
+    # "scan" steps — those just double the dead scrolling and push the
+    # data-gathering goals (profile reads, searches) further apart. Keep it dense
+    # with capture-rich goals so evidence accumulates quickly.
     goal_queue: list[tuple[str, Any]] = [
-        ("scan", None),
-        ("notifications", None),
-        ("scan", None),
         ("search_profile", interest_terms[0] if interest_terms else "data engineer"),
+        ("notifications", None),
         ("glance", "network"),
-        ("scan", None),
         ("search_profile", interest_terms[min(1, len(interest_terms) - 1)] if interest_terms else "analytics"),
         ("glance", "jobs"),
-        ("scan", None),
         ("notifications", None),
         ("glance", "messages"),
-        ("scan", None),
     ]
 
     start = time.monotonic()
     markov_state: dict[str, Any] = {}
     qi = 0
+    loops = 0
+    # A goal excursion (notifications/search/glance) navigates away and the
+    # gauntlet resets the feed to the top, so each excursion costs capture depth.
+    # Spend most cycles scrolling+capturing the feed and only take an excursion
+    # every few cycles: this keeps data capture fast (long uninterrupted harvest
+    # runs that reach deep, fresh posts) while still varying the journey.
+    cycles_per_goal = random.randint(2, 3)
     while time.monotonic() - start < duration_s:
-        # Always do an ambient scan burst between goal steps (this is the scroll).
+        loops += 1
+        # Ambient feed scan burst (this is the scroll) — the dominant activity.
         steps = random.randint(3, 6)
         markov_state = _scan_feed_burst(page, behavior_plan, recorder, markov_state, steps=steps)
         summary["feed_scan_bursts"] += 1
         summary["markov_steps"] += steps
 
-        # Occasional in-feed like when something relevant is on screen.
+        # Capture everything that just scrolled past — the actual data job.
+        summary["posts_captured"] += _capture_visible_posts(page, recorder, captured_post_ids)
+
+        # Ambient variety: sometimes peek at a post's comments/reactions, sometimes
+        # like a relevant one. These are independent so the rhythm stays irregular.
+        if random.random() < 0.6 and _peek_post_engagement(page, behavior_plan, recorder):
+            summary["peeks"] += 1
+            actions.append("post_peek")
         if random.random() < 0.22 and _like_interesting_post(page, behavior_plan, recorder, interest_terms):
             summary["likes"] += 1
             actions.append("interest_like")
@@ -380,11 +499,18 @@ def run_gauntlet_journey(
         if time.monotonic() - start >= duration_s:
             break
 
+        # Only take a purposeful goal excursion every few scan cycles.
+        if loops % cycles_per_goal != 0:
+            continue
+        cycles_per_goal = random.randint(2, 3)
+
         # Pull the next purposeful goal (cycle if the journey runs long).
         if qi >= len(goal_queue):
-            # Refill with scan + a fresh interest search so long runs stay varied.
-            goal_queue.append(("scan", None))
+            # Refill with capture-rich goals (no empty scan padding) so long runs
+            # keep gathering data and stay varied.
             goal_queue.append(("search_profile", random.choice(interest_terms) if interest_terms else "data engineer"))
+            goal_queue.append(("glance", random.choice(("network", "jobs", "messages"))))
+            goal_queue.append(("notifications", None))
         kind, arg = goal_queue[qi]
         qi += 1
 
@@ -411,8 +537,9 @@ def run_gauntlet_journey(
         except Exception:
             summary["session_recording"] = None
     logger.info(
-        "[gauntlet_journey] done in %.1fs: scans=%d profiles=%d notifs=%d glances=%d likes=%d",
-        summary["duration_s"], summary["feed_scan_bursts"], summary["profiles_opened"],
-        summary["notifications_visited"], summary["glances"], summary["likes"],
+        "[gauntlet_journey] done in %.1fs: scans=%d captured=%d peeks=%d profiles=%d notifs=%d glances=%d likes=%d",
+        summary["duration_s"], summary["feed_scan_bursts"], summary["posts_captured"],
+        summary["peeks"], summary["profiles_opened"], summary["notifications_visited"],
+        summary["glances"], summary["likes"],
     )
     return summary

@@ -41,24 +41,16 @@
 
   .stage { position: relative; width: 100%; background: #000; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
   video { display: block; width: 100%; height: auto; background: #000; }
-  canvas.overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
-
-  .telemetry {
-    position: absolute; top: 12px; left: 12px; pointer-events: none;
-    background: rgba(8,10,15,.72); backdrop-filter: blur(6px);
-    border: 1px solid rgba(255,255,255,.08); border-radius: 8px;
-    padding: 10px 12px; min-width: 210px; max-width: 360px;
-    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: var(--text); box-shadow: 0 6px 24px rgba(0,0,0,.45);
-  }
-  .telemetry .t-action { color: var(--accent); font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }
-  .telemetry .t-row { display: flex; justify-content: space-between; gap: 14px; color: var(--muted); }
-  .telemetry .t-row b { color: var(--text); font-weight: 600; }
-  .telemetry .t-detail { color: var(--muted); margin-top: 4px; word-break: break-all; }
 
   .meta-bar { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
   .meta-bar b { color: var(--text); }
   .offset-note { font-size: 11px; color: var(--muted); }
+
+  .speedbar { display: flex; align-items: center; gap: 6px; }
+  .speedbar .speedlabel { font-size: 11px; color: var(--muted); margin-right: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .spd { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-variant-numeric: tabular-nums; }
+  .spd:hover { border-color: #5a5a5a; }
+  .spd.active { background: var(--text); color: var(--panel); border-color: var(--text); font-weight: 600; }
 
   .chapter { padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer; display: grid; grid-template-columns: 54px 1fr; gap: 10px; align-items: baseline; transition: background .1s; }
   .chapter:hover { background: var(--panel-2); }
@@ -73,12 +65,83 @@
   .empty { padding: 40px 20px; color: var(--muted); text-align: center; }
   .hint { color: var(--muted); font-size: 12px; }
   ::-webkit-scrollbar { width: 9px; } ::-webkit-scrollbar-thumb { background: #2a3142; border-radius: 6px; }
+
+  /* New Blue Session launcher */
+  .newrun { padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel-2); display: flex; flex-direction: column; gap: 8px; }
+  .newrun .field { display: flex; flex-direction: column; gap: 3px; }
+  .newrun label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .newrun input[type="text"], .newrun select, .newrun textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: 12px ui-monospace, monospace; width: 100%;
+  }
+  .newrun textarea { resize: vertical; line-height: 1.4; }
+  .newrun .row { display: flex; gap: 12px; align-items: center; }
+  .newrun .check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); cursor: pointer; }
+  .btn-start {
+    background: var(--accent-2); color: #fff; border: 0; border-radius: 7px;
+    padding: 9px 12px; font-size: 13px; font-weight: 700; cursor: pointer; letter-spacing: .3px;
+    transition: filter .12s, opacity .12s;
+  }
+  .btn-start:hover { filter: brightness(1.08); }
+  .btn-start:disabled { opacity: .55; cursor: progress; }
+  .btn-sec {
+    flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 10px; font-size: 12px; cursor: pointer; transition: background .12s;
+  }
+  .btn-sec:hover { background: var(--bg); }
+  .btn-sec:disabled { opacity: .5; cursor: not-allowed; }
+  .runstatus { font-size: 12px; color: var(--muted); min-height: 16px; }
+  .runstatus.run { color: var(--accent-2); }
+  .runstatus.ok { color: var(--ok); }
+  .runstatus.err { color: var(--accent); }
+  .blue-verdict { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  .blue-verdict .score { font-weight: 800; font-size: 16px; }
+  .blue-verdict .score.ok { color: var(--ok); }
+  .blue-verdict .score.bad { color: var(--accent); }
 </style>
 </head>
 <body>
 <div class="app">
   <div class="col runs">
     <div class="brand"><span class="dot"></span><h1>Imposter5 Playback</h1></div>
+
+    <div class="section-label">New Blue Session</div>
+    <div class="newrun">
+      <div class="field">
+        <label for="nr-scenario">Scenario</label>
+        <select id="nr-scenario"></select>
+        <div class="hint" id="nr-scenario-desc" style="font-size:11px"></div>
+      </div>
+      <div class="field">
+        <label for="nr-url">Gauntlet URL</label>
+        <input type="text" id="nr-url" value="http://127.0.0.1:5190/gauntlet" spellcheck="false" />
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1">
+          <label for="nr-duration">Duration</label>
+          <select id="nr-duration">
+            <option value="60">60s (quick)</option>
+            <option value="120" selected>120s</option>
+            <option value="240">240s (full)</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="nr-prompt">Prompt (optional)</label>
+        <textarea id="nr-prompt" rows="3" spellcheck="false"
+          placeholder="e.g. casually browse the feed, open posts about data engineering, check notifications"></textarea>
+        <div class="hint" style="font-size:11px">Leave blank for the default goal+Markov journey. A prompt drives the run instead (duration above applies only to the default journey).</div>
+      </div>
+      <label class="check"><input type="checkbox" id="nr-live" /> Watch live (open a window)</label>
+      <label class="check"><input type="checkbox" id="nr-fp" /> Run fp-agent model verdict</label>
+      <button class="btn-start" id="nr-start">Start Blue Session</button>
+      <div class="row" style="gap:8px">
+        <button class="btn-sec" id="nr-save">Save as scenario…</button>
+        <button class="btn-sec" id="nr-del">Delete</button>
+      </div>
+      <div class="runstatus" id="nr-status"></div>
+    </div>
+
     <div class="section-label">Runs</div>
     <div id="run-list"><div class="empty">Loading runs…</div></div>
   </div>
@@ -86,15 +149,13 @@
   <div class="col main">
     <div class="stage" id="stage">
       <video id="video" controls preload="metadata" playsinline></video>
-      <canvas class="overlay" id="overlay"></canvas>
-      <div class="telemetry" id="telemetry" style="display:none">
-        <div class="t-action" id="t-action">—</div>
-        <div class="t-detail" id="t-label"></div>
-        <div class="t-row"><span>mouse</span><b id="t-mouse">—</b></div>
-        <div class="t-row"><span>velocity</span><b id="t-vel">—</b></div>
-        <div class="t-row"><span>t</span><b id="t-time">—</b></div>
-        <div class="t-detail" id="t-extra"></div>
-      </div>
+    </div>
+    <div class="speedbar" id="speedbar">
+      <span class="speedlabel">Speed</span>
+      <button class="spd active" data-rate="1">1×</button>
+      <button class="spd" data-rate="2">2×</button>
+      <button class="spd" data-rate="3">3×</button>
+      <button class="spd" data-rate="5">5×</button>
     </div>
     <div class="meta-bar" id="meta-bar"></div>
     <div class="offset-note" id="offset-note"></div>
@@ -111,18 +172,12 @@
 "use strict";
 
 const video = document.getElementById("video");
-const overlay = document.getElementById("overlay");
-const ctx = overlay.getContext("2d");
-const telemetry = document.getElementById("telemetry");
 
 let runs = [];
 let currentRunId = null;
 let events = [];          // raw events, each annotated with .videoTime (seconds)
-let mouseMoves = [];      // subset with x/y, sorted by videoTime
 let offsetMs = 0;         // video_start_offset_ms (may be null -> 0)
 let chapterEls = [];
-
-const TRAIL_WINDOW_S = 1.4; // how far back the fading mouse trail reaches
 
 // ---- helpers ---------------------------------------------------------------
 function fmtTime(s) {
@@ -198,17 +253,12 @@ async function selectRun(id) {
 
   offsetMs = num(data.video_start_offset_ms) === null ? 0 : Number(data.video_start_offset_ms);
   events = (data.events || []).map(ev => ({ ...ev, videoTime: eventVideoTime(ev) }));
-  mouseMoves = events
-    .filter(ev => ev.action === "mouse_move" && ev.metadata &&
-                  num(ev.metadata.x) !== null && num(ev.metadata.y) !== null)
-    .sort((a, b) => a.videoTime - b.videoTime);
 
   video.src = data.video_url;
   video.load();
 
   renderMeta(data);
   renderChapters();
-  telemetry.style.display = events.length ? "block" : "none";
 }
 
 function renderMeta(data) {
@@ -219,6 +269,20 @@ function renderMeta(data) {
   if (m.prompt) bits.push(`<span>prompt <b>${escapeHtml(m.prompt)}</b></span>`);
   if (m.persona) bits.push(`<span>persona <b>${escapeHtml(m.persona)}</b></span>`);
   bits.push(`<span>events <b>${data.event_count || events.length}</b></span>`);
+
+  // Blue gauntlet verdict, when this run was scored by the Blue platform.
+  const br = m.blue_report, gs = m.gauntlet_summary;
+  if (br) {
+    const score = num(br.evasion_score);
+    const good = score !== null && score >= 70;
+    bits.push(`<span class="blue-verdict">Blue
+      <span class="score ${good ? "ok" : "bad"}">${score === null ? "—" : score + "%"}</span>
+      <b>${escapeHtml(String(br.verdict || ""))}</b>
+      ${br.journey_verdict ? `<span>journey <b>${escapeHtml(String(br.journey_verdict))}</b></span>` : ""}</span>`);
+  }
+  if (gs) {
+    bits.push(`<span>journey <b>${escapeHtml(String(gs.duration_s ?? "?"))}s</b> · scans <b>${gs.feed_scan_bursts ?? 0}</b> · profiles <b>${gs.profiles_opened ?? 0}</b> · notifs <b>${gs.notifications_visited ?? 0}</b></span>`);
+  }
   document.getElementById("meta-bar").innerHTML = bits.join("");
 
   const note = document.getElementById("offset-note");
@@ -270,20 +334,10 @@ function renderChapters() {
   });
 }
 
-// ---- overlay sizing --------------------------------------------------------
-function syncOverlaySize() {
-  const w = video.videoWidth || 1440;
-  const h = video.videoHeight || 900;
-  if (overlay.width !== w) overlay.width = w;
-  if (overlay.height !== h) overlay.height = h;
-  overlay.style.width = video.clientWidth + "px";
-  overlay.style.height = video.clientHeight + "px";
-}
-video.addEventListener("loadedmetadata", syncOverlaySize);
-window.addEventListener("resize", syncOverlaySize);
-new ResizeObserver(syncOverlaySize).observe(video);
-
-// ---- live reconstruction ---------------------------------------------------
+// ---- active-chapter sync ---------------------------------------------------
+// The video carries the baked cursor; meta lives in the right-hand chapter list.
+// We only keep the active chapter highlighted/scrolled to the current time — no
+// overlay is drawn over the video.
 function activeEventIndex(t) {
   // last event whose videoTime <= t
   let lo = 0, hi = events.length - 1, ans = -1;
@@ -295,86 +349,11 @@ function activeEventIndex(t) {
   return ans;
 }
 
-function recentMouse(t) {
-  // mouse_move events within the trail window, oldest -> newest
-  const out = [];
-  for (const ev of mouseMoves) {
-    if (ev.videoTime > t) break;
-    if (ev.videoTime >= t - TRAIL_WINDOW_S) out.push(ev);
-  }
-  return out;
-}
-
-function computeVelocity(pts) {
-  if (pts.length < 2) return 0;
-  const a = pts[pts.length - 2], b = pts[pts.length - 1];
-  const dt = b.videoTime - a.videoTime;
-  if (dt <= 0) return 0;
-  const dx = b.metadata.x - a.metadata.x;
-  const dy = b.metadata.y - a.metadata.y;
-  return Math.hypot(dx, dy) / dt; // px/s
-}
-
-function drawTrail(pts, t) {
-  ctx.clearRect(0, 0, overlay.width, overlay.height);
-  if (pts.length < 2) return;
-  // fading polyline: older segments more transparent
-  for (let i = 1; i < pts.length; i++) {
-    const p0 = pts[i - 1], p1 = pts[i];
-    const age = (t - p1.videoTime) / TRAIL_WINDOW_S; // 0 newest -> 1 oldest
-    const alpha = Math.max(0, 1 - age);
-    ctx.strokeStyle = `rgba(255,77,79,${(alpha * 0.85).toFixed(3)})`;
-    ctx.lineWidth = 2 + 6 * alpha;
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(p0.metadata.x, p0.metadata.y);
-    ctx.lineTo(p1.metadata.x, p1.metadata.y);
-    ctx.stroke();
-  }
-  // leading glow ring around the most recent point (cursor itself is baked in)
-  const head = pts[pts.length - 1];
-  ctx.strokeStyle = "rgba(255,77,79,0.9)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(head.metadata.x, head.metadata.y, 16, 0, Math.PI * 2);
-  ctx.stroke();
-}
-
-function updateTelemetry(t) {
+let lastActiveIdx = -2;
+function syncActiveChapter(t) {
   const idx = activeEventIndex(t);
-  const trail = recentMouse(t);
-  drawTrail(trail, t);
-
-  if (idx < 0) {
-    document.getElementById("t-action").textContent = "—";
-    document.getElementById("t-label").textContent = "";
-    document.getElementById("t-mouse").textContent = "—";
-    document.getElementById("t-vel").textContent = "—";
-    document.getElementById("t-time").textContent = fmtTime(t);
-    document.getElementById("t-extra").textContent = "";
-  } else {
-    const ev = events[idx];
-    const m = ev.metadata || {};
-    document.getElementById("t-action").textContent = ev.action || "event";
-    document.getElementById("t-label").textContent = (ev.label && ev.label !== ev.action) ? ev.label : "";
-    const last = trail.length ? trail[trail.length - 1].metadata : (num(m.x) !== null ? m : null);
-    document.getElementById("t-mouse").textContent = last ? `${Math.round(last.x)}, ${Math.round(last.y)}` : "—";
-    const vel = computeVelocity(trail);
-    document.getElementById("t-vel").textContent = vel ? `${Math.round(vel)} px/s` : "—";
-    document.getElementById("t-time").textContent = fmtTime(t);
-    const extra = [];
-    for (const k of ["selector", "delta_y", "wait_ms", "latency_ms", "url"]) {
-      if (m[k] !== undefined && m[k] !== null && k !== "url") extra.push(`${k}=${m[k]}`);
-    }
-    if (Array.isArray(m.matched_terms) && m.matched_terms.length) extra.push(`matched_terms=${m.matched_terms.join(", ")}`);
-    if (m.snippet) extra.push(`snippet="${m.snippet}"`);
-    if (num(m.dwell_ms) !== null) extra.push(`dwell_ms=${m.dwell_ms}`);
-    if (m.state) extra.push(`state=${m.state}`);
-    if (num(m.distract_ms) !== null) extra.push(`distract_ms=${m.distract_ms}`);
-    document.getElementById("t-extra").textContent = extra.join("  ");
-  }
-
-  // highlight active chapter
+  if (idx === lastActiveIdx) return;
+  lastActiveIdx = idx;
   chapterEls.forEach((el, i) => el.classList.toggle("active", i === idx));
   const activeEl = chapterEls[idx];
   if (activeEl) {
@@ -386,16 +365,189 @@ function updateTelemetry(t) {
   }
 }
 
-video.addEventListener("timeupdate", () => updateTelemetry(video.currentTime));
-video.addEventListener("seeked", () => updateTelemetry(video.currentTime));
+video.addEventListener("timeupdate", () => syncActiveChapter(video.currentTime));
+video.addEventListener("seeked", () => syncActiveChapter(video.currentTime));
 
-// rAF keeps the overlay smooth during normal playback (timeupdate fires ~4Hz)
+// ---- Playback speed (1×/2×/3×/5×) -----------------------------------------
+// These captures are slow to watch in real time. The chapter sync reads
+// video.currentTime so it stays correct at any rate. Persist the chosen rate
+// across run switches (a new src resets playbackRate to 1).
+let preferredRate = parseFloat(localStorage.getItem("__pb_rate__") || "1") || 1;
+const speedButtons = Array.from(document.querySelectorAll(".spd"));
+function applyRate(rate) {
+  preferredRate = rate;
+  try { video.playbackRate = rate; } catch (e) {}
+  try { localStorage.setItem("__pb_rate__", String(rate)); } catch (e) {}
+  speedButtons.forEach((b) => b.classList.toggle("active", parseFloat(b.dataset.rate) === rate));
+}
+speedButtons.forEach((b) => b.addEventListener("click", () => applyRate(parseFloat(b.dataset.rate))));
+// Reassert the chosen rate whenever a new clip loads.
+video.addEventListener("loadedmetadata", () => applyRate(preferredRate));
+video.addEventListener("ratechange", () => {
+  // Keep the button state honest if the rate is changed elsewhere.
+  speedButtons.forEach((b) => b.classList.toggle("active", parseFloat(b.dataset.rate) === video.playbackRate));
+});
+applyRate(preferredRate);
+
 function rafLoop() {
-  if (!video.paused && !video.seeking) updateTelemetry(video.currentTime);
+  if (!video.paused && !video.seeking) syncActiveChapter(video.currentTime);
   requestAnimationFrame(rafLoop);
 }
 requestAnimationFrame(rafLoop);
 
+// ---- New Blue Session launcher --------------------------------------------
+const startBtn = document.getElementById("nr-start");
+const statusEl = document.getElementById("nr-status");
+const scenarioSel = document.getElementById("nr-scenario");
+const scenarioDesc = document.getElementById("nr-scenario-desc");
+let scenarios = [];
+
+function setStatus(msg, cls) {
+  statusEl.textContent = msg;
+  statusEl.className = "runstatus" + (cls ? " " + cls : "");
+}
+
+// ---- scenarios (preset + saved test setups) --------------------------------
+function readForm() {
+  return {
+    url: document.getElementById("nr-url").value.trim(),
+    prompt: document.getElementById("nr-prompt").value.trim(),
+    duration_s: Number(document.getElementById("nr-duration").value) || 120,
+    headless: !document.getElementById("nr-live").checked,
+    run_fp_agent: document.getElementById("nr-fp").checked,
+  };
+}
+
+function applyScenario(s) {
+  if (!s) return;
+  document.getElementById("nr-url").value = s.url || "http://127.0.0.1:5190/gauntlet";
+  document.getElementById("nr-prompt").value = s.prompt || "";
+  document.getElementById("nr-duration").value = String(s.duration_s || 120);
+  document.getElementById("nr-live").checked = s.headless === false;
+  document.getElementById("nr-fp").checked = !!s.run_fp_agent;
+  scenarioDesc.textContent = s.description || "";
+}
+
+async function loadScenarios(selectName) {
+  try {
+    const res = await fetch("/api/imposter5/scenarios");
+    const data = await res.json();
+    scenarios = (data && data.scenarios) || [];
+  } catch (e) {
+    scenarios = [];
+  }
+  scenarioSel.innerHTML = "";
+  scenarios.forEach((s) => {
+    const o = document.createElement("option");
+    o.value = s.name;
+    o.textContent = s.name;
+    scenarioSel.appendChild(o);
+  });
+  if (scenarios.length) {
+    const pick = scenarios.find(s => s.name === selectName) || scenarios[0];
+    scenarioSel.value = pick.name;
+    applyScenario(pick);
+  } else {
+    scenarioDesc.textContent = "";
+  }
+}
+
+scenarioSel.addEventListener("change", () => {
+  applyScenario(scenarios.find(s => s.name === scenarioSel.value));
+});
+
+document.getElementById("nr-save").addEventListener("click", async () => {
+  const def = scenarioSel.value || "";
+  const name = (window.prompt("Save this setup as a scenario named:", def) || "").trim();
+  if (!name) return;
+  const body = { name, description: "", ...readForm() };
+  try {
+    const res = await fetch("/api/imposter5/scenarios", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data && data.ok === false) { setStatus(`Save failed: ${data.message || data.error}`, "err"); return; }
+    await loadScenarios(name);
+    setStatus(`Scenario "${name}" saved.`, "ok");
+  } catch (e) { setStatus(`Save failed: ${e}`, "err"); }
+});
+
+document.getElementById("nr-del").addEventListener("click", async () => {
+  const name = scenarioSel.value;
+  if (!name) return;
+  if (!window.confirm(`Delete scenario "${name}"?`)) return;
+  try {
+    await fetch(`/api/imposter5/scenarios/${encodeURIComponent(name)}`, { method: "DELETE" });
+    await loadScenarios();
+    setStatus(`Scenario "${name}" deleted.`, "ok");
+  } catch (e) { setStatus(`Delete failed: ${e}`, "err"); }
+});
+
+async function startBlueSession() {
+  const url = document.getElementById("nr-url").value.trim();
+  const duration = Number(document.getElementById("nr-duration").value) || 120;
+  const watchLive = document.getElementById("nr-live").checked;
+  const runFp = document.getElementById("nr-fp").checked;
+  const prompt = document.getElementById("nr-prompt").value.trim();
+  if (!url) { setStatus("Enter a gauntlet URL first.", "err"); return; }
+
+  startBtn.disabled = true;
+  const mode = prompt ? "prompt run" : "Blue gauntlet";
+  const t0 = Date.now();
+  const timer = setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    setStatus(`Running ${mode}… ${s}s. Recording will load when done.`, "run");
+  }, 1000);
+  setStatus(`Running ${mode}… 0s.`, "run");
+
+  try {
+    const body = {
+      url,
+      provider: "generic",
+      run_fp_agent: runFp,
+      gauntlet_duration_s: duration,
+      // Default headless so a server-started backend can record + score;
+      // "watch live" opens a real window (needs a desktop session).
+      headless: !watchLive,
+    };
+    if (prompt) body.prompt = prompt;
+    const res = await fetch("/api/imposter5/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    clearInterval(timer);
+
+    // success_response flattens fields to the top level; error_response sets ok:false.
+    if (data && data.ok === false) {
+      setStatus(`Run rejected: ${data.message || data.error || "unknown error"}`, "err");
+      startBtn.disabled = false;
+      return;
+    }
+    const payload = data || {};
+    const br = payload.blue_report;
+    if (payload.status === "gauntlet_failed") {
+      setStatus(`Gauntlet failed: ${payload.error || "no verdict"}`, "err");
+    } else if (br) {
+      const score = (typeof br.evasion_score === "number") ? br.evasion_score + "%" : "—";
+      setStatus(`Done — Blue ${score} [${br.verdict || ""}] journey=${br.journey_verdict || "?"}`, "ok");
+    } else {
+      setStatus("Done — recording saved.", "ok");
+    }
+    // Reload the run list and jump to the newest run (this one).
+    await loadRuns();
+  } catch (e) {
+    clearInterval(timer);
+    setStatus(`Request failed: ${e}`, "err");
+  } finally {
+    startBtn.disabled = false;
+  }
+}
+
+startBtn.addEventListener("click", startBlueSession);
+
+loadScenarios();
 loadRuns();
 </script>
 </body>

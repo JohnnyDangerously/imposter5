@@ -21,6 +21,7 @@ from imposter5.automation_connector.interaction_primitives import (
     move_pointer,
     perceive_after_render,
     scroll_page,
+    trace_text_selection,
     type_text,
     update_status_ticker,
     wait_human,
@@ -32,68 +33,75 @@ logger = logging.getLogger(__name__)
 # Default human transition matrix — hand-tuned defaults (a hand-typed constant,
 # not learned from data). Each row is the distribution over next states given
 # the current state; rows are re-normalized at runtime so small edits stay safe.
+# A human cruising a feed overwhelmingly scrolls DOWN, with brief glances and
+# the occasional pause. Scrolling back UP is rare (you re-read something you
+# just passed once in a while) and is NEVER sticky — after a single up-glance
+# you go back down. scroll_down is the dominant, self-reinforcing state so the
+# walk reads as steady forward progress, not a hesitant down-a-little / back-up
+# / pause loop (which both looks wrong on video and is an easy detection signal).
 DEFAULT_HUMAN_MATRIX = {
     "idle": {
-        "idle": 0.15,
-        "mousemove": 0.35,
-        "scroll_down": 0.25,
-        "scroll_up": 0.05,
-        "hover": 0.12,
+        "idle": 0.10,
+        "mousemove": 0.22,
+        "scroll_down": 0.50,
+        "scroll_up": 0.02,
+        "hover": 0.10,
         "click": 0.03,
-        "typing": 0.05
+        "typing": 0.03
     },
     "mousemove": {
-        "idle": 0.25,
-        "mousemove": 0.20,
-        "scroll_down": 0.15,
-        "scroll_up": 0.05,
-        "hover": 0.25,
-        "click": 0.08,
+        "idle": 0.12,
+        "mousemove": 0.15,
+        "scroll_down": 0.48,
+        "scroll_up": 0.02,
+        "hover": 0.16,
+        "click": 0.05,
         "typing": 0.02
     },
     "scroll_down": {
-        "idle": 0.40,
-        "mousemove": 0.20,
-        "scroll_down": 0.20,
-        "scroll_up": 0.05,
-        "hover": 0.10,
-        "click": 0.04,
+        "idle": 0.14,
+        "mousemove": 0.12,
+        "scroll_down": 0.62,
+        "scroll_up": 0.02,
+        "hover": 0.06,
+        "click": 0.03,
         "typing": 0.01
     },
     "scroll_up": {
-        "idle": 0.35,
-        "mousemove": 0.25,
-        "scroll_down": 0.10,
-        "scroll_up": 0.15,
-        "hover": 0.10,
+        # Not sticky: after a single re-read glance, resume scrolling down.
+        "idle": 0.12,
+        "mousemove": 0.14,
+        "scroll_down": 0.62,
+        "scroll_up": 0.02,
+        "hover": 0.06,
         "click": 0.03,
-        "typing": 0.02
+        "typing": 0.01
     },
     "hover": {
-        "idle": 0.30,
-        "mousemove": 0.20,
-        "scroll_down": 0.10,
-        "scroll_up": 0.02,
-        "hover": 0.15,
-        "click": 0.20,
+        "idle": 0.18,
+        "mousemove": 0.18,
+        "scroll_down": 0.40,
+        "scroll_up": 0.01,
+        "hover": 0.10,
+        "click": 0.10,
         "typing": 0.03
     },
     "click": {
-        "idle": 0.50,
-        "mousemove": 0.20,
-        "scroll_down": 0.15,
-        "scroll_up": 0.02,
-        "hover": 0.10,
+        "idle": 0.34,
+        "mousemove": 0.18,
+        "scroll_down": 0.38,
+        "scroll_up": 0.01,
+        "hover": 0.06,
         "click": 0.01,
         "typing": 0.02
     },
     "typing": {
         "idle": 0.20,
-        "mousemove": 0.15,
-        "scroll_down": 0.05,
+        "mousemove": 0.13,
+        "scroll_down": 0.10,
         "scroll_up": 0.01,
         "hover": 0.05,
-        "click": 0.50,
+        "click": 0.47,
         "typing": 0.04
     }
 }
@@ -102,24 +110,30 @@ DEFAULT_HUMAN_MATRIX = {
 # Hand-tuned defaults: idle/reading dwells longest, clicks are quick, typing
 # and scrolling sit in the middle. Sampled via a log-normal so the long tail
 # (occasional long pauses) looks human rather than uniformly bounded.
+# Per-state sojourn means. Tuned snappy: glancing at a feed post takes ~1-3s
+# (Brysbaert reading rates over a visible snippet), not many seconds. Long
+# engagement only happens when the goal layer opens a post. Over-long idle
+# pauses both look unnatural on video and read as hesitation to the scorer.
 STATE_DWELL_MS: dict[str, tuple[float, float]] = {
-    "idle": (2400.0, 0.55),
-    "mousemove": (520.0, 0.45),
-    "scroll_down": (900.0, 0.50),
-    "scroll_up": (820.0, 0.50),
-    "hover": (760.0, 0.45),
-    "click": (380.0, 0.40),
-    "typing": (1300.0, 0.50),
+    "idle": (1300.0, 0.55),
+    "mousemove": (380.0, 0.45),
+    "scroll_down": (620.0, 0.50),
+    "scroll_up": (560.0, 0.50),
+    "hover": (560.0, 0.45),
+    "click": (360.0, 0.40),
+    "typing": (1100.0, 0.50),
 }
 
 # Short transition gap between leaving one state and entering the next.
 INTER_STEP_MEAN_MS = 320.0
 INTER_STEP_CV = 0.45
 
-# Global clamps so log-normal tails stay plausible.
+# Global clamps so log-normal tails stay plausible. The dwell ceiling is kept
+# modest so an unlucky log-normal tail can't manufacture a 10s+ stare at the
+# feed (a human scanning rarely pauses that long without engaging).
 DWELL_LO_MS = 80
-DWELL_HI_MS = 12_000
-GAP_HI_MS = 4_000
+DWELL_HI_MS = 5_500
+GAP_HI_MS = 3_000
 
 TYPING_QUERIES = ("hello", "markov chains", "last human line", "cybersecurity", "evasion")
 
@@ -140,9 +154,9 @@ TYPING_QUERIES = ("hello", "markov chains", "last human line", "cybersecurity", 
 # then renormalized, so the underlying transition structure is preserved while the
 # emphasis shifts.
 INTENT_BIAS: dict[str, dict[str, float]] = {
-    "reading": {"idle": 2.4, "scroll_down": 1.4, "scroll_up": 1.3, "mousemove": 0.7, "hover": 0.6, "click": 0.3, "typing": 0.2},
-    "scanning": {"idle": 0.6, "scroll_down": 1.9, "mousemove": 1.6, "scroll_up": 0.7, "hover": 0.9, "click": 0.5, "typing": 0.2},
-    "engaging": {"idle": 0.8, "hover": 1.9, "click": 1.9, "mousemove": 1.3, "scroll_down": 0.7, "scroll_up": 0.6, "typing": 0.6},
+    "reading": {"idle": 2.4, "scroll_down": 1.4, "scroll_up": 0.4, "mousemove": 0.7, "hover": 0.6, "click": 0.3, "typing": 0.2},
+    "scanning": {"idle": 0.6, "scroll_down": 1.9, "mousemove": 1.6, "scroll_up": 0.3, "hover": 0.9, "click": 0.5, "typing": 0.2},
+    "engaging": {"idle": 0.8, "hover": 1.9, "click": 1.9, "mousemove": 1.3, "scroll_down": 0.7, "scroll_up": 0.3, "typing": 0.6},
     "form_filling": {"typing": 3.2, "click": 1.6, "hover": 1.2, "mousemove": 1.0, "idle": 0.7, "scroll_down": 0.4, "scroll_up": 0.2},
 }
 
@@ -215,8 +229,8 @@ def _reading_scale(char_count: int) -> float:
     """
     if char_count <= 0:
         return 1.0
-    scale = 0.7 + 0.18 * math.log2(1.0 + char_count / 150.0)
-    return max(0.7, min(1.8, scale))
+    scale = 0.7 + 0.15 * math.log2(1.0 + char_count / 150.0)
+    return max(0.7, min(1.35, scale))
 
 
 def _choose_intent(rng: Any, current: str) -> str:
@@ -271,17 +285,54 @@ def _sample_dwell_ms(rng: Any, state: str) -> int:
     return int(lognormal_ms(rng, mean_ms=mean_ms, cv=cv, lo=DWELL_LO_MS, hi=DWELL_HI_MS))
 
 
+def _viewport_wh(page: Any) -> tuple[int, int]:
+    """Current viewport size in CSS px, with a sane desktop fallback."""
+    try:
+        vp = page.viewport_size or {}
+        vw = int(vp.get("width") or 0)
+        vh = int(vp.get("height") or 0)
+        if vw > 0 and vh > 0:
+            return vw, vh
+    except Exception:
+        pass
+    return 1280, 800
+
+
+def _box_in_viewport(box: Any, vw: int, vh: int, *, margin: int = 8) -> bool:
+    """True when an element's box intersects the current viewport.
+
+    Playwright reports ``bounding_box`` relative to the viewport top-left, so an
+    element scrolled below the fold has ``y`` >= ``vh`` (we saw y≈2532 on an
+    800px viewport). Requiring intersection here is what keeps the ambient
+    cursor on-screen: a human never points at or hovers content they have not
+    scrolled into view, and an off-screen ``mouse.move`` is a hard tell.
+    """
+    if not box:
+        return False
+    try:
+        top, bottom = box["y"], box["y"] + box["height"]
+        left, right = box["x"], box["x"] + box["width"]
+    except Exception:
+        return False
+    return (bottom > margin and top < vh - margin
+            and right > margin and left < vw - margin)
+
+
 def _pick_visible_locator(page: Any, rng: Any, selector: str, *, limit: int = 40) -> Any | None:
-    """Return a single visible element handle chosen with the seeded rng, or None.
+    """Return a single in-viewport element handle chosen with the seeded rng, or None.
 
     Resolving the multi-match selector to one concrete (`.first`-friendly) element
     handle here keeps the downstream click/hover primitives unambiguous and lets
-    the seeded rng own the link pick for run reproducibility.
+    the seeded rng own the link pick for run reproducibility. Only elements that
+    actually intersect the current viewport are eligible: ``is_visible`` alone is
+    true for DOM-visible content below the fold, which would aim the cursor at
+    off-screen coordinates.
     """
     try:
         candidates = page.locator(selector).all()
     except Exception:
         return None
+    vw, vh = _viewport_wh(page)
     visible = []
     for loc in candidates[:limit]:
         try:
@@ -293,6 +344,8 @@ def _pick_visible_locator(page: Any, rng: Any, selector: str, *, limit: int = 40
             if "submit" in el_id or "honeypot" in el_id:
                 # Never let the random walk fire the form submit or a honeypot
                 # trap; submit timing and trap evasion are owned elsewhere.
+                continue
+            if not _box_in_viewport(loc.bounding_box(), vw, vh):
                 continue
             visible.append(loc)
         except Exception:
@@ -310,7 +363,11 @@ def _content_move_target(page: Any, rng: Any, targets: tuple[str, ...] | None) -
     moves instead of jumping to arbitrary viewport coordinates (a tell). Falls
     back to a jittered viewport point when no visible target resolves.
     """
+    vw, vh = _viewport_wh(page)
+    margin = 8
     if targets:
+        # _pick_visible_locator already restricts to in-viewport elements, so the
+        # box below is guaranteed to be on-screen; the clamp is belt-and-braces.
         loc = _pick_visible_locator(page, rng, ", ".join(targets))
         if loc is not None:
             try:
@@ -318,10 +375,12 @@ def _content_move_target(page: Any, rng: Any, targets: tuple[str, ...] | None) -
                 if box and box.get("width") and box.get("height"):
                     cx = int(box["x"] + box["width"] * rng.uniform(0.3, 0.7))
                     cy = int(box["y"] + box["height"] * rng.uniform(0.25, 0.6))
+                    cx = max(margin, min(vw - margin, cx))
+                    cy = max(margin, min(vh - margin, cy))
                     return cx, cy
             except Exception:
                 pass
-    return rng.randint(200, 1000), rng.randint(150, 700)
+    return rng.randint(margin, max(margin + 1, vw - margin)), rng.randint(margin, max(margin + 1, vh - margin))
 
 
 def run_markov_simulation(
@@ -419,10 +478,20 @@ def run_markov_simulation(
             dwell_ms = max(DWELL_LO_MS, min(DWELL_HI_MS, dwell_ms))
 
         # 3. Execute the interaction primitive corresponding to the next state.
+        traced = False
         try:
             if next_state == "idle":
-                # Idle has no interaction; the sojourn wait below is the read pause.
-                update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")
+                # Reading: sometimes the reader traces/underlines a sentence with
+                # the cursor (an active engaged-reading gesture) rather than just
+                # holding still. The trace itself consumes part of the read time,
+                # so we shorten the trailing dwell when it fires.
+                if rng.random() < 0.35:
+                    traced = trace_text_selection(page, plan, recorder=recorder)
+                if traced:
+                    update_status_ticker(page, "✍️ READING", "Tracing a sentence while reading...")
+                    dwell_ms = int(dwell_ms * rng.uniform(0.2, 0.6))
+                else:
+                    update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")
 
             elif next_state == "mousemove":
                 cx, cy = _content_move_target(page, rng, mousemove_targets)
@@ -486,8 +555,16 @@ def run_markov_simulation(
         except Exception as e:
             logger.warning("[markov_simulator] Error during state execution (%s): %s", next_state, e)
 
-        # 4. Semi-Markov sojourn: linger in the chosen state for its sampled dwell.
-        page.wait_for_timeout(dwell_ms)
+        # 4. Semi-Markov sojourn. Dwell models WAITING / reading, not a mandatory
+        #    pause after every action. When actively doing things (scroll, move,
+        #    hover in a flow) a human frequently chains straight into the next
+        #    action with little or no pause; only idle/reading holds the full
+        #    sojourn. Collapsing most active-state dwells gives the "scroll, move,
+        #    scroll, move" rhythm and breaks the uniform act-pause-act-pause cadence.
+        if next_state != "idle" and not traced and rng.random() < 0.55:
+            dwell_ms = int(dwell_ms * rng.uniform(0.04, 0.3))
+        if dwell_ms > 0:
+            page.wait_for_timeout(dwell_ms)
         if recorder is not None:
             recorder.record("dwell", metadata={"state": next_state, "dwell_ms": dwell_ms})
 

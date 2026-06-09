@@ -278,8 +278,12 @@ def build_identity_kinematics(
 
     human_config: dict[str, Any] = {
         # Fitts's law movement-time parameters (per-person intercept/slope).
-        "fitts_a_ms": s(identity_rng, session_rng, lo=70.0, hi=150.0, session_jitter=0.10),
-        "fitts_b_ms": s(identity_rng, session_rng, lo=120.0, hi=230.0, session_jitter=0.10),
+        # Band sits at the faster end of the human range (b ≈ 100-175 ms/bit, i.e.
+        # ~5.7-10 bits/s throughput) so on-screen cursoring reads as a confident
+        # everyday user rather than a sluggish, over-deliberate drift. Per-move
+        # speed jitter (move_pointer) adds the move-to-move variance on top.
+        "fitts_a_ms": s(identity_rng, session_rng, lo=55.0, hi=120.0, session_jitter=0.10),
+        "fitts_b_ms": s(identity_rng, session_rng, lo=100.0, hi=175.0, session_jitter=0.10),
         # Per-sample emission cadence; total step count is derived from Fitts MT.
         "mouse_step_delay_ms": s(identity_rng, session_rng, lo=6.0, hi=14.0, session_jitter=0.12),
         "mouse_step_delay_cv": s(identity_rng, session_rng, lo=0.30, hi=0.60, session_jitter=0.10),

@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Ensure backend root and src directory are in sys.path
 backend_dir = str(Path(__file__).parent.resolve())
@@ -79,6 +79,23 @@ class WebsiteSaveRequest(BaseModel):
     description: str = ""
 
 
+class ScenarioSaveRequest(BaseModel):
+    """A reusable, named test scenario for the playback launcher.
+
+    A scenario captures everything needed to re-run a test (prompt, target,
+    duration, headless/fp toggles), so the same behavior can be replayed here or
+    transferred to the product path. ``prompt`` blank means the default
+    goal+Markov journey.
+    """
+    name: str = Field(max_length=80)
+    prompt: str = Field(default="", max_length=1000)
+    url: str = Field(default="http://127.0.0.1:5190/gauntlet", max_length=500)
+    duration_s: int = Field(default=120, ge=15, le=900)
+    headless: bool = True
+    run_fp_agent: bool = False
+    description: str = Field(default="", max_length=300)
+
+
 class PersonaSaveRequest(BaseModel):
     name: str
     patience: str
@@ -113,6 +130,20 @@ DEFAULT_WEBSITES = [
     {"name": "Wikipedia Machine Learning", "url": "https://en.wikipedia.org/wiki/Machine_learning", "description": "Wikipedia article on ML. Perfect for testing search-like queries and scroll-and-read behaviors."},
     {"name": "Yahoo News", "url": "https://news.yahoo.com", "description": "Dynamic news portal. Good for testing feed scans, comments, and fast-paced browsing."},
     {"name": "Hacker News", "url": "https://news.ycombinator.com", "description": "Text-heavy tech feed. Ideal for testing precise, low-touch link clicks and methodic scanner pacing."}
+]
+
+
+SCENARIOS_FILE_PATH = os.path.join(os.path.dirname(__file__), "src", "imposter5", "automation_connector", "scenarios.json")
+
+# Preloaded Blue-gauntlet test scenarios so the launcher is never a blank box.
+# A blank ``prompt`` runs the default goal+Markov journey; a prompt drives the
+# run instead. Users can save their own on top of these.
+DEFAULT_SCENARIOS = [
+    {"name": "Default journey (goal + Markov)", "prompt": "", "url": "http://127.0.0.1:5190/gauntlet", "duration_s": 120, "headless": True, "run_fp_agent": False, "description": "Canned multi-minute journey: ambient feed scans, notifications, interest opens — Markov-driven micro-behavior."},
+    {"name": "Casual feed browse", "prompt": "casually browse the feed and scroll around using markov", "url": "http://127.0.0.1:5190/gauntlet", "duration_s": 120, "headless": True, "run_fp_agent": False, "description": "Pure ambient Markov scroll/read through the feed."},
+    {"name": "Interest hunt: data engineering", "prompt": "browse the feed and open posts about data engineering, then keep scrolling and reading", "url": "http://127.0.0.1:5190/gauntlet", "duration_s": 180, "headless": True, "run_fp_agent": False, "description": "Goal+Markov hybrid: scan, find ICP-relevant posts, open and read them."},
+    {"name": "Check notifications", "prompt": "check notifications then return to the feed and keep reading", "url": "http://127.0.0.1:5190/gauntlet", "duration_s": 120, "headless": True, "run_fp_agent": False, "description": "Navigate to notifications and back — exercises cross-surface navigation."},
+    {"name": "Research a profile", "prompt": "search for data engineers, open a profile and read it, then go back to the feed", "url": "http://127.0.0.1:5190/gauntlet", "duration_s": 180, "headless": True, "run_fp_agent": False, "description": "Human-interest endgame: search → results scan → profile read → return."},
 ]
 
 
@@ -164,6 +195,26 @@ def _write_session_sidecar(
     return session_filename
 
 
+def _capture_blue_gauntlet_verdict(page: Any) -> dict[str, Any] | None:
+    """Trigger the Blue gauntlet's own scorer and return its verdict, or None.
+
+    The gauntlet page exposes ``window.lhhlSubmit()`` (submit the recorded
+    session) and ``window.__lhhl_last_report`` (the async score). We poll up to
+    ~10s for the report so any run that ends on a ``/gauntlet`` page — whether
+    the canned journey or a prompt-driven walk — surfaces an evasion score.
+    """
+    try:
+        page.evaluate("window.lhhlSubmit && window.lhhlSubmit()")
+        for _ in range(50):  # poll up to ~10s for the async score
+            rep = page.evaluate("window.__lhhl_last_report || null")
+            if rep:
+                return rep
+            page.wait_for_timeout(200)
+    except Exception:
+        return None
+    return None
+
+
 def load_websites() -> list[dict[str, Any]]:
     try:
         if os.path.exists(WEBSITES_FILE_PATH):
@@ -186,6 +237,31 @@ def _save_websites_to_disk(websites: list[dict[str, Any]]) -> None:
         os.makedirs(os.path.dirname(WEBSITES_FILE_PATH), exist_ok=True)
         with open(WEBSITES_FILE_PATH, "w") as f:
             json.dump(websites, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_scenarios() -> list[dict[str, Any]]:
+    try:
+        if os.path.exists(SCENARIOS_FILE_PATH):
+            with open(SCENARIOS_FILE_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    try:
+        os.makedirs(os.path.dirname(SCENARIOS_FILE_PATH), exist_ok=True)
+        with open(SCENARIOS_FILE_PATH, "w") as f:
+            json.dump(DEFAULT_SCENARIOS, f, indent=2)
+    except Exception:
+        pass
+    return DEFAULT_SCENARIOS
+
+
+def _save_scenarios_to_disk(scenarios: list[dict[str, Any]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(SCENARIOS_FILE_PATH), exist_ok=True)
+        with open(SCENARIOS_FILE_PATH, "w") as f:
+            json.dump(scenarios, f, indent=2)
     except Exception:
         pass
 
@@ -292,6 +368,39 @@ async def delete_website(name: str):
         return success_response({"success": True, "message": f"Website '{name}' deleted successfully."})
     except Exception as e:
         return error_response("delete_website_error", str(e))
+
+
+@app.get("/api/imposter5/scenarios")
+async def get_scenarios():
+    """Return saved test scenarios (preloaded presets + user-saved)."""
+    try:
+        return success_response({"scenarios": load_scenarios()})
+    except Exception as e:
+        return error_response("scenarios_error", str(e))
+
+
+@app.post("/api/imposter5/scenarios")
+async def save_scenario(body: ScenarioSaveRequest):
+    """Save or update a named test scenario (upsert by name)."""
+    try:
+        scenarios = load_scenarios()
+        scenarios = [s for s in scenarios if s.get("name") != body.name]
+        scenarios.append(body.model_dump())
+        _save_scenarios_to_disk(scenarios)
+        return success_response({"success": True, "message": f"Scenario '{body.name}' saved.", "scenarios": scenarios})
+    except Exception as e:
+        return error_response("save_scenario_error", str(e))
+
+
+@app.delete("/api/imposter5/scenarios/{name}")
+async def delete_scenario(name: str):
+    """Delete a saved scenario."""
+    try:
+        scenarios = [s for s in load_scenarios() if s.get("name") != name]
+        _save_scenarios_to_disk(scenarios)
+        return success_response({"success": True, "message": f"Scenario '{name}' deleted.", "scenarios": scenarios})
+    except Exception as e:
+        return error_response("delete_scenario_error", str(e))
 
 
 def sanitize_human_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -528,9 +637,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 # reads + notifications + glances) for a multi-minute session,
                 # record video like a LinkedIn run, then trigger the gauntlet's
                 # own scorer and capture the Blue evasion verdict.
-                logs.append(f"[{datetime.now().isoformat()}] Executing Blue Team gauntlet journey")
+                gauntlet_headless = body.headless if body.headless is not None else False
+                logs.append(f"[{datetime.now().isoformat()}] Executing Blue Team gauntlet journey (headless={gauntlet_headless})")
                 runner = get_browser_runner()
-                browser = runner.launch_browser(headless=False)
+                browser = runner.launch_browser(headless=gauntlet_headless)
 
                 from imposter5.loaders.cloak_runtime import (
                     apply_anti_fingerprint_init_script,
@@ -578,7 +688,7 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
 
                 try:
                     from imposter5.loaders.gauntlet_journey import run_gauntlet_journey
-                    duration_s = float(plan.get("gauntlet_duration_s") or 240.0)
+                    duration_s = float(body.gauntlet_duration_s or plan.get("gauntlet_duration_s") or 240.0)
                     gauntlet_summary = run_gauntlet_journey(
                         page, plan, recorder=recorder, duration_s=duration_s
                     )
@@ -603,24 +713,15 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
 
                 # Trigger the gauntlet's own telemetry submit + capture the Blue
                 # evasion verdict (the "much better stats" than a live run).
-                try:
-                    page.evaluate("window.lhhlSubmit && window.lhhlSubmit()")
-                    for _ in range(50):  # poll up to ~10s for the async score
-                        rep = page.evaluate("window.__lhhl_last_report || null")
-                        if rep:
-                            blue_report = rep
-                            break
-                        page.wait_for_timeout(200)
-                    if blue_report:
-                        logs.append(
-                            f"[{datetime.now().isoformat()}] Blue verdict: evasion_score="
-                            f"{blue_report.get('evasion_score')}% [{blue_report.get('verdict')}] "
-                            f"journey={blue_report.get('journey_verdict')}"
-                        )
-                    else:
-                        logs.append(f"[{datetime.now().isoformat()}] Blue verdict not returned (submit may have failed)")
-                except Exception as e:
-                    logs.append(f"[{datetime.now().isoformat()}] Warning: could not capture Blue verdict: {e}")
+                blue_report = _capture_blue_gauntlet_verdict(page)
+                if blue_report:
+                    logs.append(
+                        f"[{datetime.now().isoformat()}] Blue verdict: evasion_score="
+                        f"{blue_report.get('evasion_score')}% [{blue_report.get('verdict')}] "
+                        f"journey={blue_report.get('journey_verdict')}"
+                    )
+                else:
+                    logs.append(f"[{datetime.now().isoformat()}] Blue verdict not returned (submit may have failed)")
 
                 context.close()
                 browser.close()
@@ -724,7 +825,11 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                     video_capture_start_monotonic = time.monotonic()
                 else:
                     runner = get_browser_runner()
-                    browser = runner.launch_browser(headless=False)
+                    # Honor an explicit headless request (e.g. a prompt test kicked
+                    # off from the playback tool on a server-started backend with no
+                    # desktop session); default to visible for the product UI.
+                    prompt_headless = body.headless if body.headless is not None else False
+                    browser = runner.launch_browser(headless=prompt_headless)
                     context = browser.new_context(**ctx_kwargs)
                     try:
                         apply_anti_fingerprint_init_script(context)
@@ -844,6 +949,17 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                         logs.append(f"[{datetime.now().isoformat()}] Stopped mus.js recording. Captured {len(all_captured_frames)} frames")
                     except Exception as e:
                         logs.append(f"[{datetime.now().isoformat()}] Warning: could not stop mus recording: {e}")
+
+                # If this prompt run targeted the Blue gauntlet, capture its
+                # evasion verdict too so prompt-driven Blue tests show a score.
+                if "/gauntlet" in body.url.lower():
+                    blue_report = _capture_blue_gauntlet_verdict(page)
+                    if blue_report:
+                        logs.append(
+                            f"[{datetime.now().isoformat()}] Blue verdict (prompt run): "
+                            f"{blue_report.get('evasion_score')}% [{blue_report.get('verdict')}] "
+                            f"journey={blue_report.get('journey_verdict')}"
+                        )
 
                 # Persist refreshed LinkedIn session cookies before teardown (keeps
                 # the stored jar warm, like the scraper's session does).
@@ -985,6 +1101,10 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
             "provider": body.provider,
             "url": body.url,
             "persona": plan.get("persona", {}).get("name"),
+            # Blue gauntlet verdict + journey stats, when this was a /gauntlet run,
+            # so the playback tool can show the evasion score without re-running.
+            "blue_report": blue_report,
+            "gauntlet_summary": gauntlet_summary,
         },
     )
     if session_filename:

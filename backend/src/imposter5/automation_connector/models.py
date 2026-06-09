@@ -53,4 +53,10 @@ class Imposter5RunRequest(BaseModel):
     # When set, a green first run enrolls this task on a recurring schedule at
     # this cadence (minutes). None = run once, do not schedule.
     schedule_interval_minutes: int | None = Field(default=None, ge=5, le=1440)
+    # Blue Team gauntlet run knobs (used only on a /gauntlet target). Duration
+    # bounds the multi-minute journey; headless lets a server-started backend
+    # (no desktop session) still record + score a run — None keeps the default
+    # visible/over-the-shoulder behavior of the product UI.
+    gauntlet_duration_s: float | None = Field(default=None, ge=15, le=900)
+    headless: bool | None = None
 
