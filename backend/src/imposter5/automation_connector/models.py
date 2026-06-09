@@ -50,4 +50,7 @@ class Imposter5RunRequest(BaseModel):
     variations: dict[str, bool] | None = None
     human_config: dict[str, Any] | None = None
     run_fp_agent: bool = False
+    # When set, a green first run enrolls this task on a recurring schedule at
+    # this cadence (minutes). None = run once, do not schedule.
+    schedule_interval_minutes: int | None = Field(default=None, ge=5, le=1440)
 

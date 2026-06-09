@@ -139,8 +139,35 @@ interface NeedsAuthResponse {
   logs?: string[];
 }
 
+// Pre-execution feasibility / action review (feasibility.FeasibilityReport.to_payload()).
+interface FeasibilityStep {
+  step: string;
+  action: string;
+  feasible: boolean;
+  required: boolean;
+  reason: string;
+}
+interface FeasibilityReport {
+  status: 'ok' | 'infeasible' | 'skipped';
+  summary: string;
+  steps: FeasibilityStep[];
+  blocks_run: boolean;
+}
+
+// First-run verdict + scheduling state (scheduler.RunOutcome.to_payload()).
+interface RunOutcome {
+  verdict: 'green' | 'blocked';
+  scheduled: boolean;
+  interval_minutes: number | null;
+  next_run_at: string | null;
+  reason: string;
+}
+
 interface Imposter5Result {
   success: boolean;
+  status?: string;
+  feasibility?: FeasibilityReport | null;
+  run_outcome?: RunOutcome | null;
   plan: BehaviorPlan;
   goal?: {
     name: string;
@@ -181,6 +208,9 @@ export default function App() {
   const [persona, setPersona] = useState('curious_reader');
   const [completion, setCompletion] = useState('skim_visible_feed');
   const [runFpAgent, setRunFpAgent] = useState(true);
+  // Optional recurring schedule: a green first run enrolls the task at this
+  // cadence (minutes). Empty = run once, do not schedule.
+  const [scheduleMinutes, setScheduleMinutes] = useState('');
   const [personas, setPersonas] = useState<Persona[]>([]);
 
   // Techniques / Variations
@@ -394,6 +424,7 @@ export default function App() {
           variations,
           human_config: formattedConfig,
           run_fp_agent: runFpAgent,
+          schedule_interval_minutes: scheduleMinutes ? Number(scheduleMinutes) : undefined,
         }),
       });
 
@@ -852,6 +883,24 @@ export default function App() {
                 </label>
               </div>
 
+              <div className="flex items-center justify-between gap-2 px-1">
+                <label className="text-xs font-mono text-slate-400">
+                  Auto-repeat every
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={5}
+                    max={1440}
+                    placeholder="off"
+                    value={scheduleMinutes}
+                    onChange={(e) => setScheduleMinutes(e.target.value)}
+                    className="w-20 rounded border border-slate-800 bg-slate-950 px-2 py-1 text-xs font-mono text-slate-200 focus:ring-rose-500/30"
+                  />
+                  <span className="text-xs font-mono text-slate-500">min (green run only)</span>
+                </div>
+              </div>
+
               <button
                 type="button"
                 disabled={loading}
@@ -910,6 +959,60 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {/* Feasibility / action review */}
+            {result?.feasibility && result.feasibility.status === 'infeasible' && (
+              <div className="rounded-xl border border-amber-500/50 bg-amber-950/20 p-5 backdrop-blur-md">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-400 mb-2 flex items-center gap-2">
+                  Task Not Possible On This Page
+                </h3>
+                <p className="text-xs font-mono text-amber-200/80 mb-3">{result.feasibility.summary}</p>
+                <ul className="flex flex-col gap-1">
+                  {result.feasibility.steps
+                    .filter((s) => !s.feasible)
+                    .map((s, idx) => (
+                      <li key={idx} className="text-xs font-mono text-slate-300 flex gap-2">
+                        <span className="text-rose-400">✗</span>
+                        <span><span className="text-slate-100">{s.step}</span> — {s.reason}</span>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            )}
+
+            {/* First-run verdict + schedule state */}
+            {result?.run_outcome && (
+              <div
+                className={`rounded-xl border p-5 backdrop-blur-md ${
+                  result.run_outcome.verdict === 'green'
+                    ? 'border-emerald-500/50 bg-emerald-950/20'
+                    : 'border-rose-500/50 bg-rose-950/20'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">First-Run Verdict</h3>
+                  <span
+                    className={`text-xs font-mono font-bold uppercase ${
+                      result.run_outcome.verdict === 'green' ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {result.run_outcome.verdict === 'green' ? '● GREEN' : '● BLOCKED'}
+                  </span>
+                </div>
+                {result.run_outcome.scheduled ? (
+                  <p className="text-xs font-mono text-emerald-300/90 mt-2">
+                    Scheduled — repeats every {result.run_outcome.interval_minutes} min
+                    {result.run_outcome.next_run_at
+                      ? ` · next ${new Date(result.run_outcome.next_run_at).toLocaleString()}`
+                      : ''}
+                  </p>
+                ) : (
+                  <p className="text-xs font-mono text-slate-400 mt-2">
+                    {result.run_outcome.reason || 'Ran once; no recurring schedule armed.'}
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* Evasion & Verdict Results */}
             {result && (

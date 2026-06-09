@@ -698,6 +698,11 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         url=body.url,
         prompt=body.prompt,
         result={"success": True, "goal": goal_payload, "session_recording": session_rec},
+        schedule=(
+            {"interval_minutes": body.schedule_interval_minutes}
+            if body.schedule_interval_minutes
+            else None
+        ),
     )
 
     return success_response({
@@ -777,6 +782,57 @@ def api_login_delete_cookies(user_id: str, url: str):
         return success_response({"success": True, "message": "Cookies deleted successfully."})
     except Exception as e:
         return error_response("login_delete_cookies_error", str(e))
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler worker wiring (workstream D, armed by the integrator)
+# --------------------------------------------------------------------------- #
+def _scheduled_run(provider: str, url: str, prompt: str | None) -> dict:
+    """Re-launch a due scheduled task through the normal run path.
+
+    Returns the run-result shape the scheduler's verdict logic expects. The
+    re-run carries no schedule, so it finalizes verdict-only and never
+    re-enrolls itself — the worker owns rescheduling.
+    """
+    import json as _json
+    try:
+        resp = imposter5_run(Imposter5RunRequestWithMatrix(provider=provider, url=url, prompt=prompt))
+        body = _json.loads(resp.body)
+    except Exception as e:
+        return {"success": False, "reason": f"scheduled run failed: {e}"}
+    return {
+        "success": bool(body.get("success", False)),
+        "goal": body.get("goal"),
+        "session_recording": body.get("session_recording"),
+    }
+
+
+_scheduler_handle = None
+
+
+@app.on_event("startup")
+def _start_scheduler_worker() -> None:
+    """Register the run callable and start the recurring-task worker.
+
+    Disable with IMPOSTER5_DISABLE_SCHEDULER=1; tune cadence with
+    IMPOSTER5_SCHEDULER_POLL_SECONDS. Not started during plain ``import app``.
+    """
+    global _scheduler_handle
+    if os.environ.get("IMPOSTER5_DISABLE_SCHEDULER"):
+        return
+    from imposter5.automation_connector.scheduler import set_run_callable, start_worker
+    set_run_callable(_scheduled_run)
+    poll = float(os.environ.get("IMPOSTER5_SCHEDULER_POLL_SECONDS", "60"))
+    _scheduler_handle = start_worker(poll_seconds=poll)
+
+
+@app.on_event("shutdown")
+def _stop_scheduler_worker() -> None:
+    global _scheduler_handle
+    if _scheduler_handle is not None:
+        from imposter5.automation_connector.scheduler import stop_worker
+        stop_worker(_scheduler_handle)
+        _scheduler_handle = None
 
 
 # Serve static recorded movies
