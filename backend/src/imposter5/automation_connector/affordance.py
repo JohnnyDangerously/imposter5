@@ -40,6 +40,8 @@ CLICKABLE_ROLES = (
     "nav_home", "nav_notifications", "nav_messages", "nav_network", "nav_jobs",
     "search_input", "search_submit", "result_name", "profile_section",
     "profile_back", "feed_post", "feed_like",
+    # Engagement micro-affordances (hover author card, expand comments/reactions).
+    "post_author", "comments_toggle", "reactions_toggle",
 )
 FIELD_ROLES = ("feed_author", "feed_headline", "feed_text", "feed_actions_row")
 
@@ -109,6 +111,10 @@ GENERIC_ROLE_CSS: dict[str, tuple[str, ...]] = {
     "result_name": ("[role=listitem] a[href*='/in/']", "a[href*='/in/']", "[role=listitem] a[href]", "main li a[href]", "article a[href]"),
     "profile_section": ("section[aria-label]", "[data-section]", "main section", "section.artdeco-card"),
     "profile_back": ("button[aria-label*='back' i]", "a[aria-label*='back' i]", "[role=button][aria-label*='back' i]"),
+    # Resolved INSIDE a post element (the behavior scopes the lookup to the post).
+    "post_author": (".update-components-actor__title a", ".update-components-actor__meta a", "a[href*='/in/']", ".name"),
+    "comments_toggle": ("button[aria-label*='comment' i]", "[role=button][aria-label*='comment' i]"),
+    "reactions_toggle": ("button[aria-label*='reaction' i]", "button[aria-label*='see who reacted' i]", ".social-details-social-counts__count-value"),
 }
 GENERIC_FIELD_CSS: dict[str, tuple[str, ...]] = {
     "feed_author": (".update-components-actor__title", ".update-components-actor__name", ".name", "[class*='actor'] span[aria-hidden=true]"),
@@ -314,6 +320,9 @@ GAUNTLET_PROFILE = AutomationProfile(
         "result_name": RoleHints(css=(".g-result-name",)),
         "profile_section": RoleHints(css=(".g-profile-section",)),
         "profile_back": RoleHints(css=("#g-profile-back",)),
+        # The gauntlet author is a non-link .name; comments/reactions have no rich
+        # expansion targets here, so those gestures gracefully skip on the gauntlet.
+        "post_author": RoleHints(css=(".name",)),
     },
     campaign={"interest_terms": ["data engineer", "ml platform", "analytics lead", "staff data engineer", "head of data"]},
 )
@@ -338,6 +347,9 @@ LINKEDIN_PROFILE = AutomationProfile(
         "result_name": RoleHints(css=(".entity-result__title-text a", ".reusable-search__result-container a[href*='/in/']", "a[href*='/in/']")),
         "profile_section": RoleHints(css=("section.artdeco-card",)),
         "profile_back": RoleHints(css=("button[aria-label*='Back' i]",), text=("Back",)),
+        "post_author": RoleHints(css=(".update-components-actor__title a", ".update-components-actor__meta-link", "a.update-components-actor__image")),
+        "comments_toggle": RoleHints(css=("button[aria-label*='comment' i]",)),
+        "reactions_toggle": RoleHints(css=("button[aria-label*='reaction' i]", ".social-details-social-counts__count-value")),
     },
     campaign={},
 )

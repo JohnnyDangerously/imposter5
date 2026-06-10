@@ -482,14 +482,20 @@ def run_markov_simulation(
         traced = False
         try:
             if next_state == "idle":
-                # Reading: sometimes the reader traces/underlines a sentence with
-                # the cursor (an active engaged-reading gesture) rather than just
-                # holding still. The trace itself consumes part of the read time,
-                # so we shorten the trailing dwell when it fires.
-                if rng.random() < 0.35:
-                    traced = trace_text_selection(page, plan, recorder=recorder)
+                # Reading: an engaged reader usually does something with the cursor
+                # over the text rather than holding perfectly still. Most of the time
+                # that's following the line with the cursor (no selection); once in a
+                # while it's actually highlighting a sentence. The gesture consumes
+                # part of the read time, so the trailing dwell is shortened when it
+                # fires. (Holding the cursor stone-still through every read pause is
+                # itself a tell.)
+                roll = rng.random()
+                if roll < 0.46:
+                    traced = trace_text_selection(page, plan, recorder=recorder, select=False)
+                elif roll < 0.60:
+                    traced = trace_text_selection(page, plan, recorder=recorder, select=True)
                 if traced:
-                    update_status_ticker(page, "✍️ READING", "Tracing a sentence while reading...")
+                    update_status_ticker(page, "✍️ READING", "Following the line while reading...")
                     dwell_ms = int(dwell_ms * rng.uniform(0.2, 0.6))
                 else:
                     update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")

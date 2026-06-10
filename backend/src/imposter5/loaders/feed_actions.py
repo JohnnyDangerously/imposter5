@@ -32,6 +32,7 @@ from imposter5.automation_connector.interaction_primitives import (
     move_pointer,
     perceive_after_render,
     scroll_page,
+    trace_text_selection,
     type_text,
     update_status_ticker,
     wait_human,
@@ -131,7 +132,9 @@ def new_feed_session(
     summary: dict[str, Any] = {
         "feed_scan_bursts": 0, "markov_steps": 0, "posts_captured": 0, "peeks": 0,
         "notifications_visited": 0, "profiles_opened": 0, "searches": 0, "lookups": 0,
-        "likes": 0, "glances": 0, "content_actions": 0, "profile": profile.name,
+        "likes": 0, "glances": 0, "content_actions": 0,
+        "author_hovers": 0, "comments_expanded": 0, "reactions_expanded": 0,
+        "profile": profile.name,
     }
     pending: list[str] = []
     if isinstance(plan, dict) and isinstance(plan.get("lookup_people"), (list, tuple)):
@@ -522,12 +525,114 @@ def act_on_scored_posts(fs: FeedSession) -> bool:
         return False
 
 
+def hover_author_card(fs: FeedSession) -> bool:
+    """Hover a post author — the gesture that pops a profile hovercard — and dwell
+    on it as a human reading the card would."""
+    author_cands = fs.resolver.css_candidates("post_author")
+    for post, _box in _vp_handles(fs, "feed_post", limit=8):
+        target = _within(post, author_cands)
+        if target is None:
+            continue
+        try:
+            update_status_ticker(fs.page, "👤 PROFILE PEEK", "Hovering an author to read the card...")
+            hover_element(fs.page, target, fs.plan, recorder=fs.recorder)
+            wait_human(fs.page, fs.plan, 0, random.randint(700, 1700), recorder=fs.recorder)
+            if fs.recorder is not None:
+                try:
+                    fs.recorder.record("author_hovercard", metadata={})
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def expand_comments(fs: FeedSession) -> bool:
+    """Open a post's comments and read down them a little (and sometimes trace a
+    comment line). No real comments target -> graceful skip (e.g. the gauntlet)."""
+    comment_cands = fs.resolver.css_candidates("comments_toggle")
+    for post, _box in _vp_handles(fs, "feed_post", limit=8):
+        toggle = _within(post, comment_cands)
+        if toggle is None:
+            continue
+        try:
+            update_status_ticker(fs.page, "💬 COMMENTS", "Expanding comments...")
+            click_element(fs.page, toggle, fs.plan, recorder=fs.recorder)
+            wait_human(fs.page, fs.plan, 0, random.randint(500, 1100), recorder=fs.recorder)
+            for i in range(random.randint(1, 3)):
+                scroll_page(fs.page, fs.plan, pass_index=i, fallback_delta_y=random.randint(180, 360), recorder=fs.recorder)
+                wait_human(fs.page, fs.plan, i, random.randint(360, 900), recorder=fs.recorder)
+            if random.random() < 0.4:
+                trace_text_selection(fs.page, fs.plan, recorder=fs.recorder, select=False)
+            if fs.recorder is not None:
+                try:
+                    fs.recorder.record("comments_expand", metadata={})
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def expand_reactions(fs: FeedSession) -> bool:
+    """Open a post's reactions list, glance at who reacted, scroll it a little, then
+    dismiss. No reactions target -> graceful skip."""
+    react_cands = fs.resolver.css_candidates("reactions_toggle")
+    for post, _box in _vp_handles(fs, "feed_post", limit=8):
+        toggle = _within(post, react_cands)
+        if toggle is None:
+            continue
+        try:
+            update_status_ticker(fs.page, "👍 REACTIONS", "Checking who reacted...")
+            click_element(fs.page, toggle, fs.plan, recorder=fs.recorder)
+            wait_human(fs.page, fs.plan, 0, random.randint(600, 1300), recorder=fs.recorder)
+            for i in range(random.randint(1, 2)):
+                scroll_page(fs.page, fs.plan, pass_index=i, fallback_delta_y=random.randint(150, 320), recorder=fs.recorder)
+                wait_human(fs.page, fs.plan, i, random.randint(380, 820), recorder=fs.recorder)
+            try:
+                fs.page.keyboard.press("Escape")  # close the reactions dialog
+            except Exception:
+                pass
+            if fs.recorder is not None:
+                try:
+                    fs.recorder.record("reactions_expand", metadata={})
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _sprinkle_engagement(fs: FeedSession) -> None:
+    """Randomly sprinkle ONE richer engagement micro-behavior per scan cycle, so
+    sessions don't read as a flat scroll. Weighted so most cycles add nothing
+    extra (a human doesn't poke every post)."""
+    r = random.random()
+    if r < 0.20:
+        if hover_author_card(fs):
+            fs.summary["author_hovers"] = fs.summary.get("author_hovers", 0) + 1
+            fs.actions.append("author_hovercard")
+    elif r < 0.33:
+        if expand_comments(fs):
+            fs.summary["comments_expanded"] = fs.summary.get("comments_expanded", 0) + 1
+            fs.actions.append("comments_expand")
+    elif r < 0.42:
+        if expand_reactions(fs):
+            fs.summary["reactions_expanded"] = fs.summary.get("reactions_expanded", 0) + 1
+            fs.actions.append("reactions_expand")
+    # else: no extra engagement this cycle
+
+
 # =========================================================================== #
 # Composed units the Story executor calls per scene
 # =========================================================================== #
 def feed_scan_cycle(fs: FeedSession, *, steps: int | None = None) -> None:
     """One feed-scan scene: ambient Markov burst + capture everything that scrolled
-    past + hand to the scorer + content-driven attention + ambient peek/like."""
+    past + hand to the scorer + content-driven attention + sprinkled engagement
+    (peek / like / hover author card / expand comments / expand reactions)."""
     n_steps = steps if steps is not None else random.randint(3, 6)
     scan_feed_burst(fs, steps=n_steps)
     fs.summary["feed_scan_bursts"] += 1
@@ -539,10 +644,11 @@ def feed_scan_cycle(fs: FeedSession, *, steps: int | None = None) -> None:
 
     if random.random() < 0.5:
         act_on_scored_posts(fs)
-    if random.random() < 0.6 and peek_post_engagement(fs):
+    if random.random() < 0.5 and peek_post_engagement(fs):
         fs.summary["peeks"] += 1
         fs.actions.append("post_peek")
-    if random.random() < 0.22 and like_interesting_post(fs):
+    _sprinkle_engagement(fs)
+    if random.random() < 0.18 and like_interesting_post(fs):
         fs.summary["likes"] += 1
         fs.actions.append("interest_like")
 

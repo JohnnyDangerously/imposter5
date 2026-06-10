@@ -1880,15 +1880,21 @@ def trace_text_selection(
     plan: dict[str, Any] | None = None,
     *,
     recorder: SessionRecorder | None = None,
+    select: bool = True,
 ) -> bool:
-    """Trace/underline 1-3 sentences of a visible paragraph, as a reader does.
+    """Trace 1-3 lines of a visible paragraph with the cursor, as a reader does.
 
     Picks a visible, in-viewport text block, aims the cursor at the start of a
-    line, then presses and drags along the text (highlighting it) for one to
-    three lines before releasing. The drag is emitted point-by-point so the
-    baked cursor visibly traces the sentence, and intermediate dwells vary. This
-    is a genuine selection gesture (real ``mousedown``→``mousemove``→``mouseup``
-    over text), which reads as engaged reading rather than aimless cursoring.
+    line, then moves along the text point-by-point for one to three lines so the
+    baked cursor visibly follows the sentence with reader-paced dwells.
+
+    ``select`` controls whether this is a *highlight* or a bare *reading trace*:
+    - ``select=True`` (default): a genuine selection gesture — press, drag over
+      the text, release (real ``mousedown``→``mousemove``→``mouseup``). This is
+      the occasional "highlight a sentence" behavior.
+    - ``select=False``: the same path WITHOUT the button press, i.e. the common
+      "move my eyes/cursor across the line while reading" gesture with no
+      selection. Most reading traces should be this.
 
     Returns True if a trace was performed, False if no suitable text was found.
     """
@@ -1933,7 +1939,8 @@ def trace_text_selection(
 
         # Aim the cursor at the sentence start with a normal ballistic move.
         move_pointer(page, start_x, start_y, plan, recorder=recorder)
-        page.mouse.down()
+        if select:
+            page.mouse.down()
         steps = rng.randint(4, 7)
         for i in range(1, steps + 1):
             f = i / steps
@@ -1943,18 +1950,20 @@ def trace_text_selection(
             page.mouse.move(ix, iy)
             _drive_visible_cursor(page, ix, iy)
             page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=34.0, cv=0.4, lo=14.0, hi=90.0)))
-        page.mouse.up()
+        if select:
+            page.mouse.up()
         _set_cursor(page, end_x, end_y)
         if recorder is not None:
             recorder.record(
-                "highlight",
+                "highlight" if select else "reading_trace",
                 metadata={"sentences": n_lines, "x": round(end_x), "y": round(end_y)},
             )
         return True
     except Exception:
         logger.debug("[interaction_primitives] text-selection trace failed", exc_info=True)
-        try:
-            page.mouse.up()
-        except Exception:
-            pass
+        if select:
+            try:
+                page.mouse.up()
+            except Exception:
+                pass
         return False
