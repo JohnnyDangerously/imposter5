@@ -34,6 +34,7 @@ from imposter5.automation_connector.interaction_primitives import (
     wait_human,
 )
 from imposter5.automation_connector.session_recorder import SessionRecorder
+from imposter5.loaders.content_scorer import ContentScorer
 from imposter5.loaders.linkedin_feed_scraper import FEED_SCAN_MATRIX
 from imposter5.loaders.markov_simulator import run_markov_simulation
 
@@ -160,6 +161,7 @@ def _capture_visible_posts(
     recorder: SessionRecorder | None,
     captured: set[str],
     authors: list[str] | None = None,
+    sink: list[dict[str, Any]] | None = None,
 ) -> int:
     """Capture every feed post currently on screen — the actual data-gathering job.
 
@@ -209,6 +211,8 @@ def _capture_visible_posts(
             author = (p.get("author") or "").strip() if isinstance(p, dict) else ""
             if author:
                 authors.append(author)
+        if sink is not None and isinstance(p, dict):
+            sink.append(p)
         if recorder is not None:
             try:
                 recorder.record(
@@ -465,6 +469,73 @@ def _like_interesting_post(
     return False
 
 
+def _act_on_scored_posts(
+    page: Any,
+    plan: dict[str, Any] | None,
+    recorder: SessionRecorder | None,
+    scorer: ContentScorer,
+    summary: dict[str, Any],
+    actions: list[str],
+) -> bool:
+    """Let the content score drive attention: if a sufficiently interesting post
+    is on screen, react to it the way the scorer says (open the author on a
+    "click", linger/trace on a "dwell"/"highlight"). This is what makes dwell and
+    clicks *caused by content* instead of uniform — the whole point of scoring."""
+    try:
+        onscreen = page.evaluate(
+            """() => {
+                const vh = innerHeight || 800;
+                const out = [];
+                document.querySelectorAll('.g-feed-post').forEach(p => {
+                    const r = p.getBoundingClientRect();
+                    if (r.top < 40 || r.bottom > vh - 20) return;  // fully on screen
+                    const nm = p.querySelector('.name');
+                    out.push({ id: p.getAttribute('data-post-id'), author: nm ? (nm.innerText || '').trim() : '' });
+                });
+                return out;
+            }"""
+        )
+    except Exception:
+        return False
+    best: tuple[dict[str, Any], dict[str, Any]] | None = None
+    for p in onscreen or []:
+        s = scorer.score_for(p.get("id")) if isinstance(p, dict) else None
+        if s and (best is None or s.get("interest", 0) > best[1].get("interest", 0)):
+            best = (p, s)
+    # Threshold at 0.5 so "dwell"-class interest also reacts; below that is skip.
+    if not best or best[1].get("interest", 0) < 0.5:
+        return False
+    post, score = best
+    action = score.get("action", "dwell")
+    summary["content_actions"] = summary.get("content_actions", 0) + 1
+    if recorder is not None:
+        try:
+            recorder.record(
+                "content_action",
+                metadata={"post_id": post.get("id"), "interest": score.get("interest"),
+                          "action": action, "why": score.get("why", "")},
+            )
+        except Exception:
+            pass
+    try:
+        if action == "click" and post.get("author"):
+            if _lookup_person(page, plan, recorder, str(post["author"])):
+                summary["profiles_opened"] += 1
+                summary["lookups"] += 1
+                actions.append(f"content_open:{post['author']}")
+                return True
+        # dwell / highlight: linger on this specific post and trace its text.
+        el = page.query_selector(f'[data-post-id="{post.get("id")}"] {FEED_TEXT_SELECTOR}')
+        if el is not None:
+            hover_element(page, el, plan, recorder=recorder)
+            wait_human(page, plan, 0, random.randint(500, 1200), recorder=recorder)
+        actions.append(f"content_{action}:{score.get('interest')}")
+        return True
+    except Exception:
+        logger.debug("[gauntlet_journey] content action failed", exc_info=True)
+        return False
+
+
 def run_gauntlet_journey(
     page: Any,
     behavior_plan: dict[str, Any] | None = None,
@@ -501,6 +572,14 @@ def run_gauntlet_journey(
     }
     captured_post_ids: set[str] = set()
     captured_authors: list[str] = []
+    # Content scorer: turns the captured feed text into selective attention. The
+    # LLM backend runs in a background thread (set IMPOSTER5_CONTENT_EVAL=llm);
+    # the default heuristic backend scores instantly in-process.
+    persona = None
+    if isinstance(behavior_plan, dict):
+        persona = behavior_plan.get("persona_description") or behavior_plan.get("persona")
+    scorer = ContentScorer(persona)
+    summary["content_actions"] = 0
 
     # The feed view just rendered: pay a floored human perceive latency first
     # (the gauntlet flags sub-90ms reactions as a tell).
@@ -567,7 +646,11 @@ def run_gauntlet_journey(
                 markov_state = _scan_feed_burst(page, behavior_plan, recorder, markov_state, steps=ms)
                 summary["feed_scan_bursts"] += 1
                 summary["markov_steps"] += ms
-                summary["posts_captured"] += _capture_visible_posts(page, recorder, captured_post_ids, captured_authors)
+                lb_posts: list[dict[str, Any]] = []
+                summary["posts_captured"] += _capture_visible_posts(
+                    page, recorder, captured_post_ids, captured_authors, sink=lb_posts
+                )
+                scorer.submit(lb_posts)
             actions.append(f"long_browse:{n_cycles}")
         return markov_state
 
@@ -591,10 +674,18 @@ def run_gauntlet_journey(
         summary["feed_scan_bursts"] += 1
         summary["markov_steps"] += steps
 
-        # Capture everything that just scrolled past — the actual data job.
+        # Capture everything that just scrolled past — the actual data job — and
+        # hand the new posts to the scorer (instant heuristic, or queued for the
+        # background LLM pass).
+        new_posts: list[dict[str, Any]] = []
         summary["posts_captured"] += _capture_visible_posts(
-            page, recorder, captured_post_ids, captured_authors
+            page, recorder, captured_post_ids, captured_authors, sink=new_posts
         )
+        scorer.submit(new_posts)
+
+        # Content-driven attention: react to a genuinely interesting on-screen post.
+        if random.random() < 0.5 and _act_on_scored_posts(page, behavior_plan, recorder, scorer, summary, actions):
+            pass
 
         # Ambient variety: sometimes peek at a post's comments/reactions, sometimes
         # like a relevant one. These are independent so the rhythm stays irregular.
@@ -623,6 +714,7 @@ def run_gauntlet_journey(
         cycles_per_excursion = random.randint(1, 2) if queued_excursions else random.randint(4, 6)
 
     summary["queued_remaining"] = len(queued_excursions)
+    summary["content_eval"] = scorer.stats()
     summary["duration_s"] = round(time.monotonic() - start, 1)
     if recorder is not None:
         try:
