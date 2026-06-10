@@ -1,18 +1,17 @@
 """Feed-native human action primitives — the proven, Blue-validated behaviors that
-make a feed-browsing session look human, factored out of the old
-``gauntlet_journey`` orchestration so the Story engine can compose them.
+make a feed-browsing session look human.
 
 These are the *physical behaviors* only (scan a feed burst, capture what scrolled
 past, peek at engagement, like a relevant post, check notifications, glance at a
 secondary surface, search/open a profile, look a person up). They own NO session
-arc and NO cross-session variety — that is the Story compiler/executor's job now.
-Every move/scroll/click/type/dwell still goes through the shared humanized motor
-primitives and the semi-Markov engine, so the behavioral surface the Blue detector
-sees is unchanged from the version that scored ``HUMAN_EVADED``.
+arc and NO cross-session variety — that is the Story compiler/executor's job.
 
-Selectors are centralized as module constants (the gauntlet DOM contract). LinkedIn
-portability is a later concern: a site profile can supply its own selector set
-without touching the behavior logic here.
+Affordances are resolved through a per-site Red Team Automation profile via the
+``RoleResolver`` cascade (profile CSS -> semantic -> text/ARIA -> vision), so the
+SAME behaviors run on the gauntlet, LinkedIn, or any conformant site without
+hard-coding one site's element ids here. Every move/scroll/click/type/dwell still
+goes through the shared humanized motor primitives, so the behavioral surface the
+Blue detector sees is unchanged from the version that scored HUMAN_EVADED.
 """
 from __future__ import annotations
 
@@ -22,6 +21,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from imposter5.automation_connector.affordance import (
+    AutomationProfile,
+    RoleResolver,
+    resolve_profile,
+)
 from imposter5.automation_connector.interaction_primitives import (
     click_element,
     hover_element,
@@ -39,32 +43,6 @@ from imposter5.loaders.markov_simulator import run_markov_simulation
 
 logger = logging.getLogger(__name__)
 
-# --- Gauntlet DOM contract (docs/gauntlet-layout-v1.md) --------------------- #
-FEED_POST_SELECTOR = "article.g-feed-post, .g-feed-post"
-FEED_LIKE_SELECTOR = ".g-feed-like"
-FEED_TEXT_SELECTOR = ".text"
-FEED_ACTIONS_SELECTOR = ".actions"
-FEED_NAME_SELECTOR = ".name"
-NAV = {
-    "home": "#g-nav-home",
-    "notifications": "#g-nav-notifications",
-    "messages": "#g-nav-messages",
-    "network": "#g-nav-network",
-    "jobs": "#g-nav-jobs",
-    "me": "#g-nav-me",
-}
-SEARCH_INPUT = "#g-search-input"
-SEARCH_GO = "#g-search-go"
-RESULT_NAME_SELECTOR = ".g-result-name"
-RESULT_CARD_SELECTOR = ".g-result-card"
-PROFILE_BACK = "#g-profile-back"
-PROFILE_SECTION_SELECTOR = ".g-profile-section"
-NOTIF_PANEL = "#g-view-notifications"
-
-# Where the ambient Markov scan is allowed to aim hovers/moves — real feed
-# content, never arbitrary viewport coordinates.
-_SCAN_TARGETS: tuple[str, ...] = (FEED_POST_SELECTOR,)
-
 _DEFAULT_GAUNTLET_INTERESTS: tuple[str, ...] = (
     "data engineer",
     "ml platform",
@@ -74,8 +52,10 @@ _DEFAULT_GAUNTLET_INTERESTS: tuple[str, ...] = (
 )
 
 
-def resolve_interest_terms(plan: dict[str, Any] | None) -> list[str]:
-    """ICP / interest terms from the plan, else a gauntlet-appropriate default."""
+def resolve_interest_terms(
+    plan: dict[str, Any] | None, profile: AutomationProfile | None = None
+) -> list[str]:
+    """ICP / interest terms from the plan, then the profile campaign, else a default."""
     terms: list[str] = []
     if isinstance(plan, dict):
         variations = plan.get("variations") if isinstance(plan.get("variations"), dict) else {}
@@ -89,31 +69,13 @@ def resolve_interest_terms(plan: dict[str, Any] | None) -> list[str]:
                 terms.extend(t.strip() for t in src.split(",") if t.strip())
             elif isinstance(src, (list, tuple)):
                 terms.extend(str(t).strip() for t in src if str(t).strip())
+    if not terms and profile is not None:
+        ct = profile.campaign.get("interest_terms")
+        if isinstance(ct, (list, tuple)):
+            terms.extend(str(t).strip() for t in ct if str(t).strip())
     if not terms:
         terms = list(_DEFAULT_GAUNTLET_INTERESTS)
     return terms
-
-
-def _visible_handles(page: Any, selector: str, *, limit: int = 25) -> list[tuple[Any, dict]]:
-    """Visible, in-viewport (handle, box) pairs for a selector (best-effort)."""
-    out: list[tuple[Any, dict]] = []
-    try:
-        handles = page.query_selector_all(selector) or []
-    except Exception:
-        return out
-    for h in handles[: limit * 3]:
-        try:
-            box = h.bounding_box()
-        except Exception:
-            box = None
-        if not box or box["width"] < 30 or box["height"] < 16:
-            continue
-        if box["y"] < -120 or box["y"] > 1200:
-            continue
-        out.append((h, box))
-        if len(out) >= limit:
-            break
-    return out
 
 
 # =========================================================================== #
@@ -121,22 +83,16 @@ def _visible_handles(page: Any, selector: str, *, limit: int = 25) -> list[tuple
 # =========================================================================== #
 @dataclass
 class FeedSession:
-    """Per-session feed state threaded through the scan cycle + excursions.
-
-    Holds the running harvest (captured ids/authors), the content scorer, the
-    interest vocabulary, and the live ``summary`` counters. The Story executor
-    owns one of these for the duration of a feed plan.
-    """
+    """Per-session feed state threaded through the scan cycle + excursions."""
 
     page: Any
     plan: dict[str, Any] | None
     recorder: SessionRecorder | None
+    resolver: RoleResolver
     interest_terms: list[str]
     scorer: ContentScorer
     captured_post_ids: set[str] = field(default_factory=set)
     captured_authors: list[str] = field(default_factory=list)
-    # App-supplied specific people to look up (the "tree of value"); drained first
-    # by tangent_lookup so a purposeful arc actually checks the requested names.
     pending_lookups: list[str] = field(default_factory=list)
     markov_state: dict[str, Any] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
@@ -156,64 +112,88 @@ def new_feed_session(
     *,
     duration_s: float = 240.0,
     interest_terms: list[str] | None = None,
+    profile: AutomationProfile | None = None,
 ) -> FeedSession:
+    if profile is None:
+        url = None
+        if isinstance(plan, dict):
+            url = plan.get("url") or plan.get("start_url")
+        if not url:
+            try:
+                url = page.url
+            except Exception:
+                url = None
+        profile = resolve_profile(plan, url=url)
+    resolver = RoleResolver(page, profile)
     persona = None
     if isinstance(plan, dict):
         persona = plan.get("persona_description") or plan.get("persona")
     summary: dict[str, Any] = {
-        "feed_scan_bursts": 0,
-        "markov_steps": 0,
-        "posts_captured": 0,
-        "peeks": 0,
-        "notifications_visited": 0,
-        "profiles_opened": 0,
-        "searches": 0,
-        "lookups": 0,
-        "likes": 0,
-        "glances": 0,
-        "content_actions": 0,
+        "feed_scan_bursts": 0, "markov_steps": 0, "posts_captured": 0, "peeks": 0,
+        "notifications_visited": 0, "profiles_opened": 0, "searches": 0, "lookups": 0,
+        "likes": 0, "glances": 0, "content_actions": 0, "profile": profile.name,
     }
     pending: list[str] = []
-    if isinstance(plan, dict):
-        people = plan.get("lookup_people")
-        if isinstance(people, (list, tuple)):
-            pending = [str(p).strip() for p in people if str(p).strip()]
+    if isinstance(plan, dict) and isinstance(plan.get("lookup_people"), (list, tuple)):
+        pending = [str(p).strip() for p in plan["lookup_people"] if str(p).strip()]
     fs = FeedSession(
-        page=page,
-        plan=plan,
-        recorder=recorder,
-        interest_terms=interest_terms or resolve_interest_terms(plan),
-        scorer=ContentScorer(persona),
-        pending_lookups=pending,
-        summary=summary,
-        start_monotonic=time.monotonic(),
-        duration_s=duration_s,
+        page=page, plan=plan, recorder=recorder, resolver=resolver,
+        interest_terms=interest_terms or resolve_interest_terms(plan, profile),
+        scorer=ContentScorer(persona), pending_lookups=pending, summary=summary,
+        start_monotonic=time.monotonic(), duration_s=duration_s,
     )
     summary["interest_terms"] = fs.interest_terms
     return fs
 
 
+# --- viewport-scoped element helpers ---------------------------------------- #
+def _vp_handles(fs: FeedSession, role: str, *, limit: int = 25) -> list[tuple[Any, dict]]:
+    """Usable, in-viewport (locator, box) pairs for a role (best-effort)."""
+    out: list[tuple[Any, dict]] = []
+    for loc in fs.resolver.all(role, limit=limit * 3):
+        try:
+            box = loc.bounding_box()
+        except Exception:
+            box = None
+        if not box or box["width"] < 30 or box["height"] < 16:
+            continue
+        if box["y"] < -120 or box["y"] > 1200:
+            continue
+        out.append((loc, box))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _within(post: Any, candidates: list[str]) -> Any | None:
+    """First usable sub-element of ``post`` matching one of the candidate selectors."""
+    for sub in candidates:
+        try:
+            t = post.locator(sub).first
+            if t.count() > 0 and t.is_visible():
+                return t
+        except Exception:
+            continue
+    return None
+
+
 # =========================================================================== #
-# Low-level behaviors (unchanged from the validated gauntlet primitives)
+# Low-level behaviors
 # =========================================================================== #
 def scan_feed_burst(fs: FeedSession, *, steps: int) -> None:
-    """One semi-Markov ambient scan burst over the feed, threading the walk state
-    forward so the whole session reads as one continuous scan."""
+    """One semi-Markov ambient scan burst over the feed, aiming hovers/moves at the
+    resolved feed-post container (never arbitrary viewport coordinates)."""
     burst_plan = dict(fs.plan or {})
     burst_plan["markov_matrix"] = FEED_SCAN_MATRIX
+    scan_sel = fs.resolver.selector_for("feed_post") or "article"
+    targets = (scan_sel,)
     state = fs.markov_state
     try:
         fs.markov_state = run_markov_simulation(
-            fs.page,
-            burst_plan,
-            recorder=fs.recorder,
-            max_steps=steps,
-            initial_state=state.get("final_state"),
-            initial_intent=state.get("final_intent"),
-            intent_steps_left=state.get("intent_steps_left"),
-            suppress_intro_wait=bool(state),
-            mousemove_targets=_SCAN_TARGETS,
-            hover_targets=_SCAN_TARGETS,
+            fs.page, burst_plan, recorder=fs.recorder, max_steps=steps,
+            initial_state=state.get("final_state"), initial_intent=state.get("final_intent"),
+            intent_steps_left=state.get("intent_steps_left"), suppress_intro_wait=bool(state),
+            mousemove_targets=targets, hover_targets=targets,
         )
     except Exception:
         logger.debug("[feed_actions] feed scan burst failed", exc_info=True)
@@ -226,54 +206,53 @@ def scan_feed_burst(fs: FeedSession, *, steps: int) -> None:
 def capture_visible_posts(fs: FeedSession, sink: list[dict[str, Any]] | None = None) -> int:
     """Capture every feed post currently on screen — the actual data-gathering job.
 
-    A pure DOM read (no input events), so capture keeps pace with the scroll
-    without changing the behavioral surface the Blue detector sees.
+    A pure DOM read (no input events), parameterized by the site profile's post +
+    field selectors, so it works on any site without changing the behavioral surface.
     """
-    page, recorder, captured = fs.page, fs.recorder, fs.captured_post_ids
+    post_sel = fs.resolver.selector_for("feed_post") or "article"
+    sels = {
+        "post": post_sel,
+        "author": fs.resolver.field_selector("feed_author") or ".name",
+        "headline": fs.resolver.field_selector("feed_headline") or ".meta",
+        "text": fs.resolver.field_selector("feed_text") or ".text",
+    }
     try:
-        posts = page.evaluate(
-            """() => {
+        posts = fs.page.evaluate(
+            """(sels) => {
                 const vh = innerHeight || 800;
                 const out = [];
-                document.querySelectorAll('.g-feed-post').forEach(p => {
+                document.querySelectorAll(sels.post).forEach(p => {
                     const r = p.getBoundingClientRect();
                     if (r.top > vh - 40) return;
-                    const pick = (s) => { const e = p.querySelector(s); return e ? (e.innerText || '').trim() : ''; };
-                    out.push({
-                        id: p.getAttribute('data-post-id'),
-                        author: pick('.name'),
-                        headline: pick('.meta'),
-                        text: pick('.text').slice(0, 200),
-                    });
+                    const pick = (s) => { try { const e = s && p.querySelector(s); return e ? (e.innerText || '').trim() : ''; } catch (_) { return ''; } };
+                    const author = pick(sels.author), text = pick(sels.text);
+                    const id = p.getAttribute('data-post-id') || p.getAttribute('data-urn')
+                        || p.getAttribute('data-id') || ('h:' + (author + '|' + text).slice(0, 48));
+                    out.push({ id: id, author: author, headline: pick(sels.headline), text: text.slice(0, 200) });
                 });
                 return out;
-            }"""
+            }""",
+            sels,
         )
     except Exception:
         return 0
     n = 0
     for p in posts or []:
         pid = p.get("id") if isinstance(p, dict) else None
-        if not pid or pid in captured:
+        if not pid or pid in fs.captured_post_ids:
             continue
-        captured.add(pid)
+        fs.captured_post_ids.add(pid)
         n += 1
         author = (p.get("author") or "").strip() if isinstance(p, dict) else ""
         if author:
             fs.captured_authors.append(author)
         if sink is not None and isinstance(p, dict):
             sink.append(p)
-        if recorder is not None:
+        if fs.recorder is not None:
             try:
-                recorder.record(
-                    "feed_capture",
-                    metadata={
-                        "post_id": pid,
-                        "author": p.get("author", ""),
-                        "headline": p.get("headline", ""),
-                        "snippet": (p.get("text") or "")[:120],
-                    },
-                )
+                fs.recorder.record("feed_capture", metadata={
+                    "post_id": pid, "author": p.get("author", ""),
+                    "headline": p.get("headline", ""), "snippet": (p.get("text") or "")[:120]})
             except Exception:
                 pass
     return n
@@ -282,29 +261,24 @@ def capture_visible_posts(fs: FeedSession, sink: list[dict[str, Any]] | None = N
 def peek_post_engagement(fs: FeedSession) -> bool:
     """Glance at a post's comments / reactions — the ambient 'looking at comments'
     micro-behavior that breaks up a pure scroll."""
-    page, plan, recorder = fs.page, fs.plan, fs.recorder
-    posts = _visible_handles(page, FEED_POST_SELECTOR, limit=8)
+    posts = _vp_handles(fs, "feed_post", limit=8)
     if not posts:
         return False
     post, _box = random.choice(posts)
     target = None
-    for sel in (FEED_ACTIONS_SELECTOR, FEED_NAME_SELECTOR, FEED_TEXT_SELECTOR):
-        try:
-            t = post.query_selector(sel)
-        except Exception:
-            t = None
-        if t is not None:
-            target = t
+    for role in ("feed_actions_row", "feed_author", "feed_text"):
+        target = _within(post, fs.resolver.field_candidates(role))
+        if target is not None:
             break
     if target is None:
         return False
     try:
-        update_status_ticker(page, "💬 PEEKING", "Glancing at comments / reactions...")
-        hover_element(page, target, plan, recorder=recorder)
-        wait_human(page, plan, 0, random.randint(220, 620), recorder=recorder)
-        if recorder is not None:
+        update_status_ticker(fs.page, "💬 PEEKING", "Glancing at comments / reactions...")
+        hover_element(fs.page, target, fs.plan, recorder=fs.recorder)
+        wait_human(fs.page, fs.plan, 0, random.randint(220, 620), recorder=fs.recorder)
+        if fs.recorder is not None:
             try:
-                recorder.record("post_peek", metadata={})
+                fs.recorder.record("post_peek", metadata={})
             except Exception:
                 pass
         return True
@@ -314,8 +288,11 @@ def peek_post_engagement(fs: FeedSession) -> bool:
 
 
 def return_home(fs: FeedSession) -> None:
+    el = fs.resolver.one("nav_home")
+    if el is None:
+        return
     try:
-        click_element(fs.page, NAV["home"], fs.plan, recorder=fs.recorder)
+        click_element(fs.page, el, fs.plan, recorder=fs.recorder)
         perceive_after_render(fs.page, fs.plan, recorder=fs.recorder)
     except Exception:
         logger.debug("[feed_actions] return-home failed", exc_info=True)
@@ -323,17 +300,19 @@ def return_home(fs: FeedSession) -> None:
 
 def visit_notifications(fs: FeedSession) -> bool:
     """Open notifications, read down the list, then back to the feed."""
-    page, plan, recorder = fs.page, fs.plan, fs.recorder
+    el = fs.resolver.one("nav_notifications")
+    if el is None:
+        return False
     try:
-        update_status_ticker(page, "🔔 NOTIFICATIONS", "Checking notifications...")
-        click_element(page, NAV["notifications"], plan, recorder=recorder)
-        perceive_after_render(page, plan, recorder=recorder)
+        update_status_ticker(fs.page, "🔔 NOTIFICATIONS", "Checking notifications...")
+        click_element(fs.page, el, fs.plan, recorder=fs.recorder)
+        perceive_after_render(fs.page, fs.plan, recorder=fs.recorder)
         for i in range(random.randint(2, 4)):
-            scroll_page(page, plan, pass_index=i, fallback_delta_y=random.randint(420, 700), recorder=recorder)
-            wait_human(page, plan, i, random.randint(280, 720), recorder=recorder)
-        if recorder is not None:
+            scroll_page(fs.page, fs.plan, pass_index=i, fallback_delta_y=random.randint(420, 700), recorder=fs.recorder)
+            wait_human(fs.page, fs.plan, i, random.randint(280, 720), recorder=fs.recorder)
+        if fs.recorder is not None:
             try:
-                recorder.record("notifications_visit", metadata={})
+                fs.recorder.record("notifications_visit", metadata={})
             except Exception:
                 pass
         return_home(fs)
@@ -344,19 +323,22 @@ def visit_notifications(fs: FeedSession) -> bool:
         return False
 
 
+_GLANCE_ROLE = {"network": "nav_network", "jobs": "nav_jobs", "messages": "nav_messages"}
+
+
 def glance(fs: FeedSession, surface: str) -> bool:
     """Quick human glance at a secondary nav surface (network/jobs/messages)."""
-    page, plan, recorder = fs.page, fs.plan, fs.recorder
-    sel = NAV.get(surface)
-    if not sel:
+    role = _GLANCE_ROLE.get(surface)
+    el = fs.resolver.one(role) if role else None
+    if el is None:
         return False
     try:
-        update_status_ticker(page, "🧭 BROWSING", f"Glancing at {surface}...")
-        click_element(page, sel, plan, recorder=recorder)
-        perceive_after_render(page, plan, recorder=recorder)
+        update_status_ticker(fs.page, "🧭 BROWSING", f"Glancing at {surface}...")
+        click_element(fs.page, el, fs.plan, recorder=fs.recorder)
+        perceive_after_render(fs.page, fs.plan, recorder=fs.recorder)
         for i in range(random.randint(1, 2)):
-            scroll_page(page, plan, pass_index=i, fallback_delta_y=random.randint(360, 560), recorder=recorder)
-            wait_human(page, plan, i, random.randint(240, 560), recorder=recorder)
+            scroll_page(fs.page, fs.plan, pass_index=i, fallback_delta_y=random.randint(360, 560), recorder=fs.recorder)
+            wait_human(fs.page, fs.plan, i, random.randint(240, 560), recorder=fs.recorder)
         return_home(fs)
         return True
     except Exception:
@@ -369,20 +351,30 @@ def search_and_open_profile(fs: FeedSession, term: str, *, read_sections: bool =
     """Search an interest term, scan results, open an interesting profile, read a
     few sections, then back home."""
     page, plan, recorder = fs.page, fs.plan, fs.recorder
+    si = fs.resolver.one("search_input")
+    if si is None:
+        return False
     try:
         update_status_ticker(page, "🔎 SEARCHING", f"Searching for '{term}'...")
-        click_element(page, SEARCH_INPUT, plan, recorder=recorder)
+        click_element(page, si, plan, recorder=recorder)
         wait_human(page, plan, 0, random.randint(160, 380), recorder=recorder)
-        type_text(page, SEARCH_INPUT, term, plan, recorder=recorder)
+        type_text(page, si, term, plan, recorder=recorder)
         wait_human(page, plan, 0, random.randint(180, 420), recorder=recorder)
-        click_element(page, SEARCH_GO, plan, recorder=recorder)
+        sg = fs.resolver.one("search_submit")
+        if sg is not None:
+            click_element(page, sg, plan, recorder=recorder)
+        else:
+            try:
+                si.press("Enter")
+            except Exception:
+                pass
         perceive_after_render(page, plan, recorder=recorder)
 
         for i in range(random.randint(2, 4)):
             scroll_page(page, plan, pass_index=i, fallback_delta_y=random.randint(420, 640), recorder=recorder)
             wait_human(page, plan, i, random.randint(280, 640), recorder=recorder)
 
-        names = _visible_handles(page, RESULT_NAME_SELECTOR, limit=12)
+        names = _vp_handles(fs, "result_name", limit=12)
         if not names:
             return_home(fs)
             return False
@@ -399,7 +391,7 @@ def search_and_open_profile(fs: FeedSession, term: str, *, read_sections: bool =
             for i in range(random.randint(2, 4)):
                 scroll_page(page, plan, pass_index=i, fallback_delta_y=random.randint(360, 620), recorder=recorder)
                 wait_human(page, plan, i, random.randint(320, 760), recorder=recorder)
-                for h, box in _visible_handles(page, PROFILE_SECTION_SELECTOR, limit=1):
+                for h, box in _vp_handles(fs, "profile_section", limit=1):
                     cx = box["x"] + box["width"] * random.uniform(0.25, 0.6)
                     cy = box["y"] + box["height"] * random.uniform(0.3, 0.6)
                     try:
@@ -407,11 +399,13 @@ def search_and_open_profile(fs: FeedSession, term: str, *, read_sections: bool =
                     except Exception:
                         pass
 
-        try:
-            click_element(page, PROFILE_BACK, plan, recorder=recorder)
-            perceive_after_render(page, plan, recorder=recorder)
-        except Exception:
-            pass
+        pb = fs.resolver.one("profile_back")
+        if pb is not None:
+            try:
+                click_element(page, pb, plan, recorder=recorder)
+                perceive_after_render(page, plan, recorder=recorder)
+            except Exception:
+                pass
         return_home(fs)
         return True
     except Exception:
@@ -427,25 +421,28 @@ def lookup_person(fs: FeedSession, name: str) -> bool:
 
 def like_interesting_post(fs: FeedSession) -> bool:
     """Lightweight interest signal: like a visible feed post matching an interest term."""
-    page, plan, recorder = fs.page, fs.plan, fs.recorder
     low_terms = [t.lower() for t in fs.interest_terms]
-    for post, _box in _visible_handles(page, FEED_POST_SELECTOR, limit=10):
-        try:
-            text_el = post.query_selector(FEED_TEXT_SELECTOR)
-            txt = (text_el.inner_text() if text_el else "") or ""
-        except Exception:
-            txt = ""
+    text_cands = fs.resolver.field_candidates("feed_text")
+    like_cands = fs.resolver.css_candidates("feed_like")
+    for post, _box in _vp_handles(fs, "feed_post", limit=10):
+        txt = ""
+        te = _within(post, text_cands)
+        if te is not None:
+            try:
+                txt = (te.inner_text() or "")
+            except Exception:
+                txt = ""
         low = txt.lower()
         if not any(t and t in low for t in low_terms):
             continue
+        like = _within(post, like_cands)
+        if like is None:
+            continue
         try:
-            like = post.query_selector(FEED_LIKE_SELECTOR)
-            if not like:
-                continue
-            click_element(page, like, plan, recorder=recorder)
-            if recorder is not None:
+            click_element(fs.page, like, fs.plan, recorder=fs.recorder)
+            if fs.recorder is not None:
                 try:
-                    recorder.record("interest_like", metadata={"snippet": txt[:120]})
+                    fs.recorder.record("interest_like", metadata={"snippet": txt[:120]})
                 except Exception:
                     pass
             return True
@@ -457,22 +454,28 @@ def like_interesting_post(fs: FeedSession) -> bool:
 def act_on_scored_posts(fs: FeedSession) -> bool:
     """Let the content score drive attention: react to a sufficiently interesting
     on-screen post the way the scorer says (open author on 'click', linger/trace on
-    'dwell'/'highlight'). This is what makes dwell and clicks *content-caused*."""
+    'dwell'/'highlight')."""
     page, plan, recorder, scorer = fs.page, fs.plan, fs.recorder, fs.scorer
     summary, actions = fs.summary, fs.actions
+    post_sel = fs.resolver.selector_for("feed_post") or "article"
+    author_sel = fs.resolver.field_selector("feed_author") or ".name"
+    text_sel = fs.resolver.field_selector("feed_text") or ".text"
+    sels = {"post": post_sel, "author": author_sel}
     try:
         onscreen = page.evaluate(
-            """() => {
+            """(sels) => {
                 const vh = innerHeight || 800;
                 const out = [];
-                document.querySelectorAll('.g-feed-post').forEach(p => {
+                document.querySelectorAll(sels.post).forEach(p => {
                     const r = p.getBoundingClientRect();
                     if (r.top < 40 || r.bottom > vh - 20) return;
-                    const nm = p.querySelector('.name');
-                    out.push({ id: p.getAttribute('data-post-id'), author: nm ? (nm.innerText || '').trim() : '' });
+                    const a = p.querySelector(sels.author);
+                    const id = p.getAttribute('data-post-id') || p.getAttribute('data-urn') || p.getAttribute('data-id') || '';
+                    out.push({ id: id, author: a ? (a.innerText || '').trim() : '' });
                 });
                 return out;
-            }"""
+            }""",
+            sels,
         )
     except Exception:
         return False
@@ -488,11 +491,9 @@ def act_on_scored_posts(fs: FeedSession) -> bool:
     summary["content_actions"] = summary.get("content_actions", 0) + 1
     if recorder is not None:
         try:
-            recorder.record(
-                "content_action",
-                metadata={"post_id": post.get("id"), "interest": score.get("interest"),
-                          "action": action, "why": score.get("why", "")},
-            )
+            recorder.record("content_action", metadata={
+                "post_id": post.get("id"), "interest": score.get("interest"),
+                "action": action, "why": score.get("why", "")})
         except Exception:
             pass
     try:
@@ -502,7 +503,15 @@ def act_on_scored_posts(fs: FeedSession) -> bool:
                 summary["lookups"] += 1
                 actions.append(f"content_open:{post['author']}")
                 return True
-        el = page.query_selector(f'[data-post-id="{post.get("id")}"] {FEED_TEXT_SELECTOR}')
+        pid = post.get("id") or ""
+        el = None
+        if pid:
+            try:
+                el = page.locator(f'[data-post-id="{pid}"] {text_sel}, [data-urn="{pid}"] {text_sel}').first
+                if el.count() == 0:
+                    el = None
+            except Exception:
+                el = None
         if el is not None:
             hover_element(page, el, plan, recorder=recorder)
             wait_human(page, plan, 0, random.randint(500, 1200), recorder=recorder)
@@ -518,10 +527,7 @@ def act_on_scored_posts(fs: FeedSession) -> bool:
 # =========================================================================== #
 def feed_scan_cycle(fs: FeedSession, *, steps: int | None = None) -> None:
     """One feed-scan scene: ambient Markov burst + capture everything that scrolled
-    past + hand to the scorer + content-driven attention + ambient peek/like.
-
-    This is the exact proven loop body; the Story compiler decides HOW MANY of
-    these run and what excursions interleave them."""
+    past + hand to the scorer + content-driven attention + ambient peek/like."""
     n_steps = steps if steps is not None else random.randint(3, 6)
     scan_feed_burst(fs, steps=n_steps)
     fs.summary["feed_scan_bursts"] += 1
@@ -542,10 +548,7 @@ def feed_scan_cycle(fs: FeedSession, *, steps: int | None = None) -> None:
 
 
 def do_feed_excursion(fs: FeedSession, name: str, arg: Any = None) -> None:
-    """Execute one feed excursion (the human 'check stop'), updating the summary.
-
-    Excursions are self-returning (each primitive ends back on the feed), so the
-    caller does not need a resume stack."""
+    """Execute one feed excursion (the human 'check stop'), updating the summary."""
     summary, actions = fs.summary, fs.actions
     if name in ("notifications", "tangent_notifications"):
         if visit_notifications(fs):
@@ -563,8 +566,6 @@ def do_feed_excursion(fs: FeedSession, name: str, arg: Any = None) -> None:
             summary["profiles_opened"] += 1
             actions.append(f"search_profile:{term}")
     elif name in ("lookup_person", "tangent_lookup"):
-        # App-requested people first (drain the value tree), then arg, then someone
-        # whose post we actually saw — the "I'll look them up" instinct.
         person = arg
         if not person and fs.pending_lookups:
             person = fs.pending_lookups.pop(0)

@@ -328,12 +328,14 @@ export default function App() {
     name: string;
     url: string;
     description: string;
+    automation_profile?: Record<string, unknown>;
   }
 
   const [websites, setWebsites] = useState<Website[]>([]);
   const [selectedWebsite, setSelectedWebsite] = useState<string>('');
   const [showWebsiteModal, setShowWebsiteModal] = useState(false);
-  const [newWebsite, setNewWebsite] = useState({ name: '', url: '', description: '' });
+  // automation_profile is edited as JSON text here; parsed on save.
+  const [newWebsite, setNewWebsite] = useState({ name: '', url: '', description: '', automation_profile: '' });
 
   const [showPersonaModal, setShowPersonaModal] = useState(false);
   const [newPersona, setNewPersona] = useState({
@@ -386,20 +388,73 @@ export default function App() {
     fetchPersonas();
   }, []);
 
+  // Starting-point affordance maps. The backend keeps authoritative built-ins as a
+  // fallback; these are editable seeds so a new site's profile isn't a blank box.
+  const AUTOMATION_PROFILE_PRESETS: Record<string, Record<string, unknown>> = {
+    linkedin: {
+      name: 'linkedin', kind: 'feed',
+      roles: {
+        feed_post: { css: ['div.feed-shared-update-v2[data-urn]', '[role=feed] [role=article]', '[data-urn]'] },
+        feed_author: { css: ['.update-components-actor__title', '.update-components-actor__name'] },
+        feed_text: { css: ['.update-components-text', '.feed-shared-update-v2__description'] },
+        feed_like: { css: ["button[aria-label*='Like' i]"], text: ['Like'] },
+        nav_home: { css: ["a[href$='/feed/']"], text: ['Home'] },
+        nav_notifications: { css: ["a[href*='/notifications/']"], text: ['Notifications'] },
+        nav_messages: { css: ["a[href*='/messaging/']"], text: ['Messaging'] },
+        nav_network: { css: ["a[href*='/mynetwork/']"], text: ['My Network'] },
+        nav_jobs: { css: ["a[href*='/jobs/']"], text: ['Jobs'] },
+        search_input: { css: ['input.search-global-typeahead__input', "input[aria-label*='Search' i]"] },
+        result_name: { css: ['.entity-result__title-text a', "a[href*='/in/']"] },
+        profile_section: { css: ['section.artdeco-card'] },
+      },
+      campaign: {},
+    },
+    gauntlet: {
+      name: 'gauntlet', kind: 'feed',
+      roles: {
+        feed_post: { css: ['article.g-feed-post', '.g-feed-post'] },
+        feed_author: { css: ['.name'] }, feed_text: { css: ['.text'] },
+        feed_like: { css: ['.g-feed-like'] },
+        nav_home: { css: ['#g-nav-home'], text: ['Home'] },
+        nav_notifications: { css: ['#g-nav-notifications'], text: ['Alerts'] },
+        search_input: { css: ['#g-search-input'] }, search_submit: { css: ['#g-search-go'] },
+        result_name: { css: ['.g-result-name'] }, profile_section: { css: ['.g-profile-section'] },
+      },
+      campaign: { interest_terms: ['data engineer', 'ml platform', 'analytics lead'] },
+    },
+  };
+
+  const applyProfilePreset = (kind: string) => {
+    const preset = AUTOMATION_PROFILE_PRESETS[kind];
+    setNewWebsite((prev) => ({ ...prev, automation_profile: preset ? JSON.stringify(preset, null, 2) : '' }));
+  };
+
   const handleSaveWebsite = async () => {
     if (!newWebsite.name || !newWebsite.url) return;
+    const body: { name: string; url: string; description: string; automation_profile?: Record<string, unknown> } = {
+      name: newWebsite.name, url: newWebsite.url, description: newWebsite.description,
+    };
+    const apText = newWebsite.automation_profile.trim();
+    if (apText) {
+      try {
+        body.automation_profile = JSON.parse(apText);
+      } catch {
+        alert('Automation profile must be valid JSON (or left blank for auto-detect).');
+        return;
+      }
+    }
     try {
       const res = await fetch('/api/imposter5/websites', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newWebsite)
+        body: JSON.stringify(body)
       });
       if (res.ok) {
         await fetchWebsites();
         setSelectedWebsite(newWebsite.name);
         setUrl(newWebsite.url);
         setShowWebsiteModal(false);
-        setNewWebsite({ name: '', url: '', description: '' });
+        setNewWebsite({ name: '', url: '', description: '', automation_profile: '' });
       }
     } catch (err) {
       console.error('Failed to save website:', err);
@@ -1618,6 +1673,25 @@ export default function App() {
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 px-3 text-slate-200 focus:outline-none focus:border-rose-500/50 h-20 resize-none"
                     placeholder="Describe the website target..."
                   />
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-slate-400 uppercase text-[10px]">Red Team Automation Profile <span className="text-slate-600 normal-case">(optional)</span></label>
+                    <div className="flex gap-1">
+                      <button type="button" onClick={() => applyProfilePreset('linkedin')} className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:bg-slate-700 text-[10px]">LinkedIn</button>
+                      <button type="button" onClick={() => applyProfilePreset('gauntlet')} className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:bg-slate-700 text-[10px]">Gauntlet</button>
+                      <button type="button" onClick={() => setNewWebsite((prev) => ({ ...prev, automation_profile: '' }))} className="px-2 py-0.5 rounded bg-slate-800 text-slate-400 hover:bg-slate-700 text-[10px]">Clear</button>
+                    </div>
+                  </div>
+                  <textarea
+                    value={newWebsite.automation_profile}
+                    onChange={(e) => setNewWebsite((prev) => ({ ...prev, automation_profile: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 px-3 text-slate-300 focus:outline-none focus:border-rose-500/50 h-28 resize-none font-mono text-[10px] leading-tight"
+                    placeholder='Leave blank to auto-detect (LinkedIn / Gauntlet) or use the generic semantic + text/ARIA cascade. Or paste a JSON affordance map: roles -> { css: [...], text: [...] }.'
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Maps affordance roles (feed_post, nav_*, search_input, result_name, profile_section, feed_*) to selectors. The resolver cascades profile CSS → semantic → text/ARIA, so it's robust to blank/partial profiles. Verify a new site with <span className="text-slate-400">affordance_probe.py</span>.
+                  </p>
                 </div>
                 <div className="flex gap-2 mt-2">
                   <button

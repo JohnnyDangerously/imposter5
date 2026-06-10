@@ -123,6 +123,10 @@ class StoryExecutor:
         self.feed: feed_actions.FeedSession | None = None
         if plan.goal_predicate.type == "scan_count":
             duration_s = float(behavior_plan.get("gauntlet_duration_s") or 240.0)
+            # The Red Team Automation profile (site affordance map) is threaded in
+            # via the behavior plan; new_feed_session resolves it (explicit dict,
+            # named built-in, or URL-matched) so the same feed behaviors run on the
+            # gauntlet, LinkedIn, or any conformant site.
             self.feed = feed_actions.new_feed_session(
                 page, behavior_plan, self.recorder, duration_s=duration_s
             )

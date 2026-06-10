@@ -77,6 +77,11 @@ class WebsiteSaveRequest(BaseModel):
     name: str
     url: str
     description: str = ""
+    # Red Team Automation profile: a site affordance map ({kind, roles{role:{css[],text[]}},
+    # campaign{}}) that tells the engine how to find feed posts / nav / search / results on
+    # this site. Optional — when absent, the resolver falls back to the URL-matched built-in
+    # (linkedin/gauntlet) or the generic semantic+text cascade.
+    automation_profile: dict[str, Any] | None = None
 
 
 class ScenarioSaveRequest(BaseModel):
@@ -232,6 +237,27 @@ def load_websites() -> list[dict[str, Any]]:
     return DEFAULT_WEBSITES
 
 
+def _automation_profile_for_url(url: str) -> dict[str, Any] | None:
+    """The saved website's Red Team Automation profile for this run URL, if any.
+
+    Matches the run URL against saved websites (exact or substring either way) and
+    returns the entry's ``automation_profile``. Returns None when no saved site
+    carries a custom profile — the resolver then falls back to the URL-matched
+    built-in (linkedin/gauntlet) or generic cascade.
+    """
+    if not url:
+        return None
+    try:
+        for w in load_websites():
+            ap = w.get("automation_profile")
+            wu = w.get("url") or ""
+            if ap and wu and (wu == url or wu in url or url in wu):
+                return ap
+    except Exception:
+        return None
+    return None
+
+
 def _save_websites_to_disk(websites: list[dict[str, Any]]) -> None:
     try:
         os.makedirs(os.path.dirname(WEBSITES_FILE_PATH), exist_ok=True)
@@ -351,7 +377,7 @@ async def save_website(body: WebsiteSaveRequest):
         websites = load_websites()
         # Overwrite if name already exists
         websites = [w for w in websites if w["name"] != body.name]
-        websites.append(body.model_dump())
+        websites.append(body.model_dump(exclude_none=True))
         _save_websites_to_disk(websites)
         return success_response({"success": True, "message": f"Website '{body.name}' saved successfully."})
     except Exception as e:
@@ -487,6 +513,15 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
     if body.markov_matrix:
         plan["markov_matrix"] = body.markov_matrix
         plan["use_markov_pathing"] = True
+
+    # 5c. Thread the site's Red Team Automation profile (affordance map) into the
+    # plan so feed behaviors resolve roles on THIS site. The resolver falls back to
+    # the URL-matched built-in (linkedin/gauntlet) or generic cascade when a saved
+    # site carries no custom profile, so this is purely additive.
+    plan["url"] = body.url
+    _site_profile = _automation_profile_for_url(body.url)
+    if _site_profile:
+        plan["automation_profile"] = _site_profile
 
     # 6. Set up video directory
     video_dir = tempfile.mkdtemp(prefix="tokyo-imposter5-movie-")
