@@ -59,4 +59,13 @@ class Imposter5RunRequest(BaseModel):
     # visible/over-the-shoulder behavior of the product UI.
     gauntlet_duration_s: float | None = Field(default=None, ge=15, le=900)
     headless: bool | None = None
+    # App-supplied "tree of value": concrete human side-quests that take priority
+    # over the ambient excursion menu on a gauntlet journey. `lookup_people` is a
+    # list of names to check directly; `excursion_queue` is an ordered list of
+    # excursion names ("notifications", "glance:network", "long_browse") or dicts
+    # ({"type": "lookup_person", "arg": "Jane Doe"}); `long_browse` queues an
+    # extra-long feed browse.
+    lookup_people: list[str] | None = None
+    excursion_queue: list[Any] | None = None
+    long_browse: int | None = Field(default=None, ge=1, le=20)
 

@@ -156,7 +156,10 @@ def _scan_feed_burst(
 
 
 def _capture_visible_posts(
-    page: Any, recorder: SessionRecorder | None, captured: set[str]
+    page: Any,
+    recorder: SessionRecorder | None,
+    captured: set[str],
+    authors: list[str] | None = None,
 ) -> int:
     """Capture every feed post currently on screen — the actual data-gathering job.
 
@@ -174,12 +177,14 @@ def _capture_visible_posts(
                 const out = [];
                 document.querySelectorAll('.g-feed-post').forEach(p => {
                     const r = p.getBoundingClientRect();
-                    // Capture posts on screen OR ones that just scrolled past (up to
-                    // ~700px above the fold) — a fast scroll sweeps several posts
-                    // between bursts and a reader still "sees" them go by, so a
-                    // capture window wider than the literal viewport keeps harvest
-                    // rate matched to scroll speed. Below the fold is skipped.
-                    if (r.bottom < -700 || r.top > vh - 40) return;
+                    // Capture is a SIDE EFFECT of viewing, not a sampled event: any
+                    // post whose top has crossed above the fold has been scrolled
+                    // into view at some point, so capture it. Dedup by post id makes
+                    // this idempotent across bursts (and across the feed-resets the
+                    // gauntlet does on nav), so the harvest count converges on
+                    // "everything actually seen" rather than a per-burst sample.
+                    // Only posts still fully below the fold are skipped (not seen yet).
+                    if (r.top > vh - 40) return;
                     const pick = (s) => { const e = p.querySelector(s); return e ? (e.innerText || '').trim() : ''; };
                     out.push({
                         id: p.getAttribute('data-post-id'),
@@ -200,6 +205,10 @@ def _capture_visible_posts(
             continue
         captured.add(pid)
         n += 1
+        if authors is not None:
+            author = (p.get("author") or "").strip() if isinstance(p, dict) else ""
+            if author:
+                authors.append(author)
         if recorder is not None:
             try:
                 recorder.record(
@@ -374,6 +383,54 @@ def _search_and_open_profile(
         return False
 
 
+def _lookup_person(
+    page: Any, plan: dict[str, Any] | None, recorder: SessionRecorder | None, name: str
+) -> bool:
+    """Directly check a specific person: search their name, open the result, read
+    their profile. The "I saw their post / someone told me about them, let me look
+    them up" action — reuses the search→profile path with the name as the query."""
+    return _search_and_open_profile(page, plan, recorder, name, read_sections=True)
+
+
+def _parse_excursion_queue(
+    plan: dict[str, Any] | None,
+) -> list[tuple[str, Any]]:
+    """Parse the app-supplied "tree of value" into an ordered excursion queue.
+
+    The app can load in concrete human side-quests that take priority over the
+    ambient menu, e.g. a list of people to check, an explicit ordered list of
+    excursions, or an extra-long browse. Supported plan keys:
+      - ``excursion_queue``: list of names ("notifications", "glance:network",
+        "long_browse") or dicts ({"type": "lookup_person", "arg": "Jane Doe"}).
+      - ``lookup_people``: list of names -> ``lookup_person`` excursions.
+      - ``long_browse``: truthy/int -> an extra-long feed-browse excursion.
+    """
+    queue: list[tuple[str, Any]] = []
+    if not isinstance(plan, dict):
+        return queue
+    raw = plan.get("excursion_queue")
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                queue.append((item.strip(), None))
+            elif isinstance(item, dict):
+                name = item.get("type") or item.get("name")
+                arg = item.get("arg") or item.get("term") or item.get("surface")
+                if name == "lookup_person" and not arg:
+                    arg = item.get("person") or item.get("name")
+                if name:
+                    queue.append((str(name), arg))
+    people = plan.get("lookup_people")
+    if isinstance(people, (list, tuple)):
+        for nm in people:
+            if str(nm).strip():
+                queue.append(("lookup_person", str(nm).strip()))
+    if plan.get("long_browse"):
+        n = plan.get("long_browse")
+        queue.append(("long_browse", int(n) if isinstance(n, (int, float)) and not isinstance(n, bool) else 4))
+    return queue
+
+
 def _like_interesting_post(
     page: Any,
     plan: dict[str, Any] | None,
@@ -434,14 +491,16 @@ def run_gauntlet_journey(
         "notifications_visited": 0,
         "profiles_opened": 0,
         "searches": 0,
+        "lookups": 0,
         "likes": 0,
         "glances": 0,
         "duration_s": 0.0,
         "actions": actions,
         "interest_terms": interest_terms,
-        "behavior_driver": "markov_goal_hybrid",
+        "behavior_driver": "aimless_menu_hybrid",
     }
     captured_post_ids: set[str] = set()
+    captured_authors: list[str] = []
 
     # The feed view just rendered: pay a floored human perceive latency first
     # (the gauntlet flags sub-90ms reactions as a tell).
@@ -451,31 +510,79 @@ def run_gauntlet_journey(
     except Exception:
         pass
 
-    # A loose, varied goal sequence. Every loop already does an ambient scan
-    # burst before pulling the next goal, so we do NOT pad this with standalone
-    # "scan" steps — those just double the dead scrolling and push the
-    # data-gathering goals (profile reads, searches) further apart. Keep it dense
-    # with capture-rich goals so evidence accumulates quickly.
-    goal_queue: list[tuple[str, Any]] = [
-        ("search_profile", interest_terms[0] if interest_terms else "data engineer"),
-        ("notifications", None),
-        ("glance", "network"),
-        ("search_profile", interest_terms[min(1, len(interest_terms) - 1)] if interest_terms else "analytics"),
-        ("glance", "jobs"),
-        ("notifications", None),
-        ("glance", "messages"),
+    # Layer 2 — the app-supplied "tree of value": concrete human side-quests the
+    # app loads in (specific people to check, an ordered excursion list, a long
+    # browse). These take priority over the ambient menu when present.
+    queued_excursions: list[tuple[str, Any]] = _parse_excursion_queue(behavior_plan)
+
+    # Layer 2 fallback — the ambient menu: when nothing is queued, the engine
+    # picks a "human thing to do" at weighted random, the way a bored user drifts
+    # between checking alerts, glancing at their network, looking someone up, or
+    # just browsing more. Weights lean toward light, common actions.
+    AMBIENT_MENU: list[tuple[str, float, Any]] = [
+        ("long_browse", 3.0, None),      # mostly: just keep browsing the feed
+        ("notifications", 2.5, None),    # check alerts
+        ("glance", 2.0, None),           # peek at a secondary surface
+        ("lookup_person", 1.5, None),    # check someone whose post I saw
+        ("search_profile", 1.5, None),   # search an interest and open a profile
     ]
+    menu_weights = [m[1] for m in AMBIENT_MENU]
+
+    def _do_excursion(name: str, arg: Any, markov_state: dict[str, Any]) -> dict[str, Any]:
+        """Execute one excursion by name; returns the (possibly advanced) markov state."""
+        if name == "notifications":
+            if _visit_notifications(page, behavior_plan, recorder):
+                summary["notifications_visited"] += 1
+                actions.append("notifications")
+        elif name == "glance" or name.startswith("glance:"):
+            surface = name.split(":", 1)[1] if ":" in name else (arg or random.choice(("network", "jobs", "messages")))
+            if _glance(page, behavior_plan, recorder, str(surface)):
+                summary["glances"] += 1
+                actions.append(f"glance:{surface}")
+        elif name == "search_profile":
+            term = arg or (random.choice(interest_terms) if interest_terms else "data engineer")
+            if _search_and_open_profile(page, behavior_plan, recorder, str(term), read_sections=True):
+                summary["searches"] += 1
+                summary["profiles_opened"] += 1
+                actions.append(f"search_profile:{term}")
+        elif name == "lookup_person":
+            # Prefer someone whose post we actually saw; else an interest search.
+            person = arg or (random.choice(captured_authors) if captured_authors else None)
+            if not person:
+                term = random.choice(interest_terms) if interest_terms else "data engineer"
+                if _search_and_open_profile(page, behavior_plan, recorder, str(term), read_sections=True):
+                    summary["searches"] += 1
+                    summary["profiles_opened"] += 1
+                    actions.append(f"search_profile:{term}")
+            elif _lookup_person(page, behavior_plan, recorder, str(person)):
+                summary["profiles_opened"] += 1
+                summary["lookups"] += 1
+                actions.append(f"lookup:{person}")
+        elif name == "long_browse":
+            n_cycles = int(arg) if isinstance(arg, (int, float)) and not isinstance(arg, bool) else random.randint(2, 4)
+            for _ in range(n_cycles):
+                if time.monotonic() - start >= duration_s:
+                    break
+                ms = random.randint(3, 6)
+                markov_state = _scan_feed_burst(page, behavior_plan, recorder, markov_state, steps=ms)
+                summary["feed_scan_bursts"] += 1
+                summary["markov_steps"] += ms
+                summary["posts_captured"] += _capture_visible_posts(page, recorder, captured_post_ids, captured_authors)
+            actions.append(f"long_browse:{n_cycles}")
+        return markov_state
 
     start = time.monotonic()
     markov_state: dict[str, Any] = {}
-    qi = 0
     loops = 0
-    # A goal excursion (notifications/search/glance) navigates away and the
-    # gauntlet resets the feed to the top, so each excursion costs capture depth.
-    # Spend most cycles scrolling+capturing the feed and only take an excursion
-    # every few cycles: this keeps data capture fast (long uninterrupted harvest
-    # runs that reach deep, fresh posts) while still varying the journey.
-    cycles_per_goal = random.randint(2, 3)
+    # Layer 1 — the base loop is AIMLESS feed browsing (the default human mode:
+    # "I don't really know what I'm doing, just looking"). A purposeful excursion
+    # only fires every few scan cycles; the long uninterrupted scroll both reads
+    # as natural and lets capture reach deep, fresh posts (excursions reset the
+    # feed to the top on the gauntlet).
+    # When the app has loaded a value tree, drain it on a tighter cadence (those
+    # are things it explicitly wants done); with nothing queued, excursions are
+    # rare and aimless browsing dominates.
+    cycles_per_excursion = random.randint(1, 2) if queued_excursions else random.randint(4, 6)
     while time.monotonic() - start < duration_s:
         loops += 1
         # Ambient feed scan burst (this is the scroll) — the dominant activity.
@@ -485,7 +592,9 @@ def run_gauntlet_journey(
         summary["markov_steps"] += steps
 
         # Capture everything that just scrolled past — the actual data job.
-        summary["posts_captured"] += _capture_visible_posts(page, recorder, captured_post_ids)
+        summary["posts_captured"] += _capture_visible_posts(
+            page, recorder, captured_post_ids, captured_authors
+        )
 
         # Ambient variety: sometimes peek at a post's comments/reactions, sometimes
         # like a relevant one. These are independent so the rhythm stays irregular.
@@ -499,37 +608,21 @@ def run_gauntlet_journey(
         if time.monotonic() - start >= duration_s:
             break
 
-        # Only take a purposeful goal excursion every few scan cycles.
-        if loops % cycles_per_goal != 0:
+        # Only take an excursion every few scan cycles (aimless browsing dominates).
+        if loops % cycles_per_excursion != 0:
             continue
-        cycles_per_goal = random.randint(2, 3)
 
-        # Pull the next purposeful goal (cycle if the journey runs long).
-        if qi >= len(goal_queue):
-            # Refill with capture-rich goals (no empty scan padding) so long runs
-            # keep gathering data and stay varied.
-            goal_queue.append(("search_profile", random.choice(interest_terms) if interest_terms else "data engineer"))
-            goal_queue.append(("glance", random.choice(("network", "jobs", "messages"))))
-            goal_queue.append(("notifications", None))
-        kind, arg = goal_queue[qi]
-        qi += 1
+        # Prefer the app's queued side-quests; otherwise drift to an ambient one.
+        if queued_excursions:
+            name, arg = queued_excursions.pop(0)
+        else:
+            name, arg = random.choices(AMBIENT_MENU, weights=menu_weights, k=1)[0][0], None
+        markov_state = _do_excursion(name, arg, markov_state)
+        # Next cadence: keep draining a loaded tree quickly (purposeful session
+        # with a little browsing between tasks), else go rare again (aimless).
+        cycles_per_excursion = random.randint(1, 2) if queued_excursions else random.randint(4, 6)
 
-        if kind == "scan":
-            continue
-        elif kind == "notifications":
-            if _visit_notifications(page, behavior_plan, recorder):
-                summary["notifications_visited"] += 1
-                actions.append("notifications")
-        elif kind == "glance":
-            if _glance(page, behavior_plan, recorder, arg):
-                summary["glances"] += 1
-                actions.append(f"glance:{arg}")
-        elif kind == "search_profile":
-            if _search_and_open_profile(page, behavior_plan, recorder, str(arg), read_sections=True):
-                summary["searches"] += 1
-                summary["profiles_opened"] += 1
-                actions.append(f"search_profile:{arg}")
-
+    summary["queued_remaining"] = len(queued_excursions)
     summary["duration_s"] = round(time.monotonic() - start, 1)
     if recorder is not None:
         try:
@@ -537,9 +630,9 @@ def run_gauntlet_journey(
         except Exception:
             summary["session_recording"] = None
     logger.info(
-        "[gauntlet_journey] done in %.1fs: scans=%d captured=%d peeks=%d profiles=%d notifs=%d glances=%d likes=%d",
+        "[gauntlet_journey] done in %.1fs: scans=%d captured=%d peeks=%d profiles=%d lookups=%d notifs=%d glances=%d likes=%d",
         summary["duration_s"], summary["feed_scan_bursts"], summary["posts_captured"],
-        summary["peeks"], summary["profiles_opened"], summary["notifications_visited"],
-        summary["glances"], summary["likes"],
+        summary["peeks"], summary["profiles_opened"], summary["lookups"],
+        summary["notifications_visited"], summary["glances"], summary["likes"],
     )
     return summary

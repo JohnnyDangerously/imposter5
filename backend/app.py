@@ -689,6 +689,14 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
                 try:
                     from imposter5.loaders.gauntlet_journey import run_gauntlet_journey
                     duration_s = float(body.gauntlet_duration_s or plan.get("gauntlet_duration_s") or 240.0)
+                    # App-supplied "tree of value": queued human side-quests that
+                    # take priority over the ambient excursion menu.
+                    if body.lookup_people:
+                        plan["lookup_people"] = body.lookup_people
+                    if body.excursion_queue:
+                        plan["excursion_queue"] = body.excursion_queue
+                    if body.long_browse:
+                        plan["long_browse"] = body.long_browse
                     gauntlet_summary = run_gauntlet_journey(
                         page, plan, recorder=recorder, duration_s=duration_s
                     )
