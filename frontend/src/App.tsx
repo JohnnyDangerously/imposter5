@@ -218,14 +218,22 @@ interface BlueReport {
 
 interface GauntletSummary {
   behavior_driver?: string;
+  arc?: string;
   duration_s?: number;
   feed_scan_bursts?: number;
   markov_steps?: number;
+  posts_captured?: number;
   notifications_visited?: number;
   profiles_opened?: number;
   searches?: number;
+  lookups?: number;
   likes?: number;
   glances?: number;
+  peeks?: number;
+  author_hovers?: number;
+  comments_expanded?: number;
+  reactions_expanded?: number;
+  goal_met?: boolean;
   interest_terms?: string[];
   actions?: string[];
   [key: string]: unknown;
@@ -1269,9 +1277,13 @@ export default function App() {
                         </div>
                       </div>
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 font-mono text-[11px]">
+                        <div className="bg-slate-950 border border-emerald-500/30 rounded-lg p-2.5 flex flex-col gap-0.5">
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Posts captured</span>
+                          <span className="text-emerald-400 font-bold text-base">{gs.posts_captured ?? 0}</span>
+                        </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Driver</span>
-                          <span className="text-purple-400 font-bold truncate" title={gs.behavior_driver}>{gs.behavior_driver || '—'}</span>
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Arc / driver</span>
+                          <span className="text-purple-400 font-bold truncate" title={`${gs.arc ?? ''} · ${gs.behavior_driver ?? ''}`}>{gs.arc || gs.behavior_driver || '—'}</span>
                         </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
                           <span className="text-slate-500 uppercase tracking-wider text-[9px]">Duration</span>
@@ -1282,24 +1294,20 @@ export default function App() {
                           <span className="text-cyan-400 font-bold">{gs.feed_scan_bursts ?? 0} / {gs.markov_steps ?? 0}</span>
                         </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Profiles opened</span>
-                          <span className="text-cyan-400 font-bold">{gs.profiles_opened ?? 0}</span>
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Profiles / lookups</span>
+                          <span className="text-cyan-400 font-bold">{gs.profiles_opened ?? 0} / {gs.lookups ?? 0}</span>
                         </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Notifications</span>
-                          <span className="text-cyan-400 font-bold">{gs.notifications_visited ?? 0}</span>
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Notifs / glances</span>
+                          <span className="text-cyan-400 font-bold">{gs.notifications_visited ?? 0} / {gs.glances ?? 0}</span>
                         </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Searches</span>
-                          <span className="text-cyan-400 font-bold">{gs.searches ?? 0}</span>
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Peeks / author cards</span>
+                          <span className="text-cyan-400 font-bold">{gs.peeks ?? 0} / {gs.author_hovers ?? 0}</span>
                         </div>
                         <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Glances</span>
-                          <span className="text-cyan-400 font-bold">{gs.glances ?? 0}</span>
-                        </div>
-                        <div className="bg-slate-950 border border-slate-800/80 rounded-lg p-2.5 flex flex-col gap-0.5">
-                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Likes</span>
-                          <span className="text-cyan-400 font-bold">{gs.likes ?? 0}</span>
+                          <span className="text-slate-500 uppercase tracking-wider text-[9px]">Comments / reactions</span>
+                          <span className="text-cyan-400 font-bold">{gs.comments_expanded ?? 0} / {gs.reactions_expanded ?? 0}</span>
                         </div>
                       </div>
                       {interestTerms.length > 0 && (
