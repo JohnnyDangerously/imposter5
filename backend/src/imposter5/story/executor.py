@@ -32,6 +32,7 @@ from imposter5.automation_connector.interaction_primitives import (
     update_status_ticker,
 )
 from imposter5.automation_connector.session_recorder import SessionRecorder
+from imposter5.loaders import feed_actions
 from imposter5.loaders.markov_simulator import run_markov_simulation
 from imposter5.story.compiler import Scene, StoryPlan, compile_story
 from imposter5.story.goal import GoalChecker, GoalState
@@ -114,6 +115,17 @@ class StoryExecutor:
         self._goal_met = False
         # Monotonic scan progress in [0, 1]; only ever advanced by real scroll geometry.
         self._scan_progress = 0.0
+
+        # Feed archetype: a self-contained feed session holds the harvest, the
+        # content scorer, and the summary counters. The proven feed_actions
+        # primitives (which scored HUMAN_EVADED) execute the physical behavior;
+        # this executor only decides the scene order / count / excursions.
+        self.feed: feed_actions.FeedSession | None = None
+        if plan.goal_predicate.type == "scan_count":
+            duration_s = float(behavior_plan.get("gauntlet_duration_s") or 240.0)
+            self.feed = feed_actions.new_feed_session(
+                page, behavior_plan, self.recorder, duration_s=duration_s
+            )
 
     def _install_fast_clock(self) -> None:
         """Wrap ``page.wait_for_timeout`` so every motor sleep is scaled down.
@@ -464,6 +476,8 @@ class StoryExecutor:
     # --- tangent handlers ---------------------------------------------------------
     def _do_tangent(self, scene: Scene) -> dict[str, Any]:
         name = scene.name
+        if name in ("tangent_notifications", "tangent_glance", "tangent_lookup", "tangent_search"):
+            return self._do_feed_tangent(scene)
         if name == "tangent_open_profile":
             self._resume_stack.append({"resumes_after": scene.resumes_after, "kind": "profile"})
             self.tangents_fired += 1
@@ -529,7 +543,34 @@ class StoryExecutor:
             return self._read_profile()
         if name == "profile_back":
             return self._back()
+        if name == "feed_scan":
+            return self._do_feed_scan(scene)
         return {"status": "unknown_main"}
+
+    # --- feed archetype handlers --------------------------------------------------
+    def _do_feed_scan(self, scene: Scene) -> dict[str, Any]:
+        """One ambient feed segment: delegate the proven scan cycle, advance the
+        feed-scan goal counter."""
+        if self.feed is None:
+            return {"status": "no_feed_session"}
+        feed_actions.feed_scan_cycle(self.feed)
+        self.state.feed_scans += 1
+        s = self.feed.summary
+        return {
+            "status": "ok",
+            "feed_scans": self.state.feed_scans,
+            "posts_captured": s.get("posts_captured", 0),
+        }
+
+    def _do_feed_tangent(self, scene: Scene) -> dict[str, Any]:
+        """A feed check-stop (notifications/glance/lookup/search). Self-returning, so
+        we count it fired+returned in one step (no resume-stack push)."""
+        if self.feed is None:
+            return {"status": "no_feed_session"}
+        self.tangents_fired += 1
+        feed_actions.do_feed_excursion(self.feed, scene.name)
+        self.tangents_returned += 1
+        return {"status": "ok", "excursion": scene.name}
 
     # --- run ----------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
@@ -575,7 +616,16 @@ class StoryExecutor:
         if self.goal.is_satisfied(self.state):
             return completion
         completion["ran"] = True
-        if ptype == "scan_fraction":
+        if ptype == "scan_count":
+            guard = 0
+            while not self.goal.is_satisfied(self.state) and guard < 40:
+                guard += 1
+                # Stop topping up if the session has run past its time budget.
+                if self.feed is not None and self.feed.time_left <= 0:
+                    break
+                res = self._do_feed_scan(Scene("feed_scan", "main", 0, target_role="feed_list"))
+                self.trace.append({"scene": "feed_scan", "kind": "completion", **res})
+        elif ptype == "scan_fraction":
             res = self._do_results_scan(Scene("results_scan", "main", 0, target_role="result_list"))
             self.trace.append({"scene": "results_scan", "kind": "completion", **res})
         elif ptype in ("open_count", "find_in_profile"):
@@ -597,7 +647,7 @@ class StoryExecutor:
 
     def result_payload(self) -> dict[str, Any]:
         # Resume-stack balance is the audit that every wander returned.
-        return {
+        payload = {
             "goal": self.goal.to_payload(self.state),
             "goal_met": self.goal.is_satisfied(self.state),
             "tangents_fired": self.tangents_fired,
@@ -609,6 +659,10 @@ class StoryExecutor:
             "trace": self.trace,
             "plan": self.plan.to_payload(),
         }
+        if self.feed is not None:
+            payload["feed_summary"] = dict(self.feed.summary)
+            payload["feed_summary"]["actions"] = list(self.feed.actions)
+        return payload
 
 
 def run_story(

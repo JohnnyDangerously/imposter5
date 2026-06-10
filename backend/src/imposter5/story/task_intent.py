@@ -29,6 +29,8 @@ MAIN_SCENE_VOCAB = frozenset(
         "profile_open",
         "profile_read",
         "profile_back",
+        # Feed archetype: the ambient scroll spine of a "just browsing the feed" session.
+        "feed_scan",
     }
 )
 TANGENT_SCENE_VOCAB = frozenset(
@@ -38,10 +40,24 @@ TANGENT_SCENE_VOCAB = frozenset(
         "tangent_back",
         "tangent_research",
         "tangent_refresh",
+        # Feed-native check-stops a human weaves into a browse. Each is a single
+        # self-returning excursion (the executor's primitive returns to the feed).
+        "tangent_notifications",
+        "tangent_glance",
+        "tangent_lookup",
+        "tangent_search",
     }
 )
 
-GOAL_PREDICATE_TYPES = frozenset({"scan_fraction", "open_count", "find_in_profile"})
+# Feed tangents are self-contained excursions (open + return in one primitive),
+# so the compiler emits them as a single is_return scene rather than an open/back pair.
+FEED_TANGENT_SCENES = frozenset(
+    {"tangent_notifications", "tangent_glance", "tangent_lookup", "tangent_search"}
+)
+
+# ``scan_count``: browse N feed segments (each a feed_scan burst) with human
+# over/undershoot via jitter — this is what makes session LENGTH variable.
+GOAL_PREDICATE_TYPES = frozenset({"scan_fraction", "open_count", "find_in_profile", "scan_count"})
 
 
 class TaskIntentError(ValueError):

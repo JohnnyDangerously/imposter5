@@ -26,6 +26,8 @@ class GoalState:
     results_scanned: int = 0
     profiles_opened: int = 0
     profiles_read: int = 0
+    # Feed archetype: number of completed ambient feed-scan bursts this session.
+    feed_scans: int = 0
 
     @property
     def scan_fraction(self) -> float:
@@ -64,6 +66,8 @@ class GoalChecker:
             return state.profiles_opened >= self.effective_target
         if ptype == "find_in_profile":
             return state.profiles_read >= self.effective_target
+        if ptype == "scan_count":
+            return state.feed_scans >= self.effective_target
         return False
 
     def to_payload(self, state: GoalState) -> dict[str, Any]:
@@ -79,5 +83,6 @@ class GoalChecker:
                 "scan_fraction": round(state.scan_fraction, 4),
                 "profiles_opened": state.profiles_opened,
                 "profiles_read": state.profiles_read,
+                "feed_scans": state.feed_scans,
             },
         }

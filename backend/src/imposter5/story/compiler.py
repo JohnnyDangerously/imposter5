@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from imposter5.automation_connector.humanize_dist import lognormal_ms
-from imposter5.story.task_intent import GoalPredicate, TaskIntent
+from imposter5.story.task_intent import FEED_TANGENT_SCENES, GoalPredicate, TaskIntent
 
 # Per-scene base dwell (ms) and the affordance ROLE the scene primarily acts on.
 _SCENE_BASE_DWELL_MS: dict[str, float] = {
@@ -43,6 +43,14 @@ _SCENE_BASE_DWELL_MS: dict[str, float] = {
     "tangent_back": 520.0,
     "tangent_research": 2000.0,
     "tangent_refresh": 1200.0,
+    # Feed archetype. feed_scan dwell is intentionally short: a browsing human
+    # lingers 2-5s per segment unless something catches their eye (the executor
+    # adds content-driven dwell on top when the scorer fires).
+    "feed_scan": 900.0,
+    "tangent_notifications": 1400.0,
+    "tangent_glance": 1100.0,
+    "tangent_lookup": 2400.0,
+    "tangent_search": 2400.0,
 }
 _SCENE_TARGET_ROLE: dict[str, str | None] = {
     "search_open": "search_input",
@@ -56,10 +64,17 @@ _SCENE_TARGET_ROLE: dict[str, str | None] = {
     "tangent_back": "back_control",
     "tangent_research": "search_input",
     "tangent_refresh": "back_control",
+    "feed_scan": "feed_list",
+    "tangent_notifications": "nav_notifications",
+    "tangent_glance": "nav_target",
+    "tangent_lookup": "search_input",
+    "tangent_search": "search_input",
 }
 
 # Main scenes at which a human plausibly gets curious mid-task.
 _TANGENT_ELIGIBLE = frozenset({"results_scan", "profile_open", "profile_read"})
+# In the feed archetype, the check-stop fires between feed segments.
+_FEED_TANGENT_ELIGIBLE = frozenset({"feed_scan"})
 
 # Dwell clamps so the log-normal tail stays plausible.
 _DWELL_LO_MS = 150
@@ -163,6 +178,14 @@ class StoryCompiler:
             note=note,
         )
 
+    # --- archetype detection ------------------------------------------------------
+    @property
+    def is_feed_archetype(self) -> bool:
+        """True for the 'just browsing the feed' archetype (scan_count goal)."""
+        return self.intent.goal_predicate.type == "scan_count" or (
+            "feed_scan" in self.intent.objective.main_scenes
+        )
+
     # --- backbone -----------------------------------------------------------------
     def _required_scenes(self) -> set[str]:
         """Scenes the goal predicate REQUIRES, regardless of what the intent listed.
@@ -170,6 +193,8 @@ class StoryCompiler:
         Guarantees goal reachability even if the prompt omitted a needed scene.
         """
         ptype = self.intent.goal_predicate.type
+        if ptype == "scan_count":
+            return {"feed_scan"}
         if ptype == "scan_fraction":
             return {"search_open", "search_query", "results_scan"}
         if ptype == "open_count":
@@ -178,7 +203,28 @@ class StoryCompiler:
             return {"search_open", "search_query", "results_scan", "profile_open", "profile_read"}
         return set()
 
+    def _feed_backbone(self, rng: random.Random) -> list[Scene]:
+        """Spine of N feed_scan segments — N (and therefore session length) varies
+        per seed around the goal target, so no two sessions are the same length.
+
+        The goal predicate's effective target (drawn with jitter at run time) is the
+        real stop condition; the executor tops up if a short sample undershoots. Here
+        we emit a plausible sampled count so the plan itself reads as a real session.
+        """
+        target = max(1.0, float(self.intent.goal_predicate.target))
+        # Sample the emitted segment count around the target. partial_substitution
+        # widens the spread (more variety); without it we sit right at target.
+        if self.intent.variance.partial_substitution:
+            lo = max(1, int(round(target * 0.6)))
+            hi = max(lo, int(round(target * 1.4)))
+            n = rng.randint(lo, hi)
+        else:
+            n = int(round(target))
+        return [self._main(rng, "feed_scan") for _ in range(max(1, n))]
+
     def _backbone(self, rng: random.Random) -> list[Scene]:
+        if self.is_feed_archetype:
+            return self._feed_backbone(rng)
         present = set(self.intent.objective.main_scenes) | self._required_scenes()
         var = self.intent.variance
 
@@ -317,12 +363,40 @@ class StoryCompiler:
             rng, resumes_after=resumes_after, depth=depth + 1, budget=budget
         )
 
+    def _build_feed_tangent(self, rng: random.Random, *, resumes_after: str, budget: dict[str, int]) -> list[Scene]:
+        """One feed check-stop excursion (notifications / glance / lookup / search).
+
+        Feed excursions are self-returning (the executor primitive ends back on the
+        feed), so a single is_return scene captures the whole fire+return — no
+        resume-stack bookkeeping needed and the audit stays balanced.
+        """
+        avail = [s for s in self.intent.curiosity.tangent_scenes if s in FEED_TANGENT_SCENES]
+        if not avail:
+            return []
+        budget["left"] -= 1
+        name = rng.choice(avail)
+        return [
+            Scene(
+                name=name,
+                kind="tangent",
+                dwell_ms=self._tangent_dwell(rng, name),
+                target_role=_SCENE_TARGET_ROLE.get(name),
+                depth=1,
+                tangent=True,
+                is_return=True,
+                resumes_after=resumes_after,
+                note="feed_check_stop",
+            )
+        ]
+
     # --- compile ------------------------------------------------------------------
     def compile(self, *, seed: Any = None) -> StoryPlan:
         rng, source = self._make_rng(seed)
         backbone = self._backbone(rng)
         cur = self.intent.curiosity
         budget = {"left": int(cur.max_tangents)}
+        feed = self.is_feed_archetype
+        eligible = _FEED_TANGENT_ELIGIBLE if feed else _TANGENT_ELIGIBLE
 
         scenes: list[Scene] = []
         for scene in backbone:
@@ -330,14 +404,19 @@ class StoryCompiler:
             if (
                 cur.enabled
                 and budget["left"] > 0
-                and scene.name in _TANGENT_ELIGIBLE
+                and scene.name in eligible
                 and rng.random() < cur.tangent_chance
             ):
-                scenes.extend(
-                    self._build_tangent(
-                        rng, resumes_after=scene.name, depth=1, budget=budget
+                if feed:
+                    scenes.extend(
+                        self._build_feed_tangent(rng, resumes_after=scene.name, budget=budget)
                     )
-                )
+                else:
+                    scenes.extend(
+                        self._build_tangent(
+                            rng, resumes_after=scene.name, depth=1, budget=budget
+                        )
+                    )
 
         meta = {
             "site": self.intent.site,
