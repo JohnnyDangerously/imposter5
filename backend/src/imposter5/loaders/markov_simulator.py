@@ -15,6 +15,7 @@ from typing import Any
 
 from imposter5.automation_connector.humanize_dist import lognormal_ms, weibull_ms
 from imposter5.automation_connector.interaction_primitives import (
+    _get_cursor,
     _session_rng,
     click_element,
     hover_element,
@@ -499,9 +500,33 @@ def run_markov_simulation(
                 move_pointer(page, cx, cy, plan, recorder=recorder)
 
             elif next_state == "scroll_down":
-                delta = rng.randint(300, 800)
-                update_status_ticker(page, "📜 SCROLLING", f"Scrolling down ~{delta}px...")
-                scroll_page(page, plan, pass_index=steps_executed, fallback_delta_y=delta, recorder=recorder)
+                # A human on the wheel does a RUN of flicks before repositioning the
+                # hand — not the metronomic scroll/move/scroll/move alternation. So a
+                # single scroll_down state fires 1-5 small flicks, and BETWEEN flicks
+                # the hand is usually still but sometimes nudges the cursor a few px
+                # (the "resting on the mouse while wheeling" jitter). The full
+                # repositioning move only happens on the next mousemove transition.
+                n_flicks = rng.randint(1, 5)
+                for fi in range(n_flicks):
+                    delta = rng.randint(200, 480)
+                    update_status_ticker(
+                        page, "📜 SCROLLING", f"Scrolling down ~{delta}px ({fi + 1}/{n_flicks})..."
+                    )
+                    scroll_page(page, plan, pass_index=steps_executed + fi, fallback_delta_y=delta, recorder=recorder)
+                    if fi < n_flicks - 1:
+                        # The short beat between wheel flicks.
+                        page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=170.0, cv=0.5, lo=40.0, hi=650.0)))
+                        # Mostly still; ~35% of the time a tiny nudge (a few px), with
+                        # a slight downward bias as the eye follows the text.
+                        if rng.random() < 0.35:
+                            cx, cy = _get_cursor(page)
+                            move_pointer(
+                                page,
+                                cx + rng.uniform(-7, 7),
+                                cy + rng.uniform(-4, 10),
+                                plan,
+                                recorder=recorder,
+                            )
 
             elif next_state == "scroll_up":
                 # Negative signed delta: honored downstream by planned_scroll_delta
