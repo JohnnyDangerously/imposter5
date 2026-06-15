@@ -37,9 +37,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
+from imposter5.automation_connector import arrival_clock
+from imposter5.automation_connector.arrival_clock import (
+    ArrivalState,
+    CircadianProfile,
+    profile_for_persona,
+)
 from imposter5.automation_connector.task_store import (
     TaskRecord,
     TaskStore,
+    from_iso,
     utcnow,
 )
 
@@ -47,6 +54,50 @@ logger = logging.getLogger(__name__)
 
 # Default cadence floor mirrors AutomationConnectorTargetRequest.check_interval_minutes (ge=5).
 MIN_INTERVAL_MINUTES = 5
+
+# Human-plausible arrival timing is ON by default; the deployed scheduler must
+# not emit a fixed-period, whole-minute, circadian-free stream (the tells the
+# blue team fingerprinted). Tests that need exact legacy timing can disable it.
+_arrival_jitter_enabled = True
+
+
+def set_arrival_jitter(enabled: bool) -> None:
+    """Toggle human-plausible arrival timing (default on). For deterministic
+    legacy timing in tests; production should leave this enabled."""
+    global _arrival_jitter_enabled
+    _arrival_jitter_enabled = enabled
+
+
+def _profile_for(schedule: dict[str, Any] | None, record: TaskRecord | None = None) -> CircadianProfile:
+    """Resolve the circadian identity from an enrollment request or a stored
+    task record, defaulting to a desk-worker profile."""
+    if record is not None and (record.timezone or record.chronotype):
+        return CircadianProfile(
+            timezone=record.timezone or arrival_clock.DEFAULT_TIMEZONE,
+            chronotype=record.chronotype or "nine_to_five",
+        )
+    schedule = schedule or {}
+    return profile_for_persona(
+        schedule.get("persona"),
+        timezone=schedule.get("timezone"),
+    )
+
+
+def _next_arrival(
+    *,
+    now: datetime,
+    interval_minutes: int,
+    state: ArrivalState,
+    profile: CircadianProfile,
+) -> tuple[datetime, ArrivalState]:
+    """Next due instant + advanced latent state. Honors the jitter toggle."""
+    if not _arrival_jitter_enabled:
+        from datetime import timedelta
+
+        return now + timedelta(minutes=interval_minutes), state
+    return arrival_clock.advance(
+        state, now=now, interval_minutes=interval_minutes, profile=profile
+    )
 
 # A run callable: (provider, url, prompt) -> result dict shaped like the one the
 # endpoint builds ({"success": bool, "goal": ..., "session_recording": ...}).
@@ -154,6 +205,15 @@ def finalize_run(
 
     moment = now or utcnow()
     active_store = store or TaskStore()
+
+    profile = _profile_for(schedule)
+    seed = (schedule or {}).get("arrival_seed")
+    next_dt, state = _next_arrival(
+        now=moment,
+        interval_minutes=interval,
+        state=ArrivalState.initial(seed),
+        profile=profile,
+    )
     record = active_store.enroll(
         provider=provider,
         url=url,
@@ -161,6 +221,10 @@ def finalize_run(
         interval_minutes=interval,
         last_verdict=verdict,
         now=moment,
+        next_run_at=next_dt,
+        arrival_state=state.to_dict(),
+        timezone=profile.timezone,
+        chronotype=profile.chronotype,
     )
     return RunOutcome(
         verdict="green",
@@ -175,6 +239,29 @@ def finalize_run(
 # Worker
 # --------------------------------------------------------------------------- #
 _run_callable: RunCallable | None = None
+
+# Floor on the worker's sleep so a past-due/now-due task cannot spin the loop.
+_MIN_SLEEP_SECONDS = 0.01
+
+
+def _seconds_until_next_due(store: TaskStore, *, default: float) -> float:
+    """Seconds until the soonest enabled task is due, or ``default`` if none.
+
+    Returns 0.0 when something is already due so the loop re-runs immediately.
+    """
+    soonest: datetime | None = None
+    for record in store.list_tasks():
+        if not record.enabled:
+            continue
+        try:
+            due = from_iso(record.next_run_at)
+        except (ValueError, TypeError):
+            continue
+        if soonest is None or due < soonest:
+            soonest = due
+    if soonest is None:
+        return default
+    return max(0.0, (soonest - utcnow()).total_seconds())
 
 
 def set_run_callable(fn: RunCallable | None) -> None:
@@ -224,7 +311,20 @@ def run_due_tasks(
         except Exception as exc:  # a failing run must not kill the worker loop
             logger.exception("imposter5 scheduler: due task %s raised: %s", task.id, exc)
             verdict = "blocked"
-        active_store.mark_ran(task.id, verdict=verdict, now=now or utcnow())
+        ran_at = now or utcnow()
+        next_dt, state = _next_arrival(
+            now=ran_at,
+            interval_minutes=task.interval_minutes,
+            state=ArrivalState.from_dict(task.arrival_state),
+            profile=_profile_for(None, task),
+        )
+        active_store.mark_ran(
+            task.id,
+            verdict=verdict,
+            now=ran_at,
+            next_run_at=next_dt,
+            arrival_state=state.to_dict(),
+        )
         summaries.append(
             {
                 "task_id": task.id,
@@ -269,7 +369,12 @@ def start_worker(
                 run_due_tasks(store=active_store, runner=runner)
             except Exception as exc:  # never let the loop die on a single error
                 logger.exception("imposter5 scheduler worker pass failed: %s", exc)
-            stop_event.wait(poll_seconds)
+            # Sleep until the precise next-due instant (sub-second), capped at
+            # poll_seconds so newly enrolled tasks are still picked up promptly.
+            # This keeps the deployment layer a pure metronome and prevents the
+            # poll grid from snapping spawns back onto whole-second boundaries.
+            sleep_for = _seconds_until_next_due(active_store, default=poll_seconds)
+            stop_event.wait(max(_MIN_SLEEP_SECONDS, min(poll_seconds, sleep_for)))
 
     thread = threading.Thread(target=_loop, name="imposter5-scheduler", daemon=True)
     thread.start()

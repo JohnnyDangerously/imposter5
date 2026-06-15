@@ -88,13 +88,13 @@ def test_success_without_evidence_is_blocked():
 # --------------------------------------------------------------------------- #
 # Enrollment
 # --------------------------------------------------------------------------- #
-def test_green_run_with_schedule_enrolls_with_correct_next_run_at(store):
+def test_green_run_with_schedule_enrolls_with_human_arrival(store):
     outcome = finalize_run(
         provider="linkedin",
         url="https://www.linkedin.com/feed/",
         prompt="scroll the feed",
         result=GOOD_RESULT,
-        schedule={"interval_minutes": 90},
+        schedule={"interval_minutes": 90, "arrival_seed": "test-arrival"},
         store=store,
         now=FIXED_NOW,
     )
@@ -102,8 +102,14 @@ def test_green_run_with_schedule_enrolls_with_correct_next_run_at(store):
     assert outcome.scheduled is True
     assert outcome.interval_minutes == 90
 
-    expected_next = FIXED_NOW + timedelta(minutes=90)
-    assert from_iso(outcome.next_run_at) == expected_next
+    # Anti-fingerprint contract: the next arrival is jittered into the future,
+    # NOT the exact nominal instant, never on the whole-second grid, and bounded.
+    next_run = from_iso(outcome.next_run_at)
+    nominal = FIXED_NOW + timedelta(minutes=90)
+    assert next_run > FIXED_NOW
+    assert next_run != nominal
+    assert next_run.microsecond != 0
+    assert FIXED_NOW < next_run < FIXED_NOW + timedelta(days=10)
 
     tasks = store.list_tasks()
     assert len(tasks) == 1
@@ -112,7 +118,27 @@ def test_green_run_with_schedule_enrolls_with_correct_next_run_at(store):
     assert task.provider == "linkedin"
     assert task.interval_minutes == 90
     assert task.last_verdict == "green"
-    assert from_iso(task.next_run_at) == expected_next
+    assert from_iso(task.next_run_at) == next_run
+    # Latent timing state + circadian identity are persisted for the worker.
+    assert task.arrival_state and task.arrival_state.get("seed")
+    assert task.chronotype and task.timezone
+
+
+def test_arrival_jitter_can_be_disabled_for_legacy_timing(store):
+    scheduler.set_arrival_jitter(False)
+    try:
+        outcome = finalize_run(
+            provider="generic",
+            url="https://example.com",
+            prompt=None,
+            result=GOOD_RESULT,
+            schedule={"interval_minutes": 60},
+            store=store,
+            now=FIXED_NOW,
+        )
+    finally:
+        scheduler.set_arrival_jitter(True)
+    assert from_iso(outcome.next_run_at) == FIXED_NOW + timedelta(minutes=60)
 
 
 def test_check_interval_minutes_key_is_accepted(store):
@@ -199,8 +225,13 @@ def test_run_due_tasks_executes_and_reschedules(store):
     updated = store.get(rec.id)
     assert updated.last_verdict == "green"
     assert from_iso(updated.last_run_at) == later
-    # Rescheduled to one interval past the run time.
-    assert from_iso(updated.next_run_at) == later + timedelta(minutes=60)
+    # Rescheduled to a jittered, sub-second future instant (not exactly +60m,
+    # not on the whole-second grid), and the latent timing state is carried over.
+    next_run = from_iso(updated.next_run_at)
+    assert next_run > later
+    assert next_run != later + timedelta(minutes=60)
+    assert next_run.microsecond != 0
+    assert updated.arrival_state and updated.arrival_state.get("seed")
 
 
 def test_run_due_tasks_marks_failed_run_blocked(store):

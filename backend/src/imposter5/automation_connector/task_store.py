@@ -92,6 +92,11 @@ class TaskRecord:
     last_verdict: str = "green"
     last_run_at: str | None = None
     enabled: bool = True
+    # Anti-fingerprint arrival timing (workstream D). Optional + defaulted so
+    # stores written before this field are read back unchanged.
+    arrival_state: dict[str, Any] | None = None  # latent log-rate / burst / seed
+    timezone: str | None = None                  # identity's circadian timezone
+    chronotype: str | None = None                # circadian shape name
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -174,11 +179,20 @@ class TaskStore:
         interval_minutes: int,
         last_verdict: str = "green",
         now: datetime | None = None,
+        next_run_at: datetime | None = None,
+        arrival_state: dict[str, Any] | None = None,
+        timezone: str | None = None,
+        chronotype: str | None = None,
     ) -> TaskRecord:
-        """Insert or update a recurring task; first run already happened, so the
-        next due time is ``now + interval_minutes``."""
+        """Insert or update a recurring task; the first run already happened.
+
+        The next due time is the caller-supplied ``next_run_at`` (the scheduler's
+        human-plausible arrival instant) when given, else the legacy
+        ``now + interval_minutes``. The store only persists the decision; the
+        timing *policy* lives in the scheduler / arrival clock.
+        """
         moment = now or utcnow()
-        next_run = moment + timedelta(minutes=interval_minutes)
+        next_run = next_run_at if next_run_at is not None else moment + timedelta(minutes=interval_minutes)
         tid = task_id_for(provider, url, prompt)
         with self._lock:
             records = self._read_all()
@@ -192,6 +206,12 @@ class TaskStore:
                 existing.last_verdict = last_verdict
                 existing.enabled = True
                 existing.updated_at = to_iso(moment)
+                if arrival_state is not None:
+                    existing.arrival_state = arrival_state
+                if timezone is not None:
+                    existing.timezone = timezone
+                if chronotype is not None:
+                    existing.chronotype = chronotype
                 result = existing
             else:
                 result = TaskRecord(
@@ -206,6 +226,9 @@ class TaskStore:
                     last_verdict=last_verdict,
                     last_run_at=None,
                     enabled=True,
+                    arrival_state=arrival_state,
+                    timezone=timezone,
+                    chronotype=chronotype,
                 )
                 records.append(result)
             self._write_all(records)
@@ -217,8 +240,16 @@ class TaskStore:
         *,
         verdict: str,
         now: datetime | None = None,
+        next_run_at: datetime | None = None,
+        arrival_state: dict[str, Any] | None = None,
     ) -> TaskRecord | None:
-        """Record an execution: stamp last_run_at/last_verdict and reschedule."""
+        """Record an execution: stamp last_run_at/last_verdict and reschedule.
+
+        ``next_run_at`` is the scheduler's next human-plausible arrival instant
+        when supplied (else the legacy ``now + interval``); ``arrival_state``
+        carries the latent timing state forward so long-range structure survives
+        across worker invocations.
+        """
         moment = now or utcnow()
         with self._lock:
             records = self._read_all()
@@ -227,7 +258,10 @@ class TaskStore:
                 return None
             target.last_run_at = to_iso(moment)
             target.last_verdict = verdict
-            target.next_run_at = to_iso(moment + timedelta(minutes=target.interval_minutes))
+            reschedule = next_run_at if next_run_at is not None else moment + timedelta(minutes=target.interval_minutes)
+            target.next_run_at = to_iso(reschedule)
+            if arrival_state is not None:
+                target.arrival_state = arrival_state
             target.updated_at = to_iso(moment)
             self._write_all(records)
             return target
