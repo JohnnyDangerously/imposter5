@@ -51,6 +51,11 @@ class FeedArc:
 # they wander into. Weights lean toward ordinary "just scrolling" sessions.
 ARCS: tuple[FeedArc, ...] = (
     FeedArc(
+        "micro_dip", 1.8, (0.0, 0.10), 0.85, 1,
+        ("tangent_lookup", "tangent_glance"), 0.30,
+        "Pop in, check one profile or glance, leave — barely touches the feed.",
+    ),
+    FeedArc(
         "interrupted", 1.0, (0.08, 0.22), 0.0, 0, (), 0.40,
         "A few stops down the feed, then interrupted — got pulled away.",
     ),

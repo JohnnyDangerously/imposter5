@@ -14,8 +14,26 @@ from typing import Any
 
 from imposter5.automation_connector.goals import GoalSpec, goal_spec_to_payload
 from imposter5.automation_connector.humanize_dist import lognormal_ms
+from imposter5.automation_connector.session_duration import (
+    MAX_SECONDS as _DURATION_MAX_S,
+    MIN_SECONDS as _DURATION_MIN_S,
+    sample_session_seconds,
+)
 
 POLICY_VERSION = "goal-behavior-v1"
+
+
+def _explicit_duration_s(target: dict[str, Any]) -> float | None:
+    """A caller-pinned session duration (seconds), clamped to the contract window.
+
+    Honors an operator/harness override (e.g. the visible "Watch" harness pins a
+    short duration) so sampling only governs autonomous campaign runs.
+    """
+    for key in ("gauntlet_duration_s", "session_duration_s", "engine_duration_s"):
+        raw = target.get(key)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(max(_DURATION_MIN_S, min(_DURATION_MAX_S, float(raw))))
+    return None
 
 
 @dataclass(frozen=True)
@@ -502,12 +520,27 @@ def build_behavior_plan(
     _apply_human_config_overrides(human_config, target)
     typing_block = _build_typing_block(target, kinematics["typing"])
 
+    # Session length: humans have a heavy-tailed, multi-modal session-duration
+    # distribution (many sub-minute "dip in, check one thing, leave" visits, a
+    # typical few-minute browse, an occasional long read) — NOT one fixed ~4-min
+    # budget. Sample it per run (persona dwell gently scales it) so the
+    # cross-session duration histogram is human, unless a caller pins it. Drawn
+    # from a dedicated RNG substream so it never perturbs the seeded draws above.
+    explicit_duration = _explicit_duration_s(target)
+    duration_rng = random.Random(f"{seed or run_id}:{target.get('id')}:duration")
+    gauntlet_duration_s = (
+        explicit_duration
+        if explicit_duration is not None
+        else sample_session_seconds(duration_rng, scale=persona.dwell_multiplier)
+    )
+
     return {
         "policy_version": POLICY_VERSION,
         "run_id": run_id,
         # None => primitives use fresh OS entropy per session (default). A string
         # seed => the whole session's RNG stream is reproducible for debugging.
         "session_seed": session_seed,
+        "gauntlet_duration_s": round(gauntlet_duration_s, 1),
         "identity_id": identity_id,
         "identity": kinematics["identity"],
         "human_config": human_config,
