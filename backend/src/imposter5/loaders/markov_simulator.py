@@ -384,6 +384,51 @@ def _content_move_target(page: Any, rng: Any, targets: tuple[str, ...] | None) -
     return rng.randint(margin, max(margin + 1, vw - margin)), rng.randint(margin, max(margin + 1, vh - margin))
 
 
+# Where the pointer PARKS when it is not pointing at content. A real cursor rests
+# off to the side — over a rail, near the scrollbar gutter, or up by the nav — and
+# holds still, instead of perpetually grazing the centre column (the "floating
+# mouse that stays in a 70% box, sliding left-right" tell). Fractions of the
+# viewport (x_lo, x_hi, y_lo, y_hi); picked at random and clamped.
+_REST_REGIONS: tuple[tuple[float, float, float, float], ...] = (
+    (0.02, 0.18, 0.20, 0.85),   # left rail / window edge
+    (0.82, 0.97, 0.20, 0.85),   # right rail / scrollbar gutter
+    (0.30, 0.70, 0.02, 0.10),   # up by the top nav
+)
+
+
+def _rest_target(page: Any, rng: Any) -> tuple[int, int]:
+    """A resting/parked pointer destination OFF the central content column."""
+    vw, vh = _viewport_wh(page)
+    lo_x, hi_x, lo_y, hi_y = rng.choice(_REST_REGIONS)
+    x = int(vw * rng.uniform(lo_x, hi_x))
+    y = int(vh * rng.uniform(lo_y, hi_y))
+    m = 8
+    return max(m, min(vw - m, x)), max(m, min(vh - m, y))
+
+
+def _actionable_target(page: Any, rng: Any, targets: tuple[str, ...] | None) -> tuple[int, int] | None:
+    """Centre of a visible, actionable control (Like/Comment/author/link/nav).
+
+    This is the PURPOSEFUL reach the prior motor lacked: the pointer goes to a
+    thing a person would act on, not a random point on a post. Returns None when
+    no actionable element is on screen so the caller can fall back to content."""
+    if not targets:
+        return None
+    loc = _pick_visible_locator(page, rng, ", ".join(targets))
+    if loc is None:
+        return None
+    try:
+        box = loc.bounding_box()
+        if box and box.get("width") and box.get("height"):
+            vw, vh = _viewport_wh(page)
+            cx = int(box["x"] + box["width"] * rng.uniform(0.35, 0.65))
+            cy = int(box["y"] + box["height"] * rng.uniform(0.35, 0.65))
+            return max(8, min(vw - 8, cx)), max(8, min(vh - 8, cy))
+    except Exception:
+        return None
+    return None
+
+
 def run_markov_simulation(
     page: Any,
     behavior_plan: dict[str, Any] | None = None,
@@ -396,6 +441,7 @@ def run_markov_simulation(
     suppress_intro_wait: bool = False,
     mousemove_targets: tuple[str, ...] | None = None,
     hover_targets: tuple[str, ...] | None = None,
+    actionable_targets: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Execute a dynamic, semi-Markov-driven browsing session.
 
@@ -405,7 +451,11 @@ def run_markov_simulation(
     state). ``suppress_intro_wait`` skips the fixed ~1s settle so chained bursts
     don't stamp a periodic preamble signature. ``mousemove_targets`` /
     ``hover_targets`` aim the random walk's moves/hovers at real on-page content
-    (e.g. feed posts) instead of arbitrary viewport coordinates."""
+    (e.g. feed posts) instead of arbitrary viewport coordinates.
+    ``actionable_targets`` (Like/Comment/author/link/nav controls) let a fraction
+    of moves be PURPOSEFUL reaches toward something a person would act on, while
+    others park the pointer off to the side — so the cursor is not perpetually
+    grazing the centre column."""
     plan = behavior_plan or {}
     recorder = recorder or SessionRecorder(plan)
 
@@ -501,9 +551,33 @@ def run_markov_simulation(
                     update_status_ticker(page, "👁️ READING", f"Pausing to read content ({dwell_ms}ms)...")
 
             elif next_state == "mousemove":
-                cx, cy = _content_move_target(page, rng, mousemove_targets)
+                # A human's pointer is PURPOSEFUL or PARKED, not perpetually grazing
+                # the centre column. Mix three motives: reach an actionable control
+                # (a "go do something" move, settle + read it for a beat), park off
+                # to the side and hold still, or aim at content to read. The first
+                # two break the central-column / left-right-float tell directly.
+                roll = rng.random()
+                coord = None
+                kind = "content"
+                if roll < 0.30:
+                    coord = _actionable_target(page, rng, actionable_targets)
+                    if coord is not None:
+                        kind = "actionable"
+                elif roll < 0.52:
+                    coord = _rest_target(page, rng)
+                    kind = "rest"
+                if coord is None:
+                    coord = _content_move_target(page, rng, mousemove_targets)
+                    kind = "content"
+                cx, cy = coord
                 update_status_ticker(page, "🖱️ MOVING", f"Moving mouse to ({cx}, {cy})...")
                 move_pointer(page, cx, cy, plan, recorder=recorder)
+                if kind == "actionable":
+                    # Settle on the control and read it (purposeful reach, not a graze).
+                    page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=320.0, cv=0.5, lo=90.0, hi=900.0)))
+                elif kind == "rest":
+                    # Pointer parked off to the side: hold genuinely still.
+                    page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=650.0, cv=0.6, lo=150.0, hi=2200.0)))
 
             elif next_state == "scroll_down":
                 # A human on the wheel does a RUN of flicks before repositioning the
@@ -518,7 +592,7 @@ def run_markov_simulation(
                     update_status_ticker(
                         page, "📜 SCROLLING", f"Scrolling down ~{delta}px ({fi + 1}/{n_flicks})..."
                     )
-                    scroll_page(page, plan, pass_index=steps_executed + fi, fallback_delta_y=delta, recorder=recorder)
+                    scroll_page(page, plan, pass_index=steps_executed + fi, fallback_delta_y=delta, recorder=recorder, honor_fallback=True)
                     if fi < n_flicks - 1:
                         # The short beat between wheel flicks.
                         page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=170.0, cv=0.5, lo=40.0, hi=650.0)))
@@ -539,7 +613,7 @@ def run_markov_simulation(
                 # so the wheel actually scrolls UP for a re-read.
                 delta = -rng.randint(150, 500)
                 update_status_ticker(page, "📜 SCROLLING", f"Scrolling up ~{-delta}px (re-reading)...")
-                scroll_page(page, plan, pass_index=steps_executed, fallback_delta_y=delta, recorder=recorder)
+                scroll_page(page, plan, pass_index=steps_executed, fallback_delta_y=delta, recorder=recorder, honor_fallback=True)
 
             elif next_state == "hover":
                 update_status_ticker(page, "👁️ HOVERING", "Looking for hover target...")

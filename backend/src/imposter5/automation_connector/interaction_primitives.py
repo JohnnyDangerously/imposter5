@@ -232,9 +232,22 @@ def scroll_page(
     fallback_delta_y: int = 900,
     *,
     recorder: SessionRecorder | None = None,
+    honor_fallback: bool = False,
 ) -> int:
-    """Scroll using a planned bounded delta, with mouse positioning over content first so the wheel is accompanied by realistic mouse events (for detectors and human twin traces). Returns the actual delta used."""
-    delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
+    """Scroll using a planned bounded delta, with mouse positioning over content first so the wheel is accompanied by realistic mouse events (for detectors and human twin traces). Returns the actual delta used.
+
+    ``honor_fallback`` makes the call use ``fallback_delta_y`` verbatim (sign and
+    magnitude) instead of the plan's precomputed pacing list. The semi-Markov feed
+    engine sets this: it samples a fresh, randomized per-flick magnitude on every
+    wheel flick and owns scroll variety itself. Routing those flicks through the
+    pacing list was the scroll regression — the list is indexed by an ever-growing
+    step counter, so ``planned_scroll_delta`` clamped to the list's LAST element and
+    made every feed scroll an identical magnitude (the "no scroll randomness" tell).
+    The legacy per-pass loop keeps the default (read the pacing list)."""
+    if honor_fallback:
+        delta_y = int(fallback_delta_y)
+    else:
+        delta_y = planned_scroll_delta(plan, pass_index, fallback_delta_y)
 
     rng = _session_rng(page, plan)
     update_status_ticker(page, "📜 SCROLLING", f"Delta: {delta_y}px (pass {pass_index})")
@@ -250,11 +263,25 @@ def scroll_page(
     step_mean = _bounded_float(hc.get("scroll_step_pause_ms"), lower=4.0, upper=400.0, default=55.0)
     step_cv = _bounded_float(hc.get("scroll_step_pause_cv"), lower=0.0, upper=2.0, default=0.4)
     settle_mean = _bounded_float(hc.get("scroll_settle_ms"), lower=20.0, upper=1500.0, default=220.0)
+    overshoot_chance = _bounded_float(hc.get("scroll_overshoot_chance"), lower=0.0, upper=0.6, default=0.22)
 
     deltas = scroll_decay_deltas(rng, total_px=float(delta_y), max_steps=max_steps, decay=decay)
     for step_delta in deltas:
         page.mouse.wheel(0, step_delta)
         page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=step_mean, cv=step_cv, lo=4.0, hi=400.0)))
+
+    # Over-scroll correction (the missing reverse-direction "debounce"). Momentum
+    # decay alone never reverses, so every burst stopped cleanly in one direction —
+    # a tell. A human routinely flicks a touch past where they meant to stop and
+    # nudges back the OTHER way once the eyes catch the content. Fire occasionally
+    # with a brief "too far" reaction pause before the corrective nudge.
+    overshoot_px = 0
+    if deltas and rng.random() < overshoot_chance:
+        sign = -1 if delta_y >= 0 else 1
+        overshoot_px = sign * int(max(18, min(90, abs(delta_y) * rng.uniform(0.05, 0.16))))
+        page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=140.0, cv=0.4, lo=60.0, hi=320.0)))
+        page.mouse.wheel(0, overshoot_px)
+
     # Settle pause (eyes catch up to the content after the flick stops).
     page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=settle_mean, cv=0.4, lo=20.0, hi=1500.0)))
 
@@ -264,7 +291,10 @@ def scroll_page(
     if recorder is not None:
         recorder.record(
             "scroll",
-            metadata={"pass_index": pass_index, "delta_y": delta_y, "steps": len(deltas)},
+            metadata={
+                "pass_index": pass_index, "delta_y": delta_y,
+                "steps": len(deltas), "overshoot_px": overshoot_px,
+            },
         )
     return delta_y
 
@@ -295,6 +325,7 @@ def _position_mouse_over_content(page: Any, plan: dict[str, Any] | None, rng: ra
                 const HEADER = 64;  // keep below a typical fixed app bar
                 const sels = ['article', 'main', "[role='main']",
                               "section[aria-label*='feed' i]", '.g-feed-post'];
+                const rects = [];
                 for (const s of sels) {
                     const els = document.querySelectorAll(s);
                     for (let i = 0; i < Math.min(els.length, 40); i++) {
@@ -302,20 +333,48 @@ def _position_mouse_over_content(page: Any, plan: dict[str, Any] | None, rng: ra
                         const top = Math.max(r.top, HEADER), bot = Math.min(r.bottom, vh - 8);
                         const left = Math.max(r.left, 8), right = Math.min(r.right, vw - 8);
                         if (bot - top > 40 && right - left > 60) {
-                            return {left, top, w: right - left, h: bot - top};
+                            rects.push({left, top, w: right - left, h: bot - top});
+                            if (rects.length >= 8) break;
                         }
                     }
+                    if (rects.length >= 8) break;
                 }
-                return {left: vw * 0.30, top: HEADER, w: vw * 0.40, h: vh - HEADER - 8};
+                return {rects, vw, vh, header: HEADER};
             }""",
         )
     except Exception:
         spot = None
     if not isinstance(spot, dict):
         return
+    vw = float(spot.get("vw") or 0.0)
+    vh = float(spot.get("vh") or 0.0)
+    rects = spot.get("rects") if isinstance(spot.get("rects"), list) else []
+    header = float(spot.get("header") or 64.0)
     try:
-        x = spot["left"] + spot["w"] * rng.uniform(0.28, 0.62)
-        y = spot["top"] + spot["h"] * rng.uniform(0.30, 0.70)
+        # A reader does NOT hold the pointer pinned to the dead-centre of the
+        # content column flick after flick. Vary WHERE the wheel originates: most
+        # of the time over a (randomly chosen) on-screen post with a wide spread
+        # inside it, but a meaningful share of the time parked off toward a rail /
+        # gutter. The cursor stays on-screen either way so the DOM wheel event
+        # always dispatches (an off-screen cursor silently drops the wheel event).
+        roll = rng.random()
+        if vw > 0 and vh > 0 and roll < 0.30:
+            # Off-column rest: left rail or right gutter, anywhere down the page.
+            if rng.random() < 0.5:
+                x = vw * rng.uniform(0.04, 0.17)
+            else:
+                x = vw * rng.uniform(0.83, 0.96)
+            y = header + (vh - header - 8) * rng.uniform(0.12, 0.88)
+        elif rects:
+            r = rects[rng.randrange(len(rects))]
+            x = r["left"] + r["w"] * rng.uniform(0.14, 0.86)
+            y = r["top"] + r["h"] * rng.uniform(0.18, 0.84)
+        elif vw > 0 and vh > 0:
+            # No resolvable content: a varied viewport point (never fixed centre).
+            x = vw * rng.uniform(0.18, 0.82)
+            y = header + (vh - header - 8) * rng.uniform(0.15, 0.85)
+        else:
+            return
         _safe_mouse_move(page, x, y, plan, rng, recorder=recorder)
     except Exception:
         pass
@@ -1070,24 +1129,49 @@ def _emit_bezier(
 
     # Tremor is MOMENTARY, not continuous. A real hand's jitter is swamped by the
     # ballistic sweep and only becomes visible as it decelerates and settles on
-    # the target (low-velocity homing). Applying it across the whole path makes a
-    # slow move look like a constant unnatural wobble. Gate the amplitude to the
-    # final stretch with a smooth ramp so the reach is clean and only the settle
-    # carries sub-pixel jitter.
+    # the target (low-velocity homing). Two prior failures made it a detection
+    # tell rather than realism, both fixed here:
+    #   1. The amplitude ramped MONOTONICALLY to a maximum AT the endpoint, so the
+    #      cursor's last recorded sample carried a sub-pixel offset — jitter sitting
+    #      on a point the hand has stopped at. Real tremor during homing is a DAMPED
+    #      burst that decays to ~0 as the hand arrives. We now use a windowed (Hann)
+    #      envelope over the settle: it rises, peaks mid-settle, and returns to 0 at
+    #      the endpoint, so the move ends clean.
+    #   2. The perpendicular axis was taken from the LOCAL sample-to-sample tangent.
+    #      At the low-velocity settle consecutive samples are ~coincident, so that
+    #      tangent collapses and its perpendicular flipped direction every step —
+    #      spraying noise in random directions ("micro-jitter not part of a
+    #      movement"). We fall back to the stable segment-chord perpendicular
+    #      whenever the local tangent is degenerate, so the wobble stays a coherent
+    #      cross-path oscillation.
     n_raw = len(raw)
     tremor_onset = 0.78  # no tremor until the last ~22% of the movement
+    chord_dx, chord_dy = (p3[0] - p0[0]), (p3[1] - p0[1])
+    chord_len = math.hypot(chord_dx, chord_dy)
+    if chord_len > 1e-6:
+        chord_perp = (-chord_dy / chord_len, chord_dx / chord_len)
+    else:
+        chord_perp = (0.0, 0.0)  # zero-length move: no direction, no jitter.
     last = p3
     for i in range(n_raw):
         px, py = raw[i]
         frac = (i / (n_raw - 1)) if n_raw > 1 else 1.0
-        env = 0.0 if frac < tremor_onset else ((frac - tremor_onset) / (1.0 - tremor_onset))
+        if frac < tremor_onset:
+            env = 0.0
+        else:
+            w = (frac - tremor_onset) / (1.0 - tremor_onset)
+            env = math.sin(math.pi * w)  # 0 -> peak -> 0 (damped, clean endpoint)
         eff_amp = amp * env
         if eff_amp > 0.0 and i < n_raw - 1:
-            # Perpendicular tremor using the local travel tangent.
+            # Perpendicular tremor: prefer the local travel tangent, but fall back to
+            # the stable chord normal when the local tangent is degenerate (settle).
             nx, ny = raw[i + 1]
             tx, ty = (nx - px), (ny - py)
-            tlen = math.hypot(tx, ty) or 1.0
-            perp_x, perp_y = -ty / tlen, tx / tlen
+            tlen = math.hypot(tx, ty)
+            if tlen >= 0.5:
+                perp_x, perp_y = -ty / tlen, tx / tlen
+            else:
+                perp_x, perp_y = chord_perp
             t_s = clock[0] / 1000.0
             # Band tremor: two detuned ~8-12Hz components + small longitudinal term.
             osc = (

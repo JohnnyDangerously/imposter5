@@ -183,6 +183,24 @@ def _within(post: Any, candidates: list[str]) -> Any | None:
 # =========================================================================== #
 # Low-level behaviors
 # =========================================================================== #
+def _actionable_selectors(fs: FeedSession) -> tuple[str, ...]:
+    """Profile-resolved controls a reader reaches FOR (author/Like/Comment/nav).
+
+    Aiming a fraction of ambient moves at these (a purposeful reach) instead of
+    only post bodies is what keeps the pointer from perpetually grazing the centre
+    column. Resolved through the site profile so it stays provider-neutral; a
+    generic ``a/button`` fallback keeps the reach meaningful on any conformant
+    site. The goal layer still owns any real click."""
+    sels: list[str] = []
+    for role in ("post_author", "feed_like", "comments_toggle", "nav_home", "nav_notifications"):
+        try:
+            sels.extend(fs.resolver.css_candidates(role) or [])
+        except Exception:
+            continue
+    out = tuple(dict.fromkeys(s for s in sels if s))
+    return out or ("a[href]", "button")
+
+
 def scan_feed_burst(fs: FeedSession, *, steps: int) -> None:
     """One semi-Markov ambient scan burst over the feed, aiming hovers/moves at the
     resolved feed-post container (never arbitrary viewport coordinates)."""
@@ -197,6 +215,7 @@ def scan_feed_burst(fs: FeedSession, *, steps: int) -> None:
             initial_state=state.get("final_state"), initial_intent=state.get("final_intent"),
             intent_steps_left=state.get("intent_steps_left"), suppress_intro_wait=bool(state),
             mousemove_targets=targets, hover_targets=targets,
+            actionable_targets=_actionable_selectors(fs),
         )
     except Exception:
         logger.debug("[feed_actions] feed scan burst failed", exc_info=True)
@@ -607,19 +626,19 @@ def expand_reactions(fs: FeedSession) -> bool:
 
 
 def _sprinkle_engagement(fs: FeedSession) -> None:
-    """Randomly sprinkle ONE richer engagement micro-behavior per scan cycle, so
-    sessions don't read as a flat scroll. Weighted so most cycles add nothing
-    extra (a human doesn't poke every post)."""
+    """Randomly sprinkle at most ONE richer engagement micro-behavior per scan
+    cycle, so sessions don't read as a flat scroll. Weighted so a cycle adds at
+    most one extra gesture and many add none (a human doesn't poke every post)."""
     r = random.random()
-    if r < 0.20:
+    if r < 0.26:
         if hover_author_card(fs):
             fs.summary["author_hovers"] = fs.summary.get("author_hovers", 0) + 1
             fs.actions.append("author_hovercard")
-    elif r < 0.33:
+    elif r < 0.44:
         if expand_comments(fs):
             fs.summary["comments_expanded"] = fs.summary.get("comments_expanded", 0) + 1
             fs.actions.append("comments_expand")
-    elif r < 0.42:
+    elif r < 0.54:
         if expand_reactions(fs):
             fs.summary["reactions_expanded"] = fs.summary.get("reactions_expanded", 0) + 1
             fs.actions.append("reactions_expand")
@@ -641,6 +660,36 @@ def feed_scan_cycle(fs: FeedSession, *, steps: int | None = None) -> None:
     new_posts: list[dict[str, Any]] = []
     fs.summary["posts_captured"] += capture_visible_posts(fs, sink=new_posts)
     fs.scorer.submit(new_posts)
+
+    # Loud diagnostic: if NO feed post resolves on the page, every content-driven
+    # gesture below (scoring, author hovercards, likes, comment/reaction expands,
+    # text-highlight reads, profile excursions) silently no-ops and the session
+    # degrades to a bare scroll-only walk. That is exactly the "doesn't highlight
+    # text / doesn't open profiles / just scrolls a box" failure — and it used to
+    # be invisible (the run still "succeeded" with an empty timeline). Surface it
+    # once per session so selector drift or an unloaded feed is caught, not hidden.
+    if not fs.summary.get("feed_post_unresolved_warned"):
+        try:
+            has_post = fs.resolver.selector_for("feed_post") is not None or bool(
+                fs.resolver.all("feed_post", limit=1)
+            )
+        except Exception:
+            has_post = True  # never let the probe itself break the walk
+        if not has_post:
+            fs.summary["feed_post_unresolved_warned"] = True
+            fs.summary["feed_post_unresolved"] = True
+            logger.warning(
+                "[feed_actions] no 'feed_post' element resolves on %s — feed engagement "
+                "(scoring/hovercards/likes/highlights/profile excursions) will no-op; "
+                "session will be a scroll-only walk. Check the site affordance profile "
+                "selectors or whether the feed actually loaded.",
+                fs.summary.get("profile"),
+            )
+            if fs.recorder is not None:
+                try:
+                    fs.recorder.record("feed_post_unresolved", metadata={"profile": fs.summary.get("profile")})
+                except Exception:
+                    pass
 
     if random.random() < 0.5:
         act_on_scored_posts(fs)

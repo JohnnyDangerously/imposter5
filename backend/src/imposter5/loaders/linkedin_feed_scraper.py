@@ -1125,12 +1125,17 @@ def _peek_random_profile_variation(
 # minimal, and idle is small — otherwise the walk reads as a hesitant
 # scroll-a-little / scroll-back / pause loop, which both looks wrong on video
 # and trips the journey scorer's "aimless" check.
+# scroll_down stays the dominant state (a feed is mostly scrolling), but a scroll
+# STOP now leads into idle far more often (0.12 -> 0.22): the idle state is where
+# the reader pauses and traces/highlights a line (see run_markov_simulation), so
+# this restores the "longer scrolling pause + highlight some text" rhythm Blue
+# flagged as missing. Rows are renormalized at runtime; these stay ~1.0.
 FEED_SCAN_MATRIX: dict[str, dict[str, float]] = {
-    "idle":        {"idle": 0.06, "mousemove": 0.18, "scroll_down": 0.66, "scroll_up": 0.03, "hover": 0.07},
-    "mousemove":   {"idle": 0.06, "mousemove": 0.12, "scroll_down": 0.64, "scroll_up": 0.03, "hover": 0.15},
-    "scroll_down": {"idle": 0.12, "mousemove": 0.13, "scroll_down": 0.66, "scroll_up": 0.03, "hover": 0.06},
-    "scroll_up":   {"idle": 0.10, "mousemove": 0.16, "scroll_down": 0.66, "scroll_up": 0.04, "hover": 0.04},
-    "hover":       {"idle": 0.12, "mousemove": 0.16, "scroll_down": 0.60, "scroll_up": 0.03, "hover": 0.09},
+    "idle":        {"idle": 0.10, "mousemove": 0.18, "scroll_down": 0.56, "scroll_up": 0.04, "hover": 0.12},
+    "mousemove":   {"idle": 0.12, "mousemove": 0.12, "scroll_down": 0.55, "scroll_up": 0.04, "hover": 0.17},
+    "scroll_down": {"idle": 0.22, "mousemove": 0.13, "scroll_down": 0.55, "scroll_up": 0.04, "hover": 0.06},
+    "scroll_up":   {"idle": 0.18, "mousemove": 0.16, "scroll_down": 0.56, "scroll_up": 0.04, "hover": 0.06},
+    "hover":       {"idle": 0.18, "mousemove": 0.16, "scroll_down": 0.52, "scroll_up": 0.04, "hover": 0.10},
 }
 
 # Generic "worth stopping for" markers for a professional feed. When the run
@@ -1148,6 +1153,20 @@ _DEFAULT_INTEREST_TERMS: tuple[str, ...] = (
 _FEED_HOVER_SELECTORS: tuple[str, ...] = (
     "main a[href*='/feed/update/']",
     "main a[href*='/in/']",
+)
+
+# Controls a reader actually reaches FOR (a purposeful "go do something" move,
+# distinct from a content hover). The ambient walk aims a fraction of its moves
+# here so the pointer is sometimes acquiring a real affordance — Like/Comment,
+# the author, a post link, the top nav — instead of perpetually grazing post
+# bodies in the centre column. The goal layer still owns any actual click.
+_FEED_ACTION_SELECTORS: tuple[str, ...] = (
+    "main button[aria-label*='Like' i]",
+    "main button[aria-label*='Comment' i]",
+    "main a[href*='/in/']",
+    "main a[href*='/feed/update/']",
+    "header a[href*='/feed/']",
+    "header a[href*='/notifications/']",
 )
 
 
@@ -1201,6 +1220,7 @@ def _run_feed_ambient(
             suppress_intro_wait=bool(cont),
             mousemove_targets=_RULES.post_container_selectors,
             hover_targets=_FEED_HOVER_SELECTORS,
+            actionable_targets=_FEED_ACTION_SELECTORS,
         )
     except Exception:
         logger.debug("[linkedin_feed_scraper] feed ambient markov burst failed", exc_info=True)
@@ -1588,7 +1608,10 @@ def scrape_feed(
             # This makes the LinkedIn static observation path use the same high-quality human twin mechanics
             # (from behavior_policy + primitives) as the generic/agent paths, without adopting full prompt
             # interpretation or goal_runner (per the "everything but the prompt action stuff" boundary).
-            recorder = SessionRecorder(behavior_plan)
+            # Mirror events to ``<record_dir>/events.jsonl`` as they happen so an
+            # interrupted run (deploy/restart kill) or a zero-post run still leaves
+            # a real motor track instead of an empty/absent sidecar.
+            recorder = SessionRecorder(behavior_plan, flush_dir=record_video_dir)
             video_offset_ms: int | None = None
             try:
                 video_offset_ms = round(

@@ -1133,6 +1133,24 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         except Exception:
             pass
 
+    # A zero-post scrape never lifts the payload and an interrupted run can drop
+    # it — fall back to the on-disk live event log (events.jsonl in video_dir) so
+    # the sidecar carries the real motor track instead of ``events: []``.
+    if not (isinstance(session_rec, dict) and session_rec.get("events")):
+        try:
+            from imposter5.automation_connector.session_recorder import (
+                load_partial_session,
+            )
+            partial = load_partial_session(video_dir)
+        except Exception:
+            partial = None
+        if partial is not None:
+            session_rec = partial
+            logs.append(
+                f"[{datetime.now().isoformat()}] Recovered {partial['event_count']} "
+                "events from events.jsonl (in-memory payload was empty)"
+            )
+
     # Persist the run's session recording to disk as a sidecar JSON next to the
     # video so the /playback player can replay this run later, not just in-process.
     session_filename = _write_session_sidecar(
