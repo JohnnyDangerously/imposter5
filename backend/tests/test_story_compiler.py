@@ -126,3 +126,26 @@ def test_seed_is_reproducible() -> None:
     b = compile_story(intent, seed="fixed-7")
     assert a.signature() == b.signature()
     assert [s.dwell_ms for s in a.scenes] == [s.dwell_ms for s in b.scenes]
+
+
+def test_open_count_target_drives_a_profile_binge() -> None:
+    # A binge (open_count target=20) must compile to MANY profile opens, not the old
+    # hard 1-3 cap that silently truncated every binge to single digits.
+    intent = _intent(
+        archetype="profile_browse:test",
+        objective={
+            "main_scenes": ["search_open", "search_query", "results_scan", "profile_open", "profile_back"],
+            "query_hint": "",
+            "goal_predicate": {"type": "open_count", "target": 20, "jitter": 0.3},
+        },
+        curiosity={"tangent_chance": 0.0, "max_tangents": 0, "max_depth": 1, "tangent_scenes": []},
+    )
+    counts = [
+        sum(1 for sc in compile_story(intent, seed=f"binge-{s}").main_scenes if sc.name == "profile_open")
+        for s in range(20)
+    ]
+    # Honors the target band (~0.7-1.3x), nowhere near the old 1-3 cap...
+    assert min(counts) >= 10, f"binge truncated: min opens {min(counts)}"
+    assert max(counts) <= 30, f"binge overshoots target band: max opens {max(counts)}"
+    # ...and still varies run-to-run (not a fixed count).
+    assert len(set(counts)) >= 4, f"binge length not varied: {sorted(set(counts))}"

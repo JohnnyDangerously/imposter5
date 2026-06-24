@@ -240,11 +240,29 @@ class StoryCompiler:
         if n_scan == 0:
             n_scan = 1  # always at least one scan so a result set is established
         can_profile = "profile_open" in present
-        n_cycles = rng.randint(1, 3) if can_profile else 0
+        gp = self.intent.goal_predicate
+        if not can_profile:
+            n_cycles = 0
+        elif gp.type == "open_count":
+            # Honor the requested open count so a profile-binge actually opens MANY.
+            # The old hard 1-3 cap silently truncated every binge to single digits
+            # (the "never looks at 15-30 profiles" gap). Vary around the target per
+            # seed so length still differs run to run.
+            tgt = max(1, int(round(float(gp.target))))
+            if var.partial_substitution and tgt > 2:
+                lo = max(1, int(round(tgt * 0.7)))
+                hi = max(lo, int(round(tgt * 1.3)))
+                n_cycles = rng.randint(lo, hi)
+            else:
+                n_cycles = tgt
+        else:
+            n_cycles = rng.randint(1, 3)
         if not var.partial_substitution:
-            # Deterministic body when substitution is disabled: one scan + one cycle.
+            # Deterministic body when substitution is disabled: a single scan spine.
+            # A binge still keeps its exact open count (the whole point of the arc).
             n_scan = 1
-            n_cycles = 1 if can_profile else 0
+            if gp.type != "open_count":
+                n_cycles = 1 if can_profile else 0
 
         scan_units = ["results_scan"] * n_scan
         cycle_units = list(range(n_cycles))

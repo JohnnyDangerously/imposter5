@@ -82,6 +82,24 @@ def test_activity_mix_is_not_scroll_dominant():
     assert "tangent_lookup" in pure.tangent_scenes
 
 
+def test_profile_binge_arcs_emit_open_count_intents():
+    # The "look at 5 fast then leave" and "sweep 15-30 profiles" shapes a feed-scroll
+    # arc cannot express: a profile-FIRST open_count campaign, not a feed_scan goal.
+    rng = random.Random(11)
+    five, name5 = build_feed_intent({}, duration_s=300.0, rng=rng, arc_name="five_and_bounce")
+    assert name5 == "five_and_bounce"
+    assert five.goal_predicate.type == "open_count"
+    assert 4 <= five.goal_predicate.target <= 7
+    assert "profile_open" in five.objective.main_scenes
+    # A fast skim: open -> back, no long profile_read.
+    assert "profile_read" not in five.objective.main_scenes
+
+    sweep, name_s = build_feed_intent({}, duration_s=600.0, rng=rng, arc_name="profile_sweep")
+    assert name_s == "profile_sweep"
+    assert sweep.goal_predicate.type == "open_count"
+    assert 15 <= sweep.goal_predicate.target <= 30
+
+
 def test_build_behavior_plan_samples_human_duration():
     plan = build_behavior_plan({"id": "t-1"}, provider="generic_web", seed="stable")
     assert sd.MIN_SECONDS <= plan["gauntlet_duration_s"] <= sd.MAX_SECONDS

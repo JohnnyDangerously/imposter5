@@ -45,6 +45,9 @@ class FeedArc:
     tangent_scenes: tuple[str, ...]  # which check-stops this arc tends to do
     dwell_cv: float
     describe: str
+    # Binge arcs: (lo, hi) profiles to open in one sitting. None => an ordinary
+    # feed-scroll arc whose length is driven by ``scan_frac``, not an open count.
+    open_count: tuple[int, int] | None = None
 
 
 # The base loop is always aimless feed scrolling; arcs differ in length and what
@@ -82,6 +85,19 @@ ARCS: tuple[FeedArc, ...] = (
         ("tangent_search", "tangent_lookup", "tangent_notifications", "tangent_glance"), 0.40,
         "Scroll, search an interest and read a profile, return, keep scrolling.",
     ),
+    # Profile-binge arcs: the MAIN activity is opening many profiles fast, not feed
+    # scrolling — modelling "I'll look at ~5 quickly and leave" and "I'll look at
+    # 15-30 and it won't take long." Curiosity is off: a binge is focused, not wandering.
+    FeedArc(
+        "five_and_bounce", 1.2, (0.0, 0.18), 0.0, 0, (), 0.35,
+        "Open a handful of profiles fast — a quick look at each — then bounce.",
+        open_count=(4, 7),
+    ),
+    FeedArc(
+        "profile_sweep", 1.0, (0.0, 0.25), 0.0, 0, (), 0.30,
+        "Sweep through many profiles in one sitting, skimming each, rarely lingering.",
+        open_count=(15, 30),
+    ),
 )
 _ARCS_BY_NAME = {a.name: a for a in ARCS}
 
@@ -101,6 +117,43 @@ def _pick_arc(plan: dict[str, Any] | None, rng: random.Random) -> FeedArc:
     return rng.choices(ARCS, weights=weights, k=1)[0]
 
 
+def _build_binge_intent(
+    arc: FeedArc, plan: dict[str, Any] | None, rng: random.Random
+) -> TaskIntent:
+    """A profile-FIRST session: search, then open ``open_count`` profiles, skimming
+    each (open -> back, no long read). This is the binge shape a feed-scroll arc
+    cannot express — the compiler now honors the open_count target instead of the
+    old hard 1-3 cap, so 15-30 opens actually happen.
+    """
+    assert arc.open_count is not None
+    lo, hi = arc.open_count
+    open_target = rng.randint(int(lo), int(hi))
+    site = (plan or {}).get("site", "gauntlet") if isinstance(plan, dict) else "gauntlet"
+    payload: dict[str, Any] = {
+        "schema": "lhhl-task-intent/v1",
+        "site": site,
+        "archetype": f"profile_browse:{arc.name}",
+        "describe": arc.describe,
+        "objective": {
+            # open -> back per profile (no profile_read): a fast skim, not a deep read.
+            "main_scenes": [
+                "search_open", "search_query", "results_scan", "profile_open", "profile_back",
+            ],
+            "query_hint": "",
+            "goal_predicate": {"type": "open_count", "target": open_target, "jitter": 0.3},
+        },
+        "curiosity": {
+            "tangent_chance": arc.tangent_chance,
+            "max_tangents": arc.max_tangents,
+            "max_depth": 1,
+            "tangent_scenes": list(arc.tangent_scenes),
+        },
+        "variance": {"dwell_cv": arc.dwell_cv, "order_jitter": True, "partial_substitution": True},
+        "cadence": "profile_browse",
+    }
+    return parse_task_intent(payload)
+
+
 def build_feed_intent(
     plan: dict[str, Any] | None,
     *,
@@ -114,6 +167,9 @@ def build_feed_intent(
         arc = _ARCS_BY_NAME[arc_name]
     else:
         arc = _pick_arc(plan, rng)
+
+    if arc.open_count is not None:
+        return _build_binge_intent(arc, plan, rng), arc.name
 
     max_scans = max(2, int(round(float(duration_s) / _SECONDS_PER_SCAN)))
     frac = rng.uniform(*arc.scan_frac)
