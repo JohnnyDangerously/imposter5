@@ -92,6 +92,37 @@ def test_pacing_list_clamps_to_last_without_honor_fallback():
     assert all(d == 1281 for d in deltas[1:]), "pre-fix path clamps to the last pacing element"
 
 
+# --------------------------------------------------------------------------- #
+# Fix #1b — scroll burst rhythm: a run of flicks per reposition, not 1:1 metronome
+# --------------------------------------------------------------------------- #
+def test_scroll_feed_flicks_fires_a_burst_then_one_reposition():
+    """``scroll_feed_flicks`` fires a RUN of 2-5 wheel flicks in a single call (the
+    cursor repositions once at the start of the burst, not once per scroll), records
+    each flick as its own scroll event, and bounds every flick to a human wheel
+    notch — the fix for the metronomic one-scroll-one-move tell."""
+    page = _WheelPage()
+    rec = _Recorder()
+    result = ip.scroll_feed_flicks(
+        page, {"session_seed": "flick-burst"}, pass_index=0, recorder=rec, min_flicks=2, max_flicks=5
+    )
+    scrolls = [m for a, m in rec.events if a == "scroll"]
+    assert 2 <= len(scrolls) <= 5                       # a burst, not a single scroll
+    assert len(scrolls) == result["flicks"]
+    assert result["delta_y"] == sum(page.wheels)
+    assert all(140 <= d <= 520 for d in page.wheels)    # bounded human wheel notches
+    assert [m["flick"] for m in scrolls] == list(range(len(scrolls)))
+    assert all(m["pass_index"] == 0 for m in scrolls)
+
+
+def test_scroll_feed_flicks_is_deterministic_per_seed():
+    """Seeded by the plan, a burst is replayable: same seed + pass_index -> identical
+    flick count and deltas, so sessions reproduce without being globally constant."""
+    plan = {"session_seed": "repeat-me"}
+    a = ip.scroll_feed_flicks(_WheelPage(), plan, pass_index=1, min_flicks=1, max_flicks=5)
+    b = ip.scroll_feed_flicks(_WheelPage(), plan, pass_index=1, min_flicks=1, max_flicks=5)
+    assert a == b
+
+
 def test_markov_feed_scroll_deltas_are_not_constant():
     """End-to-end: the ambient walk forced into scroll_down emits VARIED wheel
     magnitudes, even though the plan carries a clamping pacing list."""

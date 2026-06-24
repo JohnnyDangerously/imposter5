@@ -395,6 +395,45 @@ def _micro_mouse_adjust(page: Any, plan: dict[str, Any] | None, rng: random.Rand
         pass
 
 
+def scroll_feed_flicks(
+    page: Any,
+    plan: dict[str, Any] | None,
+    pass_index: int = 0,
+    *,
+    recorder: SessionRecorder | None = None,
+    min_flicks: int = 1,
+    max_flicks: int = 5,
+) -> dict[str, Any]:
+    """Scroll the feed as a *run* of 1-5 wheel flicks before the hand repositions.
+
+    A person on a scroll wheel fires several quick flicks in a row, with the cursor
+    usually resting still between them (occasionally nudging a few px), and only
+    repositions on a separate beat. One scroll + one full mouse move per pass (the
+    old rhythm) reads as metronomic — this is the tell it fixes. The mouse is
+    positioned over content once at the start of the burst; flicks then fire
+    without a full reposition between them.
+    """
+    rng = _seeded_rng(plan, f"flicks:{pass_index}")
+    base = planned_scroll_delta(plan, pass_index, 900)
+    n_flicks = rng.randint(max(1, min_flicks), max(max(1, min_flicks), max_flicks))
+    _position_mouse_over_content(page, plan, rng, recorder)
+    total = 0
+    for fi in range(n_flicks):
+        delta = max(140, min(520, int(base * rng.uniform(0.28, 0.62))))
+        try:
+            page.mouse.wheel(0, delta)
+        except Exception:
+            pass
+        total += delta
+        if recorder is not None:
+            recorder.record("scroll", metadata={"pass_index": pass_index, "delta_y": delta, "flick": fi})
+        if fi < n_flicks - 1:
+            page.wait_for_timeout(rng.randint(45, 360))
+            if rng.random() < 0.35:
+                _micro_mouse_adjust(page, plan, rng, recorder)
+    return {"flicks": n_flicks, "delta_y": total}
+
+
 def _neighboring_char(char: str) -> str:
     alphabet = string.ascii_lowercase
     lower = char.lower()

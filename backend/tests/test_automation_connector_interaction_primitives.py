@@ -93,9 +93,16 @@ class FakePage:
         # Pre-scroll mouse positioning now probes for a VISIBLE content rect via a
         # single JS evaluate (intersecting containers with the viewport) instead of
         # query_selector + bounding_box, so the cursor lands on-screen and the wheel
-        # actually dispatches a DOM event. Return a content-area rect for the fake.
+        # actually dispatches a DOM event. The probe returns ``{rects, vw, vh,
+        # header}`` (a list of on-screen rects plus viewport dims); return that shape
+        # so positioning resolves a target and reliably emits a mouse move.
         self.events.append(("evaluate", expression))
-        return {"left": 200.0, "top": 120.0, "w": 700.0, "h": 600.0}
+        return {
+            "rects": [{"left": 200.0, "top": 120.0, "w": 700.0, "h": 600.0}],
+            "vw": 1280.0,
+            "vh": 800.0,
+            "header": 64.0,
+        }
 
     def wait_for_timeout(self, timeout_ms: int) -> None:
         self.events.append(("wait", timeout_ms))
@@ -115,7 +122,16 @@ class FakePage:
 
 def test_wait_and_scroll_use_planned_values() -> None:
     page = FakePage()
-    plan = {"run_id": "r1", "pacing": {"wait_ms": [321], "scroll_delta_y": [654]}}
+    # This test asserts the planned-delta momentum burst (all-positive, sums to the
+    # plan). The reverse-direction overshoot "debounce" is a separate, stochastic
+    # feature (default 22% chance, has its own test) seeded from per-session entropy
+    # when no ``session_seed`` is set — so leave it on here and this test flips ~1-in-5
+    # runs. Disable it for this case so the planned-value invariant is deterministic.
+    plan = {
+        "run_id": "r1",
+        "pacing": {"wait_ms": [321], "scroll_delta_y": [654]},
+        "human_config": {"scroll_overshoot_chance": 0.0},
+    }
 
     assert wait_human(page, plan, 0, 800) == 321
     assert scroll_page(page, plan, 0, 900) == 654
