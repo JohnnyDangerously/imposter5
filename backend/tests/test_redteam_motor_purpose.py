@@ -71,6 +71,47 @@ def test_zero_length_move_emits_no_jitter():
     assert max(abs(mx - 400.0) + abs(my - 400.0) for mx, my in moves) < 0.01
 
 
+def test_motor_noise_is_active_mid_flight_not_only_at_settle():
+    # Signal-dependent noise (Harris & Wolpert, 1998) scales with SPEED, so the path
+    # must be perturbed during the FAST mid-flight phase — the inverse of the old
+    # settle-only tremor, which left the entire ballistic sweep sitting EXACTLY on the
+    # ideal Bezier until the last ~22% (a "too clean to be a hand" tell mid-flight).
+    p0, p1, p2, p3 = (100.0, 100.0), (300.0, 150.0), (560.0, 360.0), (700.0, 420.0)
+    clean = _run_emit(p0, p1, p2, p3, amp=0.0)
+    shaky = _run_emit(p0, p1, p2, p3, amp=2.0)
+    n = len(clean)
+    # Inspect only the first half (mid-flight, well before the >=0.55 settle onset).
+    assert any(clean[i] != shaky[i] for i in range(1, n // 2)), "no mid-flight motor noise"
+
+
+def test_settle_tremor_is_two_dimensional_not_a_single_line():
+    # Real hand tremor is a 2-D ellipse. The old model applied one oscillation along a
+    # single perpendicular vector (rank-1: every deviation collinear — it "explodes"
+    # along one axis). The motion noise must now span TWO dimensions.
+    p0, p1, p2, p3 = (100.0, 100.0), (260.0, 130.0), (520.0, 300.0), (640.0, 360.0)
+    clean = _run_emit(p0, p1, p2, p3, amp=0.0)
+    shaky = _run_emit(p0, p1, p2, p3, amp=2.5)
+    devs = [
+        (shaky[i][0] - clean[i][0], shaky[i][1] - clean[i][1])
+        for i in range(len(clean) - 1)
+    ]
+    devs = [d for d in devs if abs(d[0]) > 1e-9 or abs(d[1]) > 1e-9]
+    assert len(devs) >= 4
+    # 2x2 covariance of the deviation vectors; a rank-1 (single-line) wobble has a
+    # near-zero minor eigenvalue. Require a non-degenerate minor/major ratio.
+    mx = sum(d[0] for d in devs) / len(devs)
+    my = sum(d[1] for d in devs) / len(devs)
+    sxx = sum((d[0] - mx) ** 2 for d in devs) / len(devs)
+    syy = sum((d[1] - my) ** 2 for d in devs) / len(devs)
+    sxy = sum((d[0] - mx) * (d[1] - my) for d in devs) / len(devs)
+    tr = sxx + syy
+    disc = max(0.0, (tr * tr) / 4.0 - (sxx * syy - sxy * sxy))
+    major = tr / 2.0 + disc ** 0.5
+    minor = tr / 2.0 - disc ** 0.5
+    assert major > 0.0
+    assert (minor / major) > 0.02, "deviations collapse to a single line (rank-1 tremor regressed)"
+
+
 # --------------------------------------------------------------------------- #
 # Fix #4 — scroll over-shoot and correct
 # --------------------------------------------------------------------------- #
@@ -253,3 +294,66 @@ def test_markov_mousemove_escapes_central_column():
     assert any(x < 0.20 or x > 0.80 for x in xs)
     # ...but content/control reaches keep it mostly central (not pure edge noise).
     assert sum(1 for x in xs if 0.30 <= x <= 0.70) > 0
+
+
+# --------------------------------------------------------------------------- #
+# Fix #6 — reading/highlight trace routes through the curved Bezier emitter
+# --------------------------------------------------------------------------- #
+class _TraceMouse:
+    def __init__(self, events: list) -> None:
+        self.events = events
+
+    def move(self, x, y):
+        self.events.append(("move", (x, y)))
+
+    def down(self):
+        self.events.append(("down", None))
+
+    def up(self):
+        self.events.append(("up", None))
+
+    def wheel(self, _dx, _dy):
+        pass
+
+
+class _TracePage:
+    viewport_size = {"width": 1440, "height": 900}
+
+    def __init__(self) -> None:
+        self.events: list = []
+        self.mouse = _TraceMouse(self.events)
+
+    def set_default_timeout(self, _ms):
+        pass
+
+    def evaluate(self, *_a, **_k):
+        # The text-block probe expects {left, top, w, h}; cursor-overlay evals ignore it.
+        return {"left": 300.0, "top": 200.0, "w": 360.0, "h": 66.0}
+
+    def wait_for_timeout(self, _ms):
+        self.events.append(("wait", _ms))
+
+
+def test_highlight_trace_is_a_curved_emitter_drag_between_press_and_release():
+    page = _TracePage()
+    ok = ip.trace_text_selection(page, {"session_seed": "hl"}, select=True)
+    assert ok is True
+    kinds = [e[0] for e in page.events]
+    assert "down" in kinds and "up" in kinds
+    down_i, up_i = kinds.index("down"), kinds.index("up")
+    assert down_i < up_i
+    # The drag between mousedown and mouseup now routes through _emit_bezier (curved,
+    # velocity-profiled, tremored) — far more samples than the old 4-7 straight steps.
+    drag_moves = [k for k in kinds[down_i:up_i] if k == "move"]
+    assert len(drag_moves) >= 8
+
+
+def test_reading_trace_emits_a_multi_sample_sweep():
+    page = _TracePage()
+    ok = ip.trace_text_selection(page, {"session_seed": "read"}, select=False)
+    assert ok is True
+    moves = [e for e in page.events if e[0] == "move"]
+    # A reading trace (no button) is also a curved emitter sweep, not a straight line.
+    assert len(moves) >= 12
+    # A pure reading trace must NOT press the mouse button.
+    assert all(k != "down" for k, _ in page.events)

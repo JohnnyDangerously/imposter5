@@ -67,6 +67,12 @@ def test_run_visible_state_goal_records_actions_and_visible_state() -> None:
     goal = goal_spec_from_target({"entity_id": "https://example.com/accounts"})
     plan = {
         "run_id": "run-2",
+        # Pin the session seed so the per-session RNG is deterministic (an absent seed
+        # falls back to os.urandom, which made this assertion flaky), and disable the
+        # stochastic scroll overshoot so this test pins the PLANNED decaying burst
+        # rather than the occasional reverse correction (covered in the motor tests).
+        "session_seed": "goal-2",
+        "human_config": {"scroll_overshoot_chance": 0.0},
         "completion": {"max_scroll_passes": 2},
         "pacing": {"wait_ms": [111, 222], "scroll_delta_y": [333]},
         "recorder": {"enabled": True, "max_events": 20},

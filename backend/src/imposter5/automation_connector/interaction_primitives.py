@@ -592,15 +592,23 @@ def type_text(
     ``selector`` may be a string selector OR an already-resolved Locator / element
     handle (matching ``click_element``'s contract).
 
-    Realism model:
-    - Inter-key latency is a per-digraph multiplier (:func:`_digraph_latency_factor`)
-      on the typist's identity base latency, sampled through a log-normal so the
-      rhythm is right-skewed (occasional hesitations) rather than constant.
-    - Each key carries a key-hold (press-to-release) dwell.
-    - Occasional adjacent-key typos are usually corrected with a backspace
-      (Dhakal et al., 2018); error rate and latency both grow with intra-session
-      fatigue.
-    All draws come from the single advancing per-session RNG.
+    Realism model (digraph mode — modern plans carrying ``base_interkey_ms``):
+    - REAL key events. Each keystroke is a ``page.keyboard.press(key, delay=hold)``
+      (keydown -> held -> keyup), so the press-to-release DWELL is genuine. Bare
+      ``locator.type()`` reports ~0 ms constant dwell, which is the keystroke-dynamics
+      dead giveaway; we drive the keyboard directly instead.
+    - Rhythm from measured typing dynamics: the keydown->keydown interval (IKI) is a
+      per-digraph multiplier (:func:`_digraph_latency_factor`) on the typist's base
+      latency, log-normal so it is right-skewed (occasional hesitations). The IKI
+      already includes the previous key's hold, so flight = ``IKI - prev_hold`` (no
+      sluggish double-count), plus occasional planning pauses.
+    - Varied mistakes (Dhakal et al., 2018): substitutions (neighbour key),
+      doublings, insertions, and transpositions — usually noticed (after a reaction
+      pause, sometimes a char or two late) and fixed with backspaces + retype, rarely
+      left in. Error rate and latency both grow with intra-session fatigue.
+    LEGACY mode (only ``min_delay_ms``/``max_delay_ms``) keeps the original single
+    log-normal ``locator.type`` keystroke delay. All draws come from the single
+    advancing per-session RNG.
     """
     label = selector if isinstance(selector, str) else "element_handle"
     locator = page.locator(selector) if isinstance(selector, str) else selector
@@ -631,53 +639,186 @@ def type_text(
     correction_chance = float(typing_plan.get("correction_chance", 1.0))
     pause_chance = float(typing_plan.get("pause_mid_query_chance", 0.0))
 
-    def _press_delay() -> int:
-        if use_hold:
-            return int(lognormal_ms(rng, mean_ms=key_hold, cv=0.30, lo=20.0, hi=260.0))
-        # Legacy: keystroke delay sampled from the [min, max] window.
-        return int(lognormal_ms(rng, mean_ms=legacy_mid, cv=0.35, lo=min_delay, hi=max_delay))
+    def _dwell_ms() -> int:
+        """Key-hold (press->release) dwell for one keystroke, in ms."""
+        mean = key_hold if use_hold else legacy_mid
+        return int(lognormal_ms(rng, mean_ms=mean, cv=0.30, lo=18.0, hi=240.0))
 
-    def _interkey(prev: str, cur: str) -> int:
+    def _iki_ms(prev: str, cur: str) -> float:
+        """Keydown->keydown interval for the (prev -> cur) digraph, in ms."""
         mean = base_interkey * _digraph_latency_factor(prev, cur)
-        return int(lognormal_ms(rng, mean_ms=mean, cv=interkey_cv, lo=18.0, hi=900.0))
+        return lognormal_ms(rng, mean_ms=mean, cv=interkey_cv, lo=18.0, hi=1200.0)
 
     typed = 0
     typos = 0
     corrections = 0
-    prev_char = ""
-    locator.click()
-    for index, char in enumerate(text):
-        # Digraph-dependent inter-key gap precedes the keystroke (digraph mode only;
-        # the first key has no preceding digraph).
-        if use_digraph and index > 0:
-            page.wait_for_timeout(_interkey(prev_char, char))
-        # Occasional mid-stream "thinking" pause.
-        if rng.random() < pause_chance and index > 0:
-            page.wait_for_timeout(rng.randint(250, 900))
+    locator.click()  # focus the field as a human does before typing
 
-        type_correct = True
-        if typo_chance > 0 and char.strip() and rng.random() < typo_chance:
-            locator.type(_neighboring_char(char), delay=_press_delay())
-            typos += 1
-            if rng.random() < correction_chance:
-                # Noticed the error: brief reaction pause, then backspace and retype.
-                if use_digraph:
-                    page.wait_for_timeout(_interkey(char, char))
-                locator.press("Backspace")
-                corrections += 1
-            else:
-                # Uncorrected typo: leave ONLY the wrong char.
-                type_correct = False
+    if not use_digraph:
+        # LEGACY mode: a single log-normal keystroke ``delay`` from the [min, max]
+        # window with no separate inter-key gap. Kept verbatim so callers/tests that
+        # pin ``min_delay_ms``/``max_delay_ms`` keep their exact contract.
+        def _press_delay() -> int:
+            return int(lognormal_ms(rng, mean_ms=legacy_mid, cv=0.35, lo=min_delay, hi=max_delay))
 
-        if type_correct:
-            locator.type(char, delay=_press_delay())
-        typed += 1
-        prev_char = char
+        for index, char in enumerate(text):
+            if rng.random() < pause_chance and index > 0:
+                page.wait_for_timeout(rng.randint(250, 900))
+            type_correct = True
+            if typo_chance > 0 and char.strip() and rng.random() < typo_chance:
+                locator.type(_neighboring_char(char), delay=_press_delay())
+                typos += 1
+                if rng.random() < correction_chance:
+                    locator.press("Backspace")
+                    corrections += 1
+                else:
+                    type_correct = False
+            if type_correct:
+                locator.type(char, delay=_press_delay())
+            typed += 1
+
+        result = {"typed_chars": typed, "typos": typos, "corrections": corrections}
+        if recorder is not None:
+            recorder.record("type_text", metadata={"selector": label, **result})
+        return result
+
+    # DIGRAPH mode: drive REAL key events (keydown -> hold -> keyup) through
+    # ``page.keyboard`` so the press->release dwell is genuine, not a 0 ms ``type()``
+    # insert (constant near-zero dwell is the keystroke-dynamics dead giveaway). The
+    # keydown->keydown interval (IKI) carries the digraph rhythm and ALREADY INCLUDES
+    # the previous key's hold, so flight (keyup -> next keydown) is ``IKI - prev_hold``
+    # — this removes the old double-count (inter-key wait PLUS a second ``type`` delay)
+    # that made search typing feel sluggish, while staying faithful to measured rates.
+    kb = getattr(page, "keyboard", None)
+    MIN_FLIGHT = 8.0
+    state = {"prev": "", "last_hold": 0.0}
+
+    def _press_key(key: str, hold_ms: int) -> None:
+        """One real keystroke with a measurable press->release dwell."""
+        k = "Space" if key == " " else key
+        if kb is not None:
+            try:
+                kb.press(k, delay=int(hold_ms))
+                return
+            except Exception:
+                pass
+        # Fallback (no keyboard surface / unmappable key): keep the char correct.
+        try:
+            locator.type(key, delay=0)
+        except Exception:
+            pass
+
+    def _stroke(ch: str) -> None:
+        """Emit a content keystroke: digraph-paced flight, then a held key press."""
+        flight = max(MIN_FLIGHT, _iki_ms(state["prev"], ch) - state["last_hold"])
+        page.wait_for_timeout(int(flight))
+        hold = _dwell_ms()
+        _press_key(ch, hold)
+        state["prev"] = ch
+        state["last_hold"] = hold
+
+    def _control(key: str) -> None:
+        """Emit a control keystroke (Backspace) at a quick repeated-key cadence."""
+        flight = max(
+            MIN_FLIGHT,
+            lognormal_ms(rng, mean_ms=base_interkey * 0.65, cv=0.30, lo=15.0, hi=500.0) - state["last_hold"],
+        )
+        page.wait_for_timeout(int(flight))
+        hold = _dwell_ms()
+        _press_key(key, hold)
+        state["prev"] = ""  # a control key breaks the digraph chain
+        state["last_hold"] = hold
+
+    def _react() -> None:
+        """Perceive-the-error reaction pause before correcting (~120-520 ms)."""
+        page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=230.0, cv=0.45, lo=120.0, hi=520.0)))
+
+    i = 0
+    n = len(text)
+    while i < n:
+        char = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        # Occasional mid-query planning pause (deciding what to type next).
+        if pause_chance and i > 0 and rng.random() < pause_chance:
+            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=520.0, cv=0.5, lo=240.0, hi=1500.0)))
+
+        if not (typo_chance > 0 and char.strip() and rng.random() < typo_chance):
+            _stroke(char)
+            typed += 1
+            i += 1
+            continue
+
+        # --- a mistake happens ------------------------------------------------------
+        typos += 1
+        will_correct = rng.random() < correction_chance
+        # Pick a mistake KIND — not just an adjacent substitution:
+        #   substitution  - a neighbouring key instead of the intended one
+        #   doubling      - the key is accidentally repeated
+        #   insertion     - an extra neighbour key slips in before the intended one
+        #   transposition - this char and the next are typed in the wrong order
+        kinds = ["substitution", "doubling", "insertion"]
+        weights = [0.55, 0.16, 0.13]
+        if nxt and char.isalpha() and nxt.isalpha() and nxt != char:
+            kinds.append("transposition")
+            weights.append(0.16)
+        kind = rng.choices(kinds, weights=weights, k=1)[0]
+
+        start = i  # first intended index of the error region
+        if kind == "substitution":
+            _stroke(_neighboring_char(char))
+            i += 1
+            wrong_on_screen = 1
+        elif kind == "doubling":
+            _stroke(char)
+            _stroke(char)
+            i += 1
+            wrong_on_screen = 2
+        elif kind == "insertion":
+            _stroke(_neighboring_char(char))
+            _stroke(char)
+            i += 1
+            wrong_on_screen = 2
+        else:  # transposition
+            _stroke(nxt)
+            _stroke(char)
+            i += 2
+            wrong_on_screen = 2
+
+        # Sometimes the typist runs a char or two PAST the error before noticing it.
+        if kind != "transposition" and will_correct and i < n and rng.random() < 0.35:
+            overrun = 1 if (i + 1 >= n or rng.random() < 0.7) else 2
+            for _ in range(overrun):
+                if i >= n:
+                    break
+                _stroke(text[i])
+                i += 1
+                wrong_on_screen += 1
+
+        if will_correct:
+            _react()
+            for _ in range(wrong_on_screen):
+                _control("Backspace")
+            for j in range(start, i):  # retype the intended span (incl. any overrun)
+                _stroke(text[j])
+            corrections += 1
+        # else: leave the mistake in place (rare; an honest uncorrected error).
+        typed += i - start
 
     result = {"typed_chars": typed, "typos": typos, "corrections": corrections}
     if recorder is not None:
         recorder.record("type_text", metadata={"selector": label, **result})
     return result
+
+
+def _click_hold_ms(rng: random.Random) -> int:
+    """Human mouse-button hold (press->release) dwell, in ms.
+
+    A real click is not instantaneous: the button is held ~50-120 ms (longer when
+    relaxed, shorter when rushing). Bare ``page.mouse.click()`` / ``locator.click()``
+    use a 0 ms hold, i.e. ``mousedown`` and ``mouseup`` share a timestamp — a trivial
+    tell for any detector that watches pointer-event dwell. Pass this as ``delay``.
+    """
+    return int(lognormal_ms(rng, mean_ms=78.0, cv=0.40, lo=30.0, hi=200.0))
 
 
 def click_element(
@@ -756,7 +897,7 @@ def click_element(
                 cy = box["y"] + box["height"] * rng.uniform(0.28, 0.72)
                 update_status_ticker(page, "🖱️ CLICKING", f"Clicking: random link at ({round(cx)}, {round(cy)})")
                 move_meta = move_pointer(page, cx, cy, plan, recorder=recorder, target_w=box.get("width"), target_h=box.get("height"))
-                locator.click()
+                locator.click(delay=_click_hold_ms(rng))
                 result = {
                     "hovered": False,
                     "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
@@ -773,7 +914,7 @@ def click_element(
                 cy = rng.uniform(200, 500)
                 update_status_ticker(page, "🖱️ CLICKING", f"Clicking fallback spot ({round(cx)}, {round(cy)})")
                 move_meta = move_pointer(page, cx, cy, plan, recorder=recorder)
-                page.mouse.click(cx, cy)
+                page.mouse.click(cx, cy, delay=_click_hold_ms(rng))
                 result = {
                     "hovered": False,
                     "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
@@ -789,7 +930,7 @@ def click_element(
             cx = rng.uniform(300, 600)
             cy = rng.uniform(200, 500)
             move_pointer(page, cx, cy, plan, recorder=recorder)
-            page.mouse.click(cx, cy)
+            page.mouse.click(cx, cy, delay=_click_hold_ms(rng))
             return {"clicked_fallback_spot": True}
 
     # Resolve to the concrete element we will click. For string selectors that can
@@ -837,11 +978,11 @@ def click_element(
         click_xy = None
 
     if click_xy is not None:
-        page.mouse.click(click_xy[0], click_xy[1])
+        page.mouse.click(click_xy[0], click_xy[1], delay=_click_hold_ms(rng))
     else:
         # No bounding box (e.g. zero-size/odd element): fall back to the locator
         # click so the action still lands.
-        locator.click()
+        locator.click(delay=_click_hold_ms(rng))
     result = {
         "hovered": hovered,
         "move_style": (move_meta or {}).get("style") or pointer.get("move_style", "direct"),
@@ -1131,12 +1272,22 @@ def _emit_bezier(
        (:func:`two_thirds_power_dwell_scale`): the cursor slows through tight curves
        and speeds up on straight segments (Lacquaniti et al., 1983). Dwells are
        normalized so the segment takes ~``total_ms``.
-    3. PHYSIOLOGICAL TREMOR — an ~8–12 Hz, sub-pixel oscillation (two slightly
-       detuned sinusoids, since real tremor is band- not line-spectrum) is added
-       perpendicular to the path (Elble & Koller, 1990). ``clock`` is a 1-element
-       list carrying elapsed ms across segments so tremor phase stays continuous.
+    3. MOTOR NOISE — two complementary, physiologically-grounded components, both
+       scaled by ``tremor_amp_px`` (so ``amp == 0`` is a perfectly clean baseline):
+         * SIGNAL-DEPENDENT noise (Harris & Wolpert, 1998): a small Gaussian
+           positional wander whose std tracks the LOCAL speed, so the path is
+           noisiest mid-flight and quiets onto the target. It is AR(1)-smoothed
+           (a wavering hand, not white fuzz) and vanishes at the endpoint.
+         * SETTLE TREMOR (Elble & Koller, 1990): an ~8–12 Hz oscillation during
+           the low-velocity homing phase. It is ELLIPTICAL (independent
+           perpendicular + longitudinal components, not a single line) and a
+           NARROWBAND STOCHASTIC process — component frequencies/amplitudes are
+           drawn per move and a slow phase random-walk lets the instantaneous
+           frequency wander, so the cross-move spectrum is a band, not two fixed
+           lines. ``clock`` carries elapsed ms across segments so phase stays
+           continuous.
 
-    The final sample lands on P3 (sans tremor) so the endpoint is exact.
+    The final sample lands on P3 (sans noise) so the endpoint is exact.
     """
     n = max(2, int(steps))
     # Pass 1: positions along the curve under the velocity reparam.
@@ -1163,63 +1314,105 @@ def _emit_bezier(
 
     amp = max(0.0, float(tremor_amp_px))
     hz = max(1.0, float(tremor_hz))
-    phase = rng.uniform(0.0, 2.0 * math.pi)
-    phase2 = rng.uniform(0.0, 2.0 * math.pi)
-
-    # Tremor is MOMENTARY, not continuous. A real hand's jitter is swamped by the
-    # ballistic sweep and only becomes visible as it decelerates and settles on
-    # the target (low-velocity homing). Two prior failures made it a detection
-    # tell rather than realism, both fixed here:
-    #   1. The amplitude ramped MONOTONICALLY to a maximum AT the endpoint, so the
-    #      cursor's last recorded sample carried a sub-pixel offset — jitter sitting
-    #      on a point the hand has stopped at. Real tremor during homing is a DAMPED
-    #      burst that decays to ~0 as the hand arrives. We now use a windowed (Hann)
-    #      envelope over the settle: it rises, peaks mid-settle, and returns to 0 at
-    #      the endpoint, so the move ends clean.
-    #   2. The perpendicular axis was taken from the LOCAL sample-to-sample tangent.
-    #      At the low-velocity settle consecutive samples are ~coincident, so that
-    #      tangent collapses and its perpendicular flipped direction every step —
-    #      spraying noise in random directions ("micro-jitter not part of a
-    #      movement"). We fall back to the stable segment-chord perpendicular
-    #      whenever the local tangent is degenerate, so the wobble stays a coherent
-    #      cross-path oscillation.
     n_raw = len(raw)
-    tremor_onset = 0.78  # no tremor until the last ~22% of the movement
+
+    # --- Per-MOVE settle-tremor parameters -----------------------------------------
+    # Real physiological tremor is a NARROWBAND STOCHASTIC process, not a fixed pair
+    # of sinusoids. Two prior tells are removed here:
+    #   * the spectrum was two fixed lines at a fixed 1.27 ratio (a dead giveaway on
+    #     an FFT pooled across moves) -> draw both component frequencies AND their
+    #     amplitude split PER MOVE, and let a slow phase random-walk make the
+    #     instantaneous frequency WANDER within the move (each line becomes a band);
+    #   * the wobble was rank-1 (a single perpendicular line) -> add an independent
+    #     LONGITUDINAL component so it traces a small ELLIPSE, like a real 2-D hand
+    #     tremor, instead of "exploding" along one axis.
+    f_perp1 = hz * rng.uniform(0.85, 1.15)
+    f_perp2 = f_perp1 * rng.uniform(1.18, 1.45)
+    f_long = hz * rng.uniform(0.80, 1.18)
+    split = rng.uniform(0.58, 0.78)          # energy fraction in the primary line
+    long_ratio = rng.uniform(0.35, 0.55)     # longitudinal amp vs perpendicular
+    ph_p1 = rng.uniform(0.0, 2.0 * math.pi)
+    ph_p2 = rng.uniform(0.0, 2.0 * math.pi)
+    ph_l = rng.uniform(0.0, 2.0 * math.pi)
+    drift_step = 0.045                        # rad/sample slow frequency wander
+    drift_p = 0.0
+    drift_l = 0.0
+    # Randomized settle onset PER MOVE — no constant 0.78 boundary across every move,
+    # which is itself a tell. The damped Hann burst still returns to 0 at the endpoint.
+    onset = rng.uniform(0.55, 0.74)
+
+    # --- Signal-dependent (Harris & Wolpert, 1998) motor noise ---------------------
+    # Endpoint variance grows with commanded speed, so the path is NOISIEST mid-flight
+    # and quiets as the hand decelerates onto the target (the INVERSE of the old
+    # settle-only model). Std tracks the local speed; an AR(1) filter makes it a
+    # wavering hand rather than white per-sample fuzz. It vanishes at the endpoint
+    # (speed -> 0) and on a zero-length move, keeping the arrival clean. Mid-flight it
+    # is supra-pixel for typical amplitudes, so motion structure survives the integer
+    # quantization of CDP transport (sub-pixel-only tremor can be lost there).
+    step_dist = [
+        math.hypot(raw[i + 1][0] - raw[i][0], raw[i + 1][1] - raw[i][1])
+        for i in range(n_raw - 1)
+    ]
+    max_step = max(step_dist) if step_dist else 0.0
+    noise_amp = amp * 1.4                     # ~peak (mid-flight) noise std, in px
+    ar = 0.7                                  # temporal correlation of motor noise
+    ar_b = math.sqrt(max(0.0, 1.0 - ar * ar))
+    ou_x = 0.0
+    ou_y = 0.0
+
     chord_dx, chord_dy = (p3[0] - p0[0]), (p3[1] - p0[1])
     chord_len = math.hypot(chord_dx, chord_dy)
     if chord_len > 1e-6:
+        chord_tan = (chord_dx / chord_len, chord_dy / chord_len)
         chord_perp = (-chord_dy / chord_len, chord_dx / chord_len)
     else:
-        chord_perp = (0.0, 0.0)  # zero-length move: no direction, no jitter.
+        # Zero-length move: no travel direction and (below) zero speed => no motion.
+        chord_tan = (0.0, 0.0)
+        chord_perp = (0.0, 0.0)
+
     last = p3
     for i in range(n_raw):
         px, py = raw[i]
-        frac = (i / (n_raw - 1)) if n_raw > 1 else 1.0
-        if frac < tremor_onset:
-            env = 0.0
-        else:
-            w = (frac - tremor_onset) / (1.0 - tremor_onset)
-            env = math.sin(math.pi * w)  # 0 -> peak -> 0 (damped, clean endpoint)
-        eff_amp = amp * env
-        if eff_amp > 0.0 and i < n_raw - 1:
-            # Perpendicular tremor: prefer the local travel tangent, but fall back to
-            # the stable chord normal when the local tangent is degenerate (settle).
-            nx, ny = raw[i + 1]
-            tx, ty = (nx - px), (ny - py)
+        if amp > 0.0 and i < n_raw - 1:
+            # Stable travel axes: prefer the local tangent, fall back to the segment
+            # chord when consecutive samples are ~coincident (settle), so the wobble
+            # stays a coherent 2-D oscillation instead of spraying in random dirs.
+            tx, ty = (raw[i + 1][0] - px, raw[i + 1][1] - py)
             tlen = math.hypot(tx, ty)
             if tlen >= 0.5:
-                perp_x, perp_y = -ty / tlen, tx / tlen
+                tan_x, tan_y = tx / tlen, ty / tlen
+                perp_x, perp_y = -tan_y, tan_x
             else:
+                tan_x, tan_y = chord_tan
                 perp_x, perp_y = chord_perp
-            t_s = clock[0] / 1000.0
-            # Band tremor: two detuned ~8-12Hz components + small longitudinal term.
-            osc = (
-                0.7 * math.sin(2.0 * math.pi * hz * t_s + phase)
-                + 0.3 * math.sin(2.0 * math.pi * (hz * 1.27) * t_s + phase2)
-            )
-            jx = perp_x * eff_amp * osc
-            jy = perp_y * eff_amp * osc
-            page.mouse.move(px + jx, py + jy)
+
+            # (1) Signal-dependent noise: speed-scaled, AR(1)-smoothed, whole path.
+            norm_speed = (step_dist[i] / max_step) if max_step > 1e-9 else 0.0
+            sd = noise_amp * norm_speed
+            ou_x = ar * ou_x + ar_b * sd * rng.gauss(0.0, 1.0)
+            ou_y = ar * ou_y + ar_b * sd * rng.gauss(0.0, 1.0)
+
+            # (2) Settle tremor: elliptical, wandering narrowband, damped to 0 at end.
+            frac = i / (n_raw - 1)
+            if frac < onset:
+                eff = 0.0
+            else:
+                w = (frac - onset) / (1.0 - onset)
+                eff = amp * math.sin(math.pi * w)  # 0 -> peak -> 0 (clean endpoint)
+            jx = jy = 0.0
+            if eff > 0.0:
+                t_s = clock[0] / 1000.0
+                drift_p += rng.gauss(0.0, drift_step)
+                drift_l += rng.gauss(0.0, drift_step)
+                osc_perp = (
+                    split * math.sin(2.0 * math.pi * f_perp1 * t_s + ph_p1 + drift_p)
+                    + (1.0 - split) * math.sin(2.0 * math.pi * f_perp2 * t_s + ph_p2 + drift_p)
+                )
+                osc_long = math.sin(2.0 * math.pi * f_long * t_s + ph_l + drift_l)
+                jx = perp_x * eff * osc_perp + tan_x * eff * long_ratio * osc_long
+                jy = perp_y * eff * osc_perp + tan_y * eff * long_ratio * osc_long
+
+            page.mouse.move(px + ou_x + jx, py + ou_y + jy)
         else:
             page.mouse.move(px, py)
         last = (px, py)
@@ -2060,26 +2253,64 @@ def trace_text_selection(
         end_x = spot["left"] + spot["w"] * rng.uniform(0.45, 0.96)
         end_y = start_y + line_h * (n_lines - 1)
 
+        # Human motor knobs (the same identity-derived physics move_pointer uses), so
+        # the sweep is a CURVED, velocity-profiled, tremored drag rather than the old
+        # straight constant-velocity interpolation — which read as obviously synthetic
+        # motion (no acceleration, no curvature, no tremor) to a kinematics detector.
+        hc = _human_config(plan)
+        drift = _fatigue(page, plan)
+        tremor_hz = _bounded_float(hc.get("tremor_hz"), lower=5.0, upper=14.0, default=10.0)
+        tremor_amp = _bounded_float(hc.get("tremor_amp_px"), lower=0.0, upper=3.0, default=0.6) * drift["sloppiness"]
+        pl_gain = _bounded_float(hc.get("power_law_gain"), lower=0.0, upper=1.0, default=0.8)
+        mj_skew = _bounded_float(hc.get("min_jerk_skew"), lower=0.0, upper=0.45, default=0.12)
+        bow = _bounded_float(hc.get("mouse_curve_bow"), lower=0.0, upper=0.5, default=0.14)
+        wobble_cap = _bounded_float(hc.get("mouse_wobble_max"), lower=0.0, upper=400.0, default=0.0)
+        step_dt = _bounded_float(hc.get("mouse_step_delay_ms"), lower=1.0, upper=50.0, default=8.0)
+        clock = [0.0]
+        # Reading sweep speed across a line (px/ms): deliberate, slower and more
+        # variable than a ballistic acquisition.
+        read_speed = rng.uniform(0.55, 1.05)
+
+        def _sweep(p_from: tuple[float, float], p_to: tuple[float, float]) -> None:
+            dist = math.hypot(p_to[0] - p_from[0], p_to[1] - p_from[1])
+            total_ms = max(150.0, dist / max(0.2, read_speed)) * drift["slowdown"]
+            steps = max(8, min(48, int(round(total_ms / max(1.0, step_dt)))))
+            p1, p2 = _bezier_controls(p_from, p_to, rng, wobble_cap=wobble_cap, bow=bow)
+            _emit_bezier(
+                page, p_from, p1, p2, p_to,
+                steps=steps, rng=rng, total_ms=total_ms, clock=clock,
+                tremor_hz=tremor_hz, tremor_amp_px=tremor_amp,
+                power_law_gain=pl_gain, min_jerk_skew=mj_skew,
+            )
+            _drive_visible_cursor(page, p_to[0], p_to[1])
+
         # Aim the cursor at the sentence start with a normal ballistic move.
         move_pointer(page, start_x, start_y, plan, recorder=recorder)
         if select:
+            # A highlight is one continuous curved drag from start to end.
             page.mouse.down()
-        steps = rng.randint(4, 7)
-        for i in range(1, steps + 1):
-            f = i / steps
-            ix = start_x + (end_x - start_x) * f
-            # Drop to the next line in discrete jumps (text wraps line by line).
-            iy = start_y + (end_y - start_y) * round(f * (n_lines - 1)) / max(1, n_lines - 1) if n_lines > 1 else start_y
-            page.mouse.move(ix, iy)
-            _drive_visible_cursor(page, ix, iy)
-            page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=34.0, cv=0.4, lo=14.0, hi=90.0)))
-        if select:
+            _sweep((start_x, start_y), (end_x, end_y))
             page.mouse.up()
-        _set_cursor(page, end_x, end_y)
+            cur = (end_x, end_y)
+        else:
+            # A reading trace is a Z-pattern: sweep each line left->right, then a
+            # curved "carriage return" down to the next line's start.
+            cur = (start_x, start_y)
+            for k in range(n_lines):
+                ly = start_y + line_h * k
+                rx = end_x if k == n_lines - 1 else spot["left"] + spot["w"] * rng.uniform(0.70, 0.96)
+                if k > 0:
+                    _sweep(cur, (start_x, ly))
+                    cur = (start_x, ly)
+                _sweep(cur, (rx, ly))
+                # Brief end-of-line fixation, as a reader pauses before the next line.
+                page.wait_for_timeout(int(lognormal_ms(rng, mean_ms=120.0, cv=0.5, lo=40.0, hi=400.0)))
+                cur = (rx, ly)
+        _set_cursor(page, cur[0], cur[1])
         if recorder is not None:
             recorder.record(
                 "highlight" if select else "reading_trace",
-                metadata={"sentences": n_lines, "x": round(end_x), "y": round(end_y)},
+                metadata={"sentences": n_lines, "x": round(cur[0]), "y": round(cur[1])},
             )
         return True
     except Exception:

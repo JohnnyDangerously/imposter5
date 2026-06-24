@@ -26,11 +26,18 @@ class FakeMouse:
     def move(self, x: float, y: float) -> None:
         self.events.append(("mouse_move", {"x": round(x), "y": round(y)}))
 
-    def click(self, x: float, y: float) -> None:
-        # Real Playwright Mouse.click(x, y) presses at the cursor's current
-        # (realized) point; the humanized click uses this instead of
-        # locator.click() so Playwright never recenters to the element middle.
-        self.events.append(("mouse_click", {"x": round(x), "y": round(y)}))
+    def click(self, x: float, y: float, *, delay: int = 0) -> None:
+        # Real Playwright Mouse.click(x, y, delay=) presses at the cursor's current
+        # (realized) point and holds the button for ``delay`` ms; the humanized click
+        # uses this instead of locator.click() so Playwright never recenters to the
+        # element middle, and passes a non-zero hold so down!=up timestamps.
+        self.events.append(("mouse_click", {"x": round(x), "y": round(y), "delay": int(delay)}))
+
+    def down(self) -> None:
+        self.events.append(("mouse_down", None))
+
+    def up(self) -> None:
+        self.events.append(("mouse_up", None))
 
 
 class FakeLocator:
@@ -47,7 +54,8 @@ class FakeLocator:
         # Honeypot trap probe runs el-scoped JS; the fake element is never a trap.
         return ""
 
-    def click(self) -> None:
+    def click(self, *, delay: int = 0) -> None:
+        # Real Playwright Locator.click(delay=) holds the button for ``delay`` ms.
         self.events.append(("locator_click", None))
 
     def hover(self) -> None:
@@ -62,6 +70,28 @@ class FakeLocator:
 
     def type(self, text: str, *, delay: int) -> None:
         self.events.append(("type", {"text": text, "delay": delay}))
+
+
+class FakeKeyboard:
+    """Stand-in for ``page.keyboard``. The humanized (digraph-mode) ``type_text``
+    drives REAL key events through this — ``press(key, delay=hold)`` is a
+    keydown -> held -> keyup with a measurable press/release dwell — instead of the
+    0 ms ``locator.type()`` insert that any keystroke-dynamics detector flags."""
+
+    def __init__(self, events: list[tuple[str, Any]]) -> None:
+        self.events = events
+
+    def press(self, key: str, *, delay: int = 0) -> None:
+        self.events.append(("key_press", {"key": key, "delay": int(delay)}))
+
+    def down(self, key: str) -> None:
+        self.events.append(("key_down", key))
+
+    def up(self, key: str) -> None:
+        self.events.append(("key_up", key))
+
+    def type(self, text: str, *, delay: int = 0) -> None:
+        self.events.append(("key_type", {"text": text, "delay": int(delay)}))
 
 
 class FakeElementHandle:
@@ -85,6 +115,7 @@ class FakePage:
     def __init__(self) -> None:
         self.events: list[tuple[str, Any]] = []
         self.mouse = FakeMouse(self.events)
+        self.keyboard = FakeKeyboard(self.events)
 
     def set_default_timeout(self, timeout_ms: int) -> None:
         self.default_timeout = timeout_ms
@@ -176,6 +207,86 @@ def test_type_text_uses_locator_and_returns_metadata() -> None:
     assert page.events.count(("type", {"text": "c", "delay": 1})) == 1
 
 
+def _digraph_typing_plan(*, seed: str = "kbd", typo: float = 0.0, correction: float = 1.0, pause: float = 0.0) -> dict:
+    """A modern (digraph-mode) typing plan: carries ``base_interkey_ms``/``key_hold_ms``
+    so ``type_text`` drives real key events with a genuine press/release dwell."""
+    return {
+        "session_seed": seed,
+        "typing": {
+            "base_interkey_ms": 140.0,
+            "interkey_cv": 0.30,
+            "key_hold_ms": 80.0,
+            "typo_chance": typo,
+            "correction_chance": correction,
+            "pause_mid_query_chance": pause,
+        },
+    }
+
+
+def test_type_text_digraph_drives_real_key_events_with_dwell() -> None:
+    page = FakePage()
+    result = type_text(page, "input[name='q']", "hello", _digraph_typing_plan())
+
+    presses = [m for a, m in page.events if a == "key_press"]
+    # One REAL keystroke per character, in order, via page.keyboard (not locator.type).
+    assert [p["key"] for p in presses] == list("hello")
+    assert all(a != "type" for a, _ in page.events), "digraph mode must not fall back to locator.type for ASCII"
+    # Every keystroke carries a measurable press->release DWELL — the signal a 0 ms
+    # locator.type() can never produce (the keystroke-dynamics dead giveaway).
+    assert all(p["delay"] >= 18 for p in presses)
+    mean_dwell = sum(p["delay"] for p in presses) / len(presses)
+    assert 30.0 <= mean_dwell <= 200.0
+    # Inter-key flight gaps were waited between keystrokes.
+    assert sum(1 for a, _ in page.events if a == "wait") >= 4
+    assert result == {"typed_chars": 5, "typos": 0, "corrections": 0}
+
+
+def test_type_text_digraph_makes_and_corrects_varied_mistakes() -> None:
+    # typo_chance=1 forces an error on every content char; correction_chance=1 means
+    # each is noticed and fixed. The final committed text must still be correct.
+    page = FakePage()
+    result = type_text(page, "input[name='q']", "research", _digraph_typing_plan(seed="oops", typo=1.0, correction=1.0))
+
+    assert result["typos"] >= 1
+    assert result["corrections"] >= 1
+    keys = [m["key"] for a, m in page.events if a == "key_press"]
+    assert "Backspace" in keys, "a corrected mistake must emit real Backspace key events"
+    # Replay the key stream (presses + backspaces) and prove it lands on the intended
+    # word — i.e. the varied mistake/correction logic always converges to correct text.
+    buf: list[str] = []
+    for k in keys:
+        if k == "Backspace":
+            if buf:
+                buf.pop()
+        else:
+            buf.append(" " if k == "Space" else k)
+    assert "".join(buf) == "research"
+
+
+def test_type_text_digraph_can_leave_some_mistakes_uncorrected() -> None:
+    # With correction_chance=0 the typist never fixes errors: typos are recorded but
+    # no Backspace is emitted (honest uncorrected error path).
+    page = FakePage()
+    result = type_text(page, "input[name='q']", "engineer", _digraph_typing_plan(seed="raw", typo=1.0, correction=0.0))
+    keys = [m["key"] for a, m in page.events if a == "key_press"]
+    assert result["typos"] >= 1
+    assert result["corrections"] == 0
+    assert "Backspace" not in keys
+
+
+def test_type_text_digraph_is_deterministic_per_seed() -> None:
+    p1 = FakePage()
+    p2 = FakePage()
+    type_text(p1, "i", "research scientist", _digraph_typing_plan(seed="det", typo=0.5))
+    type_text(p2, "i", "research scientist", _digraph_typing_plan(seed="det", typo=0.5))
+    # Same session seed => identical keystroke stream (reproducible), while a different
+    # seed would diverge — randomness is per-session, not a fixed pre-baked pattern.
+    assert p1.events == p2.events
+    p3 = FakePage()
+    type_text(p3, "i", "research scientist", _digraph_typing_plan(seed="other", typo=0.5))
+    assert p3.events != p1.events
+
+
 def test_click_element_can_hover_first() -> None:
     page = FakePage()
     plan = {
@@ -194,6 +305,16 @@ def test_click_element_can_hover_first() -> None:
     assert any(e[0] == "mouse_click" for e in page.events)
     assert ("hover", None) not in page.events
     assert ("locator_click", None) not in page.events
+
+
+def test_click_holds_the_button_for_a_human_dwell() -> None:
+    page = FakePage()
+    click_element(page, "button.save", {"run_id": "hold", "pointer": {"hover_before_click_chance": 0}})
+    clicks = [m for a, m in page.events if a == "mouse_click"]
+    assert clicks, "expected a realized-point mouse click"
+    # A real click holds the button ~50-120 ms; never a 0 ms down==up timestamp.
+    assert all(c["delay"] >= 30 for c in clicks)
+    assert all(c["delay"] <= 200 for c in clicks)
 
 
 def test_hover_expand_and_mobile_primitives_record_metadata() -> None:
