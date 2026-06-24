@@ -73,6 +73,37 @@ _OFFGOAL_QUERIES = (
     "guitar lessons",
 )
 
+# Story-level "stepped away from the keyboard" — a rare, heavy-tailed idle of MINUTES
+# inserted once mid-session. This is categorically different from the markov micro-
+# distraction (<=30s, a glance away): a real operator leaves the tab, the cursor sits
+# motionless for minutes, then comes back and re-orients before resuming. The minutes-
+# long GAP in the event stream plus a natural resume is a human signal that a bot which
+# is never away (or which pauses only uniformly) cannot fake.
+_AFK_CHANCE = 0.10            # per-eligible-session probability of one away-then-resume
+_AFK_MEAN_MS = 240_000        # ~4 min typical away
+_AFK_CV = 0.9                 # heavy spread so durations vary widely
+_AFK_MIN_MS = 90_000          # 1.5 min floor (below this it is a micro-distraction)
+_AFK_MAX_MS = 20 * 60_000     # cap the tail at 20 min
+
+
+def _afk_away_ms(
+    rng: Any, scene_index: int, total: int, *, chance: float, already_done: bool
+) -> int | None:
+    """Decide whether a story-level AFK fires at this scene boundary, and for how long.
+
+    Pure (touches no page), so the gating + duration shape are unit-testable without a
+    browser. Returns the away duration in ms, or None to skip. AFK fires at most once,
+    only in the MIDDLE of a long-enough session (never the opening or the wrap-up), and
+    only rarely; when it fires the away time is a heavy-tailed, minutes-long draw.
+    """
+    if already_done or total < 6:
+        return None
+    if scene_index < 2 or scene_index > total - 3:
+        return None
+    if rng.random() >= float(chance):
+        return None
+    return int(lognormal_ms(rng, mean_ms=_AFK_MEAN_MS, cv=_AFK_CV, lo=_AFK_MIN_MS, hi=_AFK_MAX_MS))
+
 
 class StoryExecutor:
     def __init__(
@@ -113,6 +144,9 @@ class StoryExecutor:
         self.tangents_returned = 0
         self.profiles_opened_total = 0  # objective + off-goal tangent opens
         self._goal_met = False
+        # Story-level AFK: at most one minutes-long away-then-resume per session.
+        self._afk_done = False
+        self._afk_chance = float(behavior_plan.get("afk_chance", _AFK_CHANCE))
         # Monotonic scan progress in [0, 1]; only ever advanced by real scroll geometry.
         self._scan_progress = 0.0
 
@@ -576,6 +610,41 @@ class StoryExecutor:
         self.tangents_returned += 1
         return {"status": "ok", "excursion": scene.name}
 
+    def _maybe_afk(self, scene_index: int, total: int) -> bool:
+        """Maybe step away from the keyboard for minutes, then come back and re-orient.
+
+        Distinct from the markov micro-distraction: this is the story-level "I left and
+        came back" a real person does. The wait goes through ``page.wait_for_timeout`` so
+        it is a REAL minutes-long gap in production, while the test fast-clock compresses
+        it; the recorded ``away_ms`` preserves the intended duration either way.
+        """
+        away_ms = _afk_away_ms(
+            self.rng, scene_index, total, chance=self._afk_chance, already_done=self._afk_done
+        )
+        if away_ms is None:
+            return False
+        self._afk_done = True
+        if self.recorder is not None:
+            try:
+                self.recorder.record(
+                    "afk_away", metadata={"away_ms": away_ms, "after_scene": scene_index}
+                )
+            except Exception:
+                pass
+        try:
+            update_status_ticker(self.page, "🚶 AWAY", f"Stepped away (~{away_ms // 1000}s)…")
+            self.page.wait_for_timeout(away_ms)
+        except Exception:
+            logger.debug("[story] afk wait failed", exc_info=True)
+        # Came back: take the screen in again before resuming, like a returning reader.
+        self._perceive_after_render()
+        if self.recorder is not None:
+            try:
+                self.recorder.record("afk_resume", metadata={})
+            except Exception:
+                pass
+        return True
+
     # --- run ----------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
         update_status_ticker(self.page, "STORY MODE", f"goal={self.plan.goal_predicate.type}")
@@ -604,8 +673,10 @@ class StoryExecutor:
                 if scene.is_return:
                     entry["is_return"] = True
             self.trace.append(entry)
-            if not scene.tangent and self.goal.is_satisfied(self.state):
-                self._goal_met = True
+            if not scene.tangent:
+                self._maybe_afk(i, len(self.plan.scenes))
+                if self.goal.is_satisfied(self.state):
+                    self._goal_met = True
 
         # The sampled plan is one human's chosen effort; if it didn't quite reach the
         # (jittered) goal, finish the task the way a person would rather than quitting
@@ -666,6 +737,13 @@ class StoryExecutor:
         if self.feed is not None:
             payload["feed_summary"] = dict(self.feed.summary)
             payload["feed_summary"]["actions"] = list(self.feed.actions)
+            # Surface a degraded (scroll-only) walk as a FIRST-CLASS result, not buried
+            # in feed_summary. When no feed_post ever resolved, the session was a bare
+            # scroll and goal_met (scan_count) is technically true but misleading.
+            # No-fallbacks rule: report the degradation honestly instead of a clean pass.
+            if self.feed.summary.get("feed_post_unresolved"):
+                payload["degraded_to_scroll_only"] = True
+                payload["feed_post_unresolved"] = True
         return payload
 
 

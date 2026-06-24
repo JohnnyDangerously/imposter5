@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import random
+
 from imposter5.automation_connector.behavior_policy import build_behavior_plan
+from imposter5.story import executor as _ex
 from imposter5.story.executor import run_story
 from imposter5.story.task_intent import parse_task_intent
 
@@ -95,3 +98,42 @@ def test_two_runs_differ_but_both_meet_goal(gauntlet_page_factory) -> None:
     seq_a = [(e["scene"], e["kind"]) for e in a["trace"]]
     seq_b = [(e["scene"], e["kind"]) for e in b["trace"]]
     assert seq_a != seq_b, "two attempts from one prompt should not be identical"
+
+
+def test_afk_decision_is_rare_minutes_long_and_fires_once() -> None:
+    # Pure gating + duration shape (no browser): the story-level away-then-resume.
+    rng = random.Random(0)
+    # Never in the opening or the wrap-up, never in a short session; honor the chance
+    # gate and the once-only flag.
+    assert _ex._afk_away_ms(rng, 1, 10, chance=1.0, already_done=False) is None  # too early
+    assert _ex._afk_away_ms(rng, 8, 10, chance=1.0, already_done=False) is None  # too late
+    assert _ex._afk_away_ms(rng, 3, 5, chance=1.0, already_done=False) is None   # session too short
+    assert _ex._afk_away_ms(rng, 3, 10, chance=0.0, already_done=False) is None  # chance gate off
+    assert _ex._afk_away_ms(rng, 3, 10, chance=1.0, already_done=True) is None   # once-only
+
+    fired = [_ex._afk_away_ms(random.Random(s), 3, 12, chance=1.0, already_done=False) for s in range(60)]
+    assert all(v is not None for v in fired), "chance=1.0 must fire when eligible"
+    # Minutes-long and bounded — NOT the <=30s markov micro-distraction.
+    assert all(_ex._AFK_MIN_MS <= v <= _ex._AFK_MAX_MS for v in fired)
+    assert min(fired) >= 90_000
+    # Heavy-tailed: durations vary widely run-to-run.
+    assert len(set(fired)) > 15
+
+
+def test_afk_wires_into_a_real_run(gauntlet_page) -> None:
+    # End-to-end (browser-gated): forcing the chance makes one away-then-resume appear
+    # in the recorded event stream, and the session still completes after coming back.
+    intent = parse_task_intent(INTENT_RAW)
+    bplan = _controlled_plan("afk-e2e")
+    bplan["afk_chance"] = 1.0
+    result = run_story(
+        gauntlet_page, intent, seed="afk-e2e", behavior_plan=bplan,
+        dwell_scale=0.0, ambient_steps=0, max_scan_passes=8, speed_scale=0.0,
+    )
+    events = result["recorder"]["events"]
+    away = [e for e in events if e["action"] == "afk_away"]
+    resume = [e for e in events if e["action"] == "afk_resume"]
+    assert len(away) == 1, "a story-level AFK should fire exactly once"
+    assert len(resume) == 1, "the AFK must resume (came back)"
+    assert away[0]["metadata"]["away_ms"] >= 90_000
+    assert result["goal_met"] is True
