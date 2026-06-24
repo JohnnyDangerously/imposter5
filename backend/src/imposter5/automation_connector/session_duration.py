@@ -31,6 +31,31 @@ from dataclasses import dataclass
 MIN_SECONDS = 15.0
 MAX_SECONDS = 900.0
 
+# Time-of-day coupling of session LENGTH (index 0..23, local hour). A real
+# person's visit length is not the same at 03:00 as at 20:00: daytime/work-hour
+# visits are squeezed quick dips, while the evening unwind is a longer browse and
+# the rare deep-night check is the briefest of all. Without this, the duration
+# histogram is identical around the clock — a tell that survives even a perfect
+# per-session walk. These are gentle multipliers on the duration draw (centered
+# near 1.0, bounded so no hour collapses or explodes the length).
+_TIME_OF_DAY_DURATION_SCALE = (
+    0.70, 0.66, 0.66, 0.70, 0.74, 0.82,  # 00-05 deep night: rare, brief glances
+    0.90, 0.92, 0.90, 0.88, 0.90, 0.96,  # 06-11 morning + work: quick dips
+    1.06, 0.92, 0.90, 0.92, 0.98, 1.08,  # 12-17 lunch a touch longer, afternoon dips
+    1.22, 1.28, 1.24, 1.14, 1.00, 0.84,  # 18-23 evening unwind: the long browse, then taper
+)
+
+
+def time_of_day_scale(local_hour: int) -> float:
+    """Duration multiplier for a given local hour (0..23).
+
+    Quick dips during the work day, longer browses in the evening, briefest in
+    the deep night. Multiply into :func:`sample_session_seconds`' ``scale`` so a
+    scheduled identity's session lengths track the local clock instead of being
+    drawn from one time-invariant distribution.
+    """
+    return _TIME_OF_DAY_DURATION_SCALE[int(local_hour) % 24]
+
 
 @dataclass(frozen=True)
 class DurationMode:

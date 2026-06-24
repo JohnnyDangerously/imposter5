@@ -11,8 +11,9 @@ from __future__ import annotations
 import random
 import statistics
 
-import pytest
+from datetime import datetime, timezone
 
+from imposter5.automation_connector import behavior_policy as bp
 from imposter5.automation_connector import session_duration as sd
 from imposter5.automation_connector.behavior_policy import build_behavior_plan
 from imposter5.story.session_planner import _ARCS_BY_NAME, build_feed_intent
@@ -98,6 +99,44 @@ def test_profile_binge_arcs_emit_open_count_intents():
     assert name_s == "profile_sweep"
     assert sweep.goal_predicate.type == "open_count"
     assert 15 <= sweep.goal_predicate.target <= 30
+
+
+def test_time_of_day_scale_is_evening_long_daytime_short_night_briefest():
+    # The core coupling: a visit is NOT the same length at 03:00 as at 20:00.
+    night = sd.time_of_day_scale(3)
+    work = sd.time_of_day_scale(10)
+    evening = sd.time_of_day_scale(20)
+    assert evening > work          # the evening unwind is the longest browse
+    assert work > night            # a work-hour dip is longer than a 3am glance
+    # Bounded so no hour collapses or explodes the length, and it wraps mod 24.
+    assert all(0.6 <= sd.time_of_day_scale(h) <= 1.4 for h in range(24))
+    assert sd.time_of_day_scale(24) == sd.time_of_day_scale(0)
+
+
+def test_duration_factor_tracks_the_identity_timezone():
+    # One absolute instant is a different LOCAL hour per timezone, so the duration
+    # factor must follow the identity's own clock — an evening browse in New York
+    # is the small hours in Berlin.
+    instant = datetime(2026, 6, 8, 23, 0, tzinfo=timezone.utc)  # 19:00 New York, 01:00 Berlin
+    ny = bp._time_of_day_duration_factor({"timezone": "America/New_York"}, now=instant)
+    berlin = bp._time_of_day_duration_factor({"timezone": "Europe/Berlin"}, now=instant)
+    assert ny == sd.time_of_day_scale(19)
+    assert berlin == sd.time_of_day_scale(1)
+    assert ny > berlin
+    # No timezone -> the desk-worker default, never an exception.
+    assert bp._time_of_day_duration_factor({}, now=instant) == sd.time_of_day_scale(19)
+    assert bp._time_of_day_duration_factor({"timezone": "Not/AZone"}, now=instant) > 0
+
+
+def test_evening_runs_are_longer_than_deep_night_runs_on_average():
+    # End-to-end mechanism: feeding evening vs deep-night factors through the real
+    # duration draw yields a longer typical session in the evening — the duration
+    # histogram is no longer time-invariant.
+    evening_scale = sd.time_of_day_scale(20)
+    night_scale = sd.time_of_day_scale(3)
+    evening = [sd.sample_session_seconds(random.Random(i), scale=evening_scale) for i in range(400)]
+    night = [sd.sample_session_seconds(random.Random(i), scale=night_scale) for i in range(400)]
+    assert statistics.median(evening) > statistics.median(night)
 
 
 def test_build_behavior_plan_samples_human_duration():

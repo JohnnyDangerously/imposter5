@@ -467,6 +467,9 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         "id": "imposter5-sim",
         "entity_id": body.url,
         "entity_type": "generic_web" if body.provider != "linkedin" else "linkedin_profile",
+        # Anchors the time-of-day duration coupling to the identity's own wall
+        # clock when supplied (else behavior_policy defaults to a desk-worker tz).
+        "timezone": body.schedule_timezone,
     }
     
     plan = build_behavior_plan(
@@ -723,6 +726,9 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
 
                 try:
                     from imposter5.loaders.gauntlet_journey import run_gauntlet_journey
+                    # build_behavior_plan already drew a human, time-of-day-coupled
+                    # session length into plan["gauntlet_duration_s"] (see
+                    # behavior_policy); an explicit request value still overrides it.
                     duration_s = float(body.gauntlet_duration_s or plan.get("gauntlet_duration_s") or 240.0)
                     # App-supplied "tree of value": queued human side-quests that
                     # take priority over the ambient excursion menu.

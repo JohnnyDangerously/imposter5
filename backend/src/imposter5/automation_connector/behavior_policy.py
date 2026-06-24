@@ -6,11 +6,13 @@ observation run.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone as _timezone
 import json
 import os
 import random
 import secrets
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from imposter5.automation_connector.goals import GoalSpec, goal_spec_to_payload
 from imposter5.automation_connector.humanize_dist import lognormal_ms
@@ -18,9 +20,14 @@ from imposter5.automation_connector.session_duration import (
     MAX_SECONDS as _DURATION_MAX_S,
     MIN_SECONDS as _DURATION_MIN_S,
     sample_session_seconds,
+    time_of_day_scale,
 )
 
 POLICY_VERSION = "goal-behavior-v1"
+
+# Default wall clock for the time-of-day duration coupling when a run carries no
+# identity timezone (matches the scheduler's desk-worker default).
+_DEFAULT_DURATION_TZ = "America/New_York"
 
 
 def _explicit_duration_s(target: dict[str, Any]) -> float | None:
@@ -34,6 +41,27 @@ def _explicit_duration_s(target: dict[str, Any]) -> float | None:
         if isinstance(raw, (int, float)) and not isinstance(raw, bool):
             return float(max(_DURATION_MIN_S, min(_DURATION_MAX_S, float(raw))))
     return None
+
+
+def _time_of_day_duration_factor(
+    target: dict[str, Any], *, now: datetime | None = None
+) -> float:
+    """How the local clock stretches/squeezes this run's session length.
+
+    Quick dips during the work day, longer browses in the evening, briefest in
+    the deep night — so a scheduled identity's session lengths are NOT drawn from
+    one time-invariant distribution (a duration histogram identical at 03:00 and
+    20:00 is itself a tell). The timezone comes from the identity
+    (``target['timezone']``) so the coupling tracks its OWN wall clock, defaulting
+    to a desk-worker tz. ``now`` is injectable for deterministic tests.
+    """
+    tzname = str(target.get("timezone") or _DEFAULT_DURATION_TZ)
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    moment = now or datetime.now(_timezone.utc)
+    return time_of_day_scale(moment.astimezone(tz).hour)
 
 
 @dataclass(frozen=True)
@@ -523,7 +551,7 @@ def build_behavior_plan(
     # Session length: humans have a heavy-tailed, multi-modal session-duration
     # distribution (many sub-minute "dip in, check one thing, leave" visits, a
     # typical few-minute browse, an occasional long read) — NOT one fixed ~4-min
-    # budget. Sample it per run (persona dwell gently scales it) so the
+    # budget. Sample it per run (persona dwell AND time-of-day gently scale it) so the
     # cross-session duration histogram is human, unless a caller pins it. Drawn
     # from a dedicated RNG substream so it never perturbs the seeded draws above.
     explicit_duration = _explicit_duration_s(target)
@@ -531,7 +559,13 @@ def build_behavior_plan(
     gauntlet_duration_s = (
         explicit_duration
         if explicit_duration is not None
-        else sample_session_seconds(duration_rng, scale=persona.dwell_multiplier)
+        else sample_session_seconds(
+            duration_rng,
+            # Persona dwell AND the local clock shape the length: a quick midday
+            # dip vs a long evening browse. The mixture's clamp keeps the shape
+            # heavy-tailed rather than collapsing to one time-scaled value.
+            scale=persona.dwell_multiplier * _time_of_day_duration_factor(target),
+        )
     )
 
     return {
