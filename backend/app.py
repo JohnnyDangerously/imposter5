@@ -1192,7 +1192,15 @@ def imposter5_run(body: Imposter5RunRequestWithMatrix):
         prompt=body.prompt,
         result={"success": run_success, "goal": goal_payload, "session_recording": session_rec},
         schedule=(
-            {"interval_minutes": body.schedule_interval_minutes}
+            {
+                "interval_minutes": body.schedule_interval_minutes,
+                # Thread the run's persona + timezone into the schedule so the
+                # enrolled identity gets the persona's chronotype in its own local
+                # wall clock, instead of the whole fleet defaulting to one shared
+                # nine-to-five Eastern rhythm.
+                "persona": body.persona,
+                "timezone": body.schedule_timezone,
+            }
             if body.schedule_interval_minutes
             else None
         ),

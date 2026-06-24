@@ -53,6 +53,12 @@ class Imposter5RunRequest(BaseModel):
     # When set, a green first run enrolls this task on a recurring schedule at
     # this cadence (minutes). None = run once, do not schedule.
     schedule_interval_minutes: int | None = Field(default=None, ge=5, le=1440)
+    # IANA timezone for the scheduled identity's circadian clock (e.g.
+    # "Europe/Berlin"). The persona (above) selects the chronotype; this anchors
+    # it to a local wall clock. None defaults to the desk-worker America/New_York.
+    # Threading these per-task is what stops a whole fleet from sharing one
+    # nine-to-five-Eastern arrival rhythm (a cross-session tell).
+    schedule_timezone: str | None = Field(default=None, max_length=64)
     # Blue Team gauntlet run knobs (used only on a /gauntlet target). Duration
     # bounds the multi-minute journey; headless lets a server-started backend
     # (no desktop session) still record + score a run — None keeps the default

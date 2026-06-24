@@ -124,6 +124,50 @@ def test_green_run_with_schedule_enrolls_with_human_arrival(store):
     assert task.chronotype and task.timezone
 
 
+def test_schedule_persona_and_timezone_drive_circadian_identity(store):
+    """A scheduled task must inherit the *persona's* chronotype in the *requested*
+    timezone, not the fleet-wide nine-to-five Eastern default. Without this the
+    whole fleet shares one circadian arrival rhythm — a cross-session tell. The
+    endpoint forwards body.persona + body.schedule_timezone into this seam."""
+    outcome = finalize_run(
+        provider="linkedin",
+        url="https://www.linkedin.com/feed/",
+        prompt="scroll the feed",
+        result=GOOD_RESULT,
+        schedule={
+            "interval_minutes": 60,
+            "persona": "curious_reader",  # -> "evening" chronotype
+            "timezone": "Europe/Berlin",
+        },
+        store=store,
+        now=FIXED_NOW,
+    )
+    assert outcome.scheduled is True
+    task = store.list_tasks()[0]
+    assert task.chronotype == "evening"
+    assert task.timezone == "Europe/Berlin"
+
+    # And the persisted identity survives a worker reschedule (run_due_tasks
+    # rebuilds the profile from the record, not from a fresh default).
+    later = FIXED_NOW + timedelta(minutes=61)
+    run_due_tasks(store=store, runner=lambda *_: GOOD_RESULT, now=later)
+    reloaded = store.list_tasks()[0]
+    assert reloaded.chronotype == "evening"
+    assert reloaded.timezone == "Europe/Berlin"
+
+
+def test_schedule_without_persona_defaults_to_desk_worker(store):
+    """No persona/timezone => the existing desk-worker default (nine_to_five,
+    America/New_York), so the change is backward compatible."""
+    finalize_run(
+        provider="generic", url="https://example.com", prompt=None,
+        result=GOOD_RESULT, schedule={"interval_minutes": 60}, store=store, now=FIXED_NOW,
+    )
+    task = store.list_tasks()[0]
+    assert task.chronotype == "nine_to_five"
+    assert task.timezone == "America/New_York"
+
+
 def test_arrival_jitter_can_be_disabled_for_legacy_timing(store):
     scheduler.set_arrival_jitter(False)
     try:
