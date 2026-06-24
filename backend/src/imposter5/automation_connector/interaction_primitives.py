@@ -1286,8 +1286,15 @@ def _emit_bezier(
            frequency wander, so the cross-move spectrum is a band, not two fixed
            lines. ``clock`` carries elapsed ms across segments so phase stays
            continuous.
+    4. INTEGER, ERROR-DIFFUSED EMISSION — real pointers report INTEGER client
+       coordinates, so each sample is rounded to whole pixels HERE rather than
+       depending on the transport to quantize floats (uncontrolled, and a
+       fractional ``clientX`` is itself an oddity for a mouse). The fractional
+       remainder is carried forward (1-D error diffusion), so a sub-pixel settle
+       tremor survives as correctly-timed +/-1px steps instead of being truncated
+       to nothing or degenerating into a regular stair-step.
 
-    The final sample lands on P3 (sans noise) so the endpoint is exact.
+    The final sample lands on (rounded) P3 sans noise, so the endpoint is exact.
     """
     n = max(2, int(steps))
     # Pass 1: positions along the curve under the velocity reparam.
@@ -1347,8 +1354,9 @@ def _emit_bezier(
     # settle-only model). Std tracks the local speed; an AR(1) filter makes it a
     # wavering hand rather than white per-sample fuzz. It vanishes at the endpoint
     # (speed -> 0) and on a zero-length move, keeping the arrival clean. Mid-flight it
-    # is supra-pixel for typical amplitudes, so motion structure survives the integer
-    # quantization of CDP transport (sub-pixel-only tremor can be lost there).
+    # is supra-pixel for typical amplitudes; the fine settle tremor is preserved
+    # across the whole-pixel emission by error diffusion (see invariant 4), not left
+    # to the transport's uncontrolled float rounding.
     step_dist = [
         math.hypot(raw[i + 1][0] - raw[i][0], raw[i + 1][1] - raw[i][1])
         for i in range(n_raw - 1)
@@ -1371,6 +1379,11 @@ def _emit_bezier(
         chord_perp = (0.0, 0.0)
 
     last = p3
+    # Integer error-diffusion accumulators (invariant 4): carry the sub-pixel
+    # remainder forward so whole-pixel emission preserves the fine tremor instead of
+    # truncating it away. Reset per move, so each reach starts from a clean slate.
+    res_x = 0.0
+    res_y = 0.0
     for i in range(n_raw):
         px, py = raw[i]
         if amp > 0.0 and i < n_raw - 1:
@@ -1412,9 +1425,16 @@ def _emit_bezier(
                 jx = perp_x * eff * osc_perp + tan_x * eff * long_ratio * osc_long
                 jy = perp_y * eff * osc_perp + tan_y * eff * long_ratio * osc_long
 
-            page.mouse.move(px + ou_x + jx, py + ou_y + jy)
+            gx = px + ou_x + jx + res_x
+            gy = py + ou_y + jy + res_y
+            ix, iy = round(gx), round(gy)
+            res_x, res_y = gx - ix, gy - iy
+            page.mouse.move(ix, iy)
         else:
-            page.mouse.move(px, py)
+            # Clean sample (the exact endpoint, or an amp==0 baseline move): land on
+            # the whole-pixel target and clear the residual so arrival is pixel-exact.
+            res_x = res_y = 0.0
+            page.mouse.move(round(px), round(py))
         last = (px, py)
         clock[0] += dwell_ms[i]
         if i < n_raw - 1:

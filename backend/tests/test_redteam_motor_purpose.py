@@ -112,6 +112,42 @@ def test_settle_tremor_is_two_dimensional_not_a_single_line():
     assert (minor / major) > 0.02, "deviations collapse to a single line (rank-1 tremor regressed)"
 
 
+def test_sub_pixel_tremor_survives_integer_quantization():
+    # Fix #7 — real pointers report INTEGER client coordinates. We round to whole
+    # pixels at emit time (so behavior does not depend on the transport's
+    # uncontrolled float rounding) AND carry the fractional remainder forward (1-D
+    # error diffusion). A sub-pixel settle tremor (default amp ~0.6px) must therefore
+    # survive as a few correctly-timed +/-1px steps — not vanish, and not degenerate
+    # into a one-directional stair-step.
+    p0, p1, p2, p3 = (100.0, 100.0), (260.0, 130.0), (520.0, 300.0), (640.0, 360.0)
+    moves = _run_emit(p0, p1, p2, p3, amp=0.6)
+
+    # (1) Every emitted coordinate is a whole pixel on the wire (no fractional
+    #     clientX that a detector could flag, and no reliance on transport rounding).
+    assert all(
+        float(x).is_integer() and float(y).is_integer() for x, y in moves
+    ), "emitted a fractional coordinate (transport-dependent quantization)"
+
+    # (2) The sub-pixel tremor was NOT quantized away: vs the clean (amp==0) integer
+    #     path, the wobble still produces several +/-1px deviations.
+    clean = _run_emit(p0, p1, p2, p3, amp=0.0)
+    devs = [
+        (moves[i][0] - clean[i][0], moves[i][1] - clean[i][1])
+        for i in range(len(moves) - 1)
+    ]
+    nonzero = [d for d in devs if d != (0, 0)]
+    assert len(nonzero) >= 3, "sub-pixel tremor vanished under integer quantization"
+
+    # (3) It dithers rather than drifting: per-axis deviations change sign somewhere
+    #     (a constant +1 ramp would be a fixed-offset tell, not a tremor).
+    xs = [d[0] for d in devs]
+    ys = [d[1] for d in devs]
+    assert (
+        (any(v > 0 for v in xs) and any(v < 0 for v in xs))
+        or (any(v > 0 for v in ys) and any(v < 0 for v in ys))
+    ), "deviations never change sign (stair-step, not tremor dither)"
+
+
 # --------------------------------------------------------------------------- #
 # Fix #4 — scroll over-shoot and correct
 # --------------------------------------------------------------------------- #
