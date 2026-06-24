@@ -64,6 +64,24 @@ def test_micro_dip_arc_exists_and_is_short():
     assert dip.goal_predicate.target <= 5
 
 
+def test_activity_mix_is_not_scroll_dominant():
+    # Blue-team angle: "five days a week of just scrolling between two values." Plain
+    # feed browsing must stay common but NOT dominate, and the long-browse arc must
+    # itself weave in check-stops rather than being an unbroken scroll.
+    arcs = _ARCS_BY_NAME
+    pure = arcs["pure_feed"]
+    # The long pure-browse arc no longer dwarfs everything else...
+    assert pure.weight <= 2.0
+    # ...and lookup/research/check-stop arcs collectively outweigh pure scrolling.
+    active = arcs["feed_lookup"].weight + arcs["research"].weight + arcs["quick_check"].weight
+    assert active > pure.weight
+    # The long browse weaves in check-stops (including the occasional profile lookup),
+    # so it does not read as a feature-flat scroll between two fixed values.
+    assert pure.tangent_chance >= 0.3
+    assert pure.max_tangents >= 2
+    assert "tangent_lookup" in pure.tangent_scenes
+
+
 def test_build_behavior_plan_samples_human_duration():
     plan = build_behavior_plan({"id": "t-1"}, provider="generic_web", seed="stable")
     assert sd.MIN_SECONDS <= plan["gauntlet_duration_s"] <= sd.MAX_SECONDS

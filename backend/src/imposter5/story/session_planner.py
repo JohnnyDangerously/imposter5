@@ -48,7 +48,9 @@ class FeedArc:
 
 
 # The base loop is always aimless feed scrolling; arcs differ in length and what
-# they wander into. Weights lean toward ordinary "just scrolling" sessions.
+# they wander into. Weights keep ordinary browsing common but NOT dominant —
+# lookup/research/check-stop sessions collectively outweigh pure scrolling, so a
+# week of usage does not read as "scrolls between two values and does nothing else."
 ARCS: tuple[FeedArc, ...] = (
     FeedArc(
         "micro_dip", 1.8, (0.0, 0.10), 0.85, 1,
@@ -65,17 +67,18 @@ ARCS: tuple[FeedArc, ...] = (
         "Check alerts (or a quick glance), a little scroll, done.",
     ),
     FeedArc(
-        "pure_feed", 2.6, (0.55, 1.0), 0.16, 1,
-        ("tangent_notifications", "tangent_glance"), 0.45,
-        "Just browsing the feed for a while; maybe one light check-stop.",
+        "pure_feed", 1.8, (0.55, 1.0), 0.35, 2,
+        ("tangent_notifications", "tangent_glance", "tangent_lookup"), 0.45,
+        "Browsing the feed for a while, weaving in a couple of check-stops "
+        "(alerts, a glance, or looking someone up) — not an unbroken scroll.",
     ),
     FeedArc(
-        "feed_lookup", 2.0, (0.45, 0.85), 0.45, 2,
+        "feed_lookup", 2.4, (0.45, 0.85), 0.45, 2,
         ("tangent_lookup", "tangent_notifications", "tangent_glance"), 0.40,
         "Scroll, look someone up, back to the feed, scroll more.",
     ),
     FeedArc(
-        "research", 1.4, (0.60, 1.0), 0.5, 3,
+        "research", 1.8, (0.60, 1.0), 0.5, 3,
         ("tangent_search", "tangent_lookup", "tangent_notifications", "tangent_glance"), 0.40,
         "Scroll, search an interest and read a profile, return, keep scrolling.",
     ),
