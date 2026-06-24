@@ -124,11 +124,25 @@ def test_no_dominant_cadence_spike_vs_fixed(streams, fixed_stream):
 @pytest.mark.parametrize("seed", SEEDS)
 def test_bursty_and_heavy_tailed(streams, seed):
     """Positive burstiness + lag-1 memory + CV>1: clustered, heavy-tailed gaps,
-    not the perfectly regular (burstiness=-1, CV=0) fixed stream."""
+    not the perfectly regular (burstiness=-1, CV=0) fixed stream.
+
+    Burstiness and CV are read on the full stream (the multi-day absence tail only
+    strengthens both). Lag-1 gap MEMORY, however, is a *within-operation* burst
+    property: a rare vacation spike is an isolated (huge, normal) pair with
+    enormous leverage on a raw Pearson coefficient, which masks the real burst
+    clustering. So memory is measured on operational gaps (the vacation tail set
+    aside) — the honest measurement of "do short gaps follow short gaps."
+    """
+    import numpy as np
+
     bm = ad.burstiness_memory(streams[seed])
-    assert bm.cv > 0.9          # observed 1.3-1.8
-    assert bm.burstiness > 0.05  # observed 0.13-0.29
-    assert bm.memory > 0.02      # observed 0.06-0.20
+    assert bm.cv > 0.9          # observed 1.9-2.2 (multi-day tail lifts it)
+    assert bm.burstiness > 0.05  # observed 0.13-0.37
+    gaps = np.diff(ad._epoch_seconds(streams[seed]))
+    operational = gaps[gaps < 86400.0]  # drop multi-day absences (vacation/sick/travel)
+    a, b = operational[:-1], operational[1:]
+    memory = float(np.corrcoef(a, b)[0, 1])
+    assert memory > 0.02         # burst clustering survives once vacations are set aside
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +178,56 @@ def test_distinct_identities_do_not_fire_in_lockstep():
     b = generate_stream(start=START, days=DAYS, interval_minutes=INTERVAL, profile=PROFILE, seed="ident-B")
     assert a[0] != b[0]
     assert abs(ad.cross_correlation(a, b, bin_s=600.0)) < 0.25  # observed ~-0.01
+
+
+# --------------------------------------------------------------------------- #
+# Day-to-day circadian SHAPE variation (no fixed template) + multi-day absences
+# --------------------------------------------------------------------------- #
+def test_daily_shape_multipliers_vary_by_day_stable_within_day():
+    """The per-day hour wobble must replay within a day (so a stream is
+    deterministic), differ from one day to the next (no fixed template), differ
+    by identity, and stay bounded (never flatten to noise or spike to always-on)."""
+    a = ac._daily_hour_multipliers("seed-z", 1000, 0.22, 0.6, 1.5)
+    a_again = ac._daily_hour_multipliers("seed-z", 1000, 0.22, 0.6, 1.5)
+    next_day = ac._daily_hour_multipliers("seed-z", 1001, 0.22, 0.6, 1.5)
+    other_id = ac._daily_hour_multipliers("seed-q", 1000, 0.22, 0.6, 1.5)
+    assert a == a_again            # replays within a (seed, day)
+    assert a != next_day           # the shape wobbles day to day
+    assert a != other_id           # and differs by identity
+    assert len(a) == 24
+    assert all(0.6 <= x <= 1.5 for x in a)   # clamped, never degenerate
+    # sigma==0 restores the old fixed template (all-ones, no variation).
+    assert ac._daily_hour_multipliers("seed-z", 1000, 0.0, 0.6, 1.5) == tuple([1.0] * 24)
+
+
+def test_per_day_hour_histograms_are_not_one_repeated_template():
+    """Across full active days, the same identity's hour-of-day histogram is not
+    byte-identical every day — a long capture must not show one curve on repeat."""
+    from collections import defaultdict
+
+    stream = generate_stream(
+        start=START, days=30, interval_minutes=45, profile=PROFILE, seed="shape-hist"
+    )
+    by_day: dict[int, list[int]] = defaultdict(lambda: [0] * 24)
+    for t in stream:
+        loc = t.astimezone(PROFILE.tz)
+        by_day[loc.toordinal()][loc.hour] += 1
+    full_days = [tuple(h) for _, h in sorted(by_day.items()) if sum(h) >= 6]
+    assert len(full_days) >= 5
+    assert len(set(full_days)) > 1  # the daily shapes are not all identical
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_rare_multi_day_absences_appear_but_stay_rare(streams, seed):
+    """A human occasionally goes dark for days; a metronome never does. Over a
+    long stream there must be a genuine multi-day hole, yet absences stay rare
+    enough that the overwhelming majority of gaps are intra-day."""
+    stream = streams[seed]
+    gaps_days = [(b - a).total_seconds() / 86400.0 for a, b in zip(stream, stream[1:])]
+    assert max(gaps_days) > 1.5  # at least one true multi-day absence
+    over_a_day = sum(1 for g in gaps_days if g > 1.0)
+    assert over_a_day >= 1
+    assert over_a_day / len(gaps_days) < 0.06  # but absences are the rare tail
 
 
 # --------------------------------------------------------------------------- #

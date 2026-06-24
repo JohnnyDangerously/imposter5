@@ -38,9 +38,10 @@ This module is intentionally stdlib-only: it runs inside the scheduler worker.
 """
 from __future__ import annotations
 
+import functools
 import math
 import random
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -165,6 +166,26 @@ class ArrivalParams:
     skip_mult_lo: float = 3.0
     skip_mult_hi: float = 7.0
 
+    # Rare MULTI-DAY absences (vacation / sick / travel). Distinct from the
+    # in-day ``skip`` above: when this fires the identity goes dark for *days*
+    # then returns. A metronome never takes a holiday; a human does, and a long
+    # capture with no multi-day holes is itself a tell. Kept rare so the
+    # campaign's average cadence is essentially preserved (the bulk of gaps stay
+    # lognormal; these are a thin extreme tail).
+    away_prob: float = 0.008
+    away_days_lo: float = 1.0
+    away_days_hi: float = 3.0
+
+    # Per-day variation in the circadian SHAPE. A real person's hour-by-hour
+    # activity is not a pixel-identical template repeated every day; some days
+    # run later, some have a flatter midday. ``day_shape_sigma`` is the lognormal
+    # spread of a per-(identity, local-day) multiplier on each hour's weight; the
+    # clamps stop a day from flattening to noise or spiking to always-on. 0 here
+    # restores the old fixed template.
+    day_shape_sigma: float = 0.22
+    day_shape_lo: float = 0.6
+    day_shape_hi: float = 1.5
+
     # Circadian thinning grid.
     thinning_step_minutes: float = 22.0
     thinning_max_iter: int = 96  # enough to cross an overnight dead zone
@@ -257,10 +278,20 @@ def advance(
         gap_frac *= rng.uniform(params.skip_mult_lo, params.skip_mult_hi)
 
     gap_minutes = interval_minutes * gap_frac * math.exp(log_rate)
+
+    # Rare multi-day absence (vacation / sick / travel) layered ON TOP of the
+    # ordinary gap. The circadian thinning below then re-seats the *return* into
+    # a plausible active hour, so the identity comes back mid-morning rather than
+    # at 04:00. Rare by design, so the marginal gap law stays lognormal in bulk.
+    if rng.random() < params.away_prob:
+        gap_minutes += rng.uniform(params.away_days_lo, params.away_days_hi) * 1440.0
+
     candidate = now + timedelta(seconds=gap_minutes * 60.0)
 
-    # Meso: thin against the circadian intensity so dead hours stay quiet.
-    candidate = _apply_circadian(candidate, profile, rng, params)
+    # Meso: thin against the circadian intensity so dead hours stay quiet. The
+    # per-identity seed also drives the per-day SHAPE wobble (each day's curve
+    # differs instead of repeating one fixed template).
+    candidate = _apply_circadian(candidate, profile, rng, params, seed=state.seed)
 
     # Micro: guarantee a sub-second offset; never land on the second/minute grid.
     candidate = _ensure_subsecond(candidate, rng)
@@ -322,9 +353,45 @@ def _geometric_len(rng: random.Random, mean_len: float) -> int:
     return max(1, int(math.ceil(math.log(u) / math.log(1.0 - p)))) if p < 1.0 else 1
 
 
-def _circadian_weight(profile: CircadianProfile, dt_utc: datetime) -> float:
+@functools.lru_cache(maxsize=8192)
+def _daily_hour_multipliers(
+    seed: str, local_date_ordinal: int, sigma: float, lo: float, hi: float
+) -> tuple[float, ...]:
+    """A per-(identity, local-day) multiplicative wobble on each hour's circadian
+    weight, so the activity SHAPE differs from one day to the next instead of
+    repeating one fixed template.
+
+    A light AR(1) across the 24 hours keeps adjacent hours correlated, so a day
+    shifts a *block* (e.g. "started later today") rather than sprouting isolated
+    single-hour spikes. Deterministic in ``(seed, date)`` so a stream replays
+    exactly, and memoized because a single ``advance`` may probe several hours.
+    """
+    if sigma <= 0.0:
+        return tuple(1.0 for _ in range(24))
+    r = random.Random(f"{seed}|dayshape|{local_date_ordinal}")
+    out: list[float] = []
+    prev = 0.0
+    for _ in range(24):
+        prev = 0.6 * prev + 0.4 * r.gauss(0.0, 1.0)
+        out.append(max(lo, min(hi, math.exp(sigma * prev))))
+    return tuple(out)
+
+
+def _circadian_weight(
+    profile: CircadianProfile,
+    dt_utc: datetime,
+    *,
+    seed: str | None = None,
+    params: ArrivalParams = DEFAULT_PARAMS,
+) -> float:
     local = dt_utc.astimezone(profile.tz)
     weight = profile.hour_weights[local.hour]
+    if seed is not None and params.day_shape_sigma > 0.0:
+        mult = _daily_hour_multipliers(
+            seed, local.toordinal(),
+            params.day_shape_sigma, params.day_shape_lo, params.day_shape_hi,
+        )
+        weight *= mult[local.hour]
     if local.weekday() >= 5:
         weight *= profile.weekend_scale
     return weight
@@ -335,15 +402,25 @@ def _apply_circadian(
     profile: CircadianProfile,
     rng: random.Random,
     params: ArrivalParams,
+    *,
+    seed: str | None = None,
 ) -> datetime:
     """Accept ``candidate`` with probability proportional to circadian intensity;
-    otherwise roll forward on a fine grid until an active window is reached."""
+    otherwise roll forward on a fine grid until an active window is reached.
+
+    The acceptance bound ``w_max`` is the *base* template's max (NOT inflated by
+    the day wobble), so the existing cadence/density is preserved: a day that
+    runs hotter than the template at some hour simply saturates that hour at full
+    acceptance (ratio >= 1) rather than thinning every other hour down. The
+    overnight dead zone still stays quiet because its tiny base weight survives
+    even a hi-side wobble.
+    """
     weights = profile.hour_weights
     w_max = max(weights) * max(1.0, profile.weekend_scale)
     if w_max <= 0:
         return candidate
     for _ in range(params.thinning_max_iter):
-        weight = _circadian_weight(profile, candidate)
+        weight = _circadian_weight(profile, candidate, seed=seed, params=params)
         if rng.random() <= weight / w_max:
             return candidate
         step = params.thinning_step_minutes * (0.5 + rng.random())
